@@ -126,10 +126,10 @@ void expectGraphNear(ConstraintManager &reference, ConstraintManager &accelerate
   EXPECT_TRUE(rh.augmentedInformation().isApprox(ah.augmentedInformation(), 1e-9));
 }
 
-class ManagerIntegration : public testing::TestWithParam<bool> {
+class ManagerIntegration : public testing::TestWithParam<int> {
 protected:
   void checkBackend() {
-    if (!GetParam()) return;
+    if (!(GetParam() & 1)) return;
 #ifdef FORM_ENABLE_CUDA
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
@@ -141,8 +141,10 @@ protected:
 
   ConstraintManager::Params params(bool single = false) const {
     ConstraintManager::Params result;
-    result.use_summary = !GetParam();
-    result.use_cuda_summaries = GetParam();
+    result.use_summary = !(GetParam() & 1);
+    result.use_cuda_summaries = GetParam() & 1;
+    result.use_batch_summaries = GetParam() >= 2;
+    result.batch_min_edges = 0;
     result.disable_smoothing = single;
     return result;
   }
@@ -219,5 +221,5 @@ TEST_P(ManagerIntegration, DisableSmoothingUsesUnarySummariesAcrossRematches) {
   }
 }
 
-INSTANTIATE_TEST_SUITE_P(CpuAndCuda, ManagerIntegration, testing::Bool());
+INSTANTIATE_TEST_SUITE_P(CpuAndCuda, ManagerIntegration, testing::Values(0,1,2,3));
 } // namespace

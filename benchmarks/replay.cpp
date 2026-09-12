@@ -131,6 +131,7 @@ int main(int argc, char** argv) {
     params.extraction.max_norm_squared = 50.0 * 50.0;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
+      if (arg == "--batch-summaries") { params.constraints.use_batch_summaries = true; continue; }
       if (arg == "--profile") { form::profile::enabled = true; continue; }
       if (i + 1 == argc) throw std::runtime_error("Missing value for " + arg);
       const std::string value = argv[++i];
@@ -156,9 +157,10 @@ int main(int argc, char** argv) {
         params.constraints.use_cuda_dense_solver = true;
       }
       else if (arg == "--backend") {
-        if (value != "reference" && value != "summary" && value != "cuda") throw std::runtime_error("Unknown backend " + value);
+        if (value != "reference" && value != "summary" && value != "cuda" && value != "summary-batch" && value != "cuda-batch") throw std::runtime_error("Unknown backend " + value);
         params.constraints.use_summary = value != "reference";
-        params.constraints.use_cuda_summaries = value == "cuda";
+        params.constraints.use_cuda_summaries = value == "cuda" || value == "cuda-batch";
+        if(value == "summary-batch" || value == "cuda-batch") params.constraints.use_batch_summaries = true;
       }
       else throw std::runtime_error("Unknown argument " + arg);
     }

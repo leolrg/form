@@ -341,7 +341,7 @@ def main():
     parser.add_argument('--configs',nargs='+',choices=CONFIGS,default=list(CONFIGS))
     parser.add_argument('--sequence-first',action='store_true',
                         help='finish all workload settings for each sequence before the next')
-    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda'),default=['reference','summary'])
+    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch'),default=['reference','summary'])
     parser.add_argument('--threads',type=int,default=8)
     parser.add_argument('--repeats',type=int,default=2)
     parser.add_argument('--limit',type=int)
@@ -392,7 +392,7 @@ def main():
                         argv.extend(['--limit',str(args.limit)])
                     if args.profile:
                         argv.append('--profile')
-                    if (backend=='cuda' and args.cuda_solve_min_dimension is not None
+                    if (backend in ('cuda','cuda-batch') and args.cuda_solve_min_dimension is not None
                             and (args.cuda_solve_configs is None or config in args.cuda_solve_configs)):
                         argv.extend(['--cuda-solve-min-dimension',str(args.cuda_solve_min_dimension)])
                     spec={'id':run_id,'sequence':seq,'config':config,'backend':backend,'repeat':repeat,

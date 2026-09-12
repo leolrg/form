@@ -3,6 +3,7 @@
 #include <gtsam/linear/GaussianFactorGraph.h>
 #include <tbb/global_control.h>
 #include "form/feature/batch_summary.hpp"
+#include "form/feature/batch_factor.hpp"
 #include "form/feature/factor.hpp"
 
 static void append(form::PointPoint& points, form::PlanePoint& planes, const Eigen::Vector3d& p, const Eigen::Vector3d& q, const Eigen::Vector3d& normal, bool point=true, bool plane=true) {
@@ -96,5 +97,29 @@ TEST(BatchSummary, ReusesWorkspaceAcrossGraphAndRootChanges) {
       EXPECT_TRUE(batch.linearize(poses).isApprox(changed.linearize(poses),2e-12));
       batch.reset(n,{});EXPECT_TRUE(batch.linearize(poses).isZero());
     }
+  }
+}
+
+TEST(BatchSummary, RetainedGraphsKeepTheirOwnSnapshot) {
+  for(bool gpu:{false,true}) {
+#ifndef FORM_ENABLE_CUDA
+    if(gpu)continue;
+#endif
+    std::shared_ptr<form::BatchSummary> workspace;
+    auto makeGraph=[](double offset,gtsam::Key i,gtsam::Key j) {
+      auto points=std::make_shared<form::PointPoint>();auto planes=std::make_shared<form::PlanePoint>();
+      append(*points,*planes,{1,2,3},{1+offset,2,3},{1,0,0});
+      gtsam::NonlinearFactorGraph graph;
+      graph.push_back(form::FeatureFactor(i,j,std::make_tuple(planes,points),.5,true));return graph;
+    };
+    gtsam::Values values;for(auto key:{7,10,42,99})values.insert(key,gtsam::Pose3{});
+    auto original=makeGraph(.1,10,42);
+    auto first=form::batchFeatureGraph(original,gpu,0,workspace);
+    const auto firstH=first.linearize(values)->augmentedHessian();
+    auto other=makeGraph(.5,7,99);
+    auto second=form::batchFeatureGraph(other,gpu,0,workspace);
+    EXPECT_NEAR(second.error(values),other.error(values),1e-12);
+    EXPECT_NEAR(first.error(values),original.error(values),1e-12);
+    EXPECT_TRUE(first.linearize(values)->augmentedHessian().isApprox(firstH,1e-12));
   }
 }

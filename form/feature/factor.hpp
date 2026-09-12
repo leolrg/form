@@ -177,6 +177,8 @@ public:
   boost::shared_ptr<gtsam::GaussianFactor>
   linearize(const gtsam::Values &values) const override;
   double error(const gtsam::Values &values) const override;
+  const auto& summary() const noexcept { return summary_; }
+  double inverseVariance() const noexcept { return inverse_variance_; }
 
 private:
   std::shared_ptr<const FeatureSummary> summary_;

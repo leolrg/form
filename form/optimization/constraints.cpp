@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "form/optimization/constraints.hpp"
 #include "form/feature/summary.hpp"
+#include "form/feature/batch_factor.hpp"
 #ifdef FORM_ENABLE_CUDA
 #include "form/feature/cuda_qr.hpp"
 #endif
@@ -344,7 +345,7 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_single_graph() noexcept {
   return graph;
 }
 
-gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) noexcept {
+gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) {
   // Add other factors
   auto graph = gtsam::NonlinearFactorGraph(m_other_factors);
 
@@ -377,6 +378,9 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) noexcept {
       }
       // Don't use linearizeToHessianFactor, as it linearizes sequentially.
       // More allocations this way, but it's quicker
+      if (m_params.use_batch_summaries)
+        previous_matches = batchFeatureGraph(previous_matches, m_params.use_cuda_summaries,
+                                            m_params.batch_min_edges, m_batch_summary);
       const auto linear_graph = previous_matches.linearize(m_values);
       gtsam::HessianFactor hessian(*linear_graph);
       m_fast_linear = gtsam::LinearContainerFactor(hessian, m_values);
@@ -399,6 +403,9 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) noexcept {
     }
   }
 
+  if (m_params.use_batch_summaries)
+    graph = batchFeatureGraph(graph, m_params.use_cuda_summaries,
+                              m_params.batch_min_edges, m_batch_summary);
   return graph;
 }
 

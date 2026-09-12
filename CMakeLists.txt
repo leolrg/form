@@ -39,6 +39,7 @@ add_library(FORM
 	form/feature/factor.cpp
 	form/feature/summary.cpp
 	form/feature/batch_summary.cpp
+	form/feature/batch_factor.cpp
 	form/optimization/constraints.cpp
 	form/mapping/keyscanner.cpp
 )
@@ -52,6 +53,7 @@ target_sources(FORM
 		form/feature/factor.hpp
 		form/feature/summary.hpp
 		form/feature/batch_summary.hpp
+		form/feature/batch_factor.hpp
 		form/feature/cuda_qr.hpp
 		form/feature/features.hpp
 		form/feature/extraction.hpp

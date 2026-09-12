@@ -42,6 +42,7 @@
 namespace form {
 class BatchedCudaQr;
 class CudaDenseSolver;
+class BatchSummary;
 
 using ScanIndex = size_t;
 
@@ -57,6 +58,9 @@ public:
     /// Exact fixed-correspondence QR summaries, retaining reference path by default.
     bool use_summary = false;
     bool use_cuda_summaries = false;
+    /// Experimental resident graph evaluation/assembly, opt in independently.
+    bool use_batch_summaries = false;
+    size_t batch_min_edges = 64;
     /// Experimental selective dense solving; independent of summary preparation.
     bool use_cuda_dense_solver = false;
     int cuda_solve_min_dimension = 240;
@@ -107,6 +111,7 @@ private:
   ConstraintMapMap m_constraints;
   std::shared_ptr<BatchedCudaQr> m_cuda_qr;
   std::shared_ptr<CudaDenseSolver> m_cuda_solver;
+  std::shared_ptr<BatchSummary> m_batch_summary;
   void prepare_cuda_summaries();
   void prepare_cpu_summaries();
 
@@ -158,7 +163,7 @@ public:
 
   /// @brief Get the full factor graph
   /// fast => linearize previous matches
-  gtsam::NonlinearFactorGraph get_graph(bool fast) noexcept;
+  gtsam::NonlinearFactorGraph get_graph(bool fast);
 
   /// @brief Get a factor graph with only current scan as a variable.
   /// Used for ablations
