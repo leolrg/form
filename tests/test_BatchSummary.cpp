@@ -123,3 +123,24 @@ TEST(BatchSummary, RetainedGraphsKeepTheirOwnSnapshot) {
     EXPECT_TRUE(first.linearize(values)->augmentedHessian().isApprox(firstH,1e-12));
   }
 }
+
+TEST(BatchSummary, PreservesDerivedFactorActivation) {
+  class Inactive final : public form::FeatureFactor {
+   public:
+    using FeatureFactor::FeatureFactor;
+    bool active(const gtsam::Values&) const override { return false; }
+  };
+  auto points=std::make_shared<form::PointPoint>();auto planes=std::make_shared<form::PlanePoint>();
+  append(*points,*planes,{1,2,3},{2,2,3},{1,0,0});
+  std::shared_ptr<form::BatchSummary> workspace;
+  gtsam::NonlinearFactorGraph graph;
+  graph.emplace_shared<Inactive>(7,9,std::make_tuple(planes,points),1.,true);
+  auto batch=form::batchFeatureGraph(graph,false,0,workspace);
+  EXPECT_EQ(batch[0],graph[0]);
+  EXPECT_NO_THROW(EXPECT_EQ(batch.error(gtsam::Values{}),0.));
+  graph.push_back(form::FeatureFactor(1,2,std::make_tuple(planes,points),1.,true));
+  gtsam::Values values;values.insert(1,gtsam::Pose3{});values.insert(2,gtsam::Pose3{});
+  batch=form::batchFeatureGraph(graph,false,0,workspace);
+  EXPECT_EQ(batch[0],graph[0]);
+  EXPECT_NO_THROW(EXPECT_NEAR(batch.error(values),graph.error(values),1e-12));
+}

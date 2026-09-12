@@ -4,8 +4,16 @@
 #include "form/optimization/profile.hpp"
 #include <gtsam/linear/HessianFactor.h>
 #include <map>
+#include <typeinfo>
 namespace form {
 namespace {
+const FeatureFactor* summarizedFeature(const gtsam::NonlinearFactor* factor) {
+  // Subclasses may override activation, error, or linearization. Keep their
+  // virtual behavior rather than replacing it with the base summary equations.
+  if (!factor || typeid(*factor) != typeid(FeatureFactor)) return nullptr;
+  const auto* feature = static_cast<const FeatureFactor*>(factor);
+  return feature->summary() ? feature : nullptr;
+}
 class BatchFactor final:public gtsam::NonlinearFactor {
   std::shared_ptr<BatchSummary> batch_;
   size_t residuals_;
@@ -33,8 +41,8 @@ gtsam::NonlinearFactorGraph batchFeatureGraph(const gtsam::NonlinearFactorGraph&
     bool cuda,size_t min_edges,std::shared_ptr<BatchSummary>& workspace) {
   std::vector<const FeatureFactor*> factors;std::map<gtsam::Key,int> indices;size_t residuals=0;
   for(const auto& factor:graph) {
-    const auto* f=dynamic_cast<const FeatureFactor*>(factor.get());
-    if(!f || !f->summary())continue;
+    const auto* f=summarizedFeature(factor.get());
+    if(!f)continue;
     factors.push_back(f);indices.emplace(f->key1(),0);indices.emplace(f->key2(),0);residuals+=f->dim();
   }
   // The zero threshold is for correctness testing. Production screening keeps
@@ -46,7 +54,7 @@ gtsam::NonlinearFactorGraph batchFeatureGraph(const gtsam::NonlinearFactorGraph&
   if(workspace && workspace.use_count()==1)workspace->reset(keys.size(),std::move(edges));
   else workspace=std::make_shared<BatchSummary>(keys.size(),std::move(edges),cuda);
   gtsam::NonlinearFactorGraph result;
-  for(const auto& factor:graph){const auto* f=dynamic_cast<const FeatureFactor*>(factor.get());if(!f || !f->summary())result.push_back(factor);}
+  for(const auto& factor:graph)if(!summarizedFeature(factor.get()))result.push_back(factor);
   result.emplace_shared<BatchFactor>(keys,workspace,residuals);return result;
 }
 }
