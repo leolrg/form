@@ -48,6 +48,9 @@ struct FeatureSummary {
   AugmentedHessian augmentedHessian(const gtsam::Pose3 &Ti,
                                     const gtsam::Pose3 &Tj) const;
 
+  const auto& pointRoot() const noexcept { return point_root_; }
+  const auto& planeRoot() const noexcept { return plane_root_; }
+
 private:
   Eigen::Matrix<double, 7, 7> point_root_ = Eigen::Matrix<double, 7, 7>::Zero();
   Eigen::Matrix<double, 13, 13> plane_root_ = Eigen::Matrix<double, 13, 13>::Zero();

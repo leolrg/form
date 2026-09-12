@@ -4,6 +4,7 @@ enable_testing() # enable ctest
 
 add_executable(form-tests
     test_FeatureFactor.cpp
+    test_BatchSummary.cpp
     test_Summary.cpp
     test_SummaryIntegration.cpp
     test_ManagerIntegration.cpp

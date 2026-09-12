@@ -10,14 +10,14 @@ uses existing FeatureSummary calculations with the same assembly and weights.
 **Tech stack:** CUDA C++17, FP64, Eigen, GTSAM 4.2, TBB, GoogleTest.
 
 - [x] Commit the existing implementation/results after running its 38 tests.
-- [ ] Add a failing independent matrix/cost comparison for shared pose graphs,
+- [x] Add a failing independent matrix/cost comparison for shared pose graphs,
   zero residuals, and different graph sizes in tests/test_BatchSummary.cpp.
-- [ ] Implement form/feature/batch_summary.hpp/.cpp with CPU batching and a
+- [x] Implement form/feature/batch_summary.hpp/.cpp with CPU batching and a
   separate CUDA data interface/kernel. Keep snapshot ownership explicit and
   validate endpoint/pose counts before device access.
 - [ ] Run the new numerical tests and all existing tests; run Compute Sanitizer
   on the new kernels before making a correctness claim.
-- [ ] Add a benchmark of warmed complete calls and setup for CPU versus GPU at
+- [x] Add a benchmark of warmed complete calls and setup for CPU versus GPU at
   10/30/40/80 poses and sparse/dense edges. Run interleaved measurements with
   32 CPU threads. Record setup, cost, and linearization+assembly separately.
 - [ ] Commit the validated experiment and its measured decision.
@@ -25,3 +25,9 @@ uses existing FeatureSummary calculations with the same assembly and weights.
   screen matched original/CPU/CUDA replays at current/features/window settings.
   If not, preserve the isolated experiment and document the remaining costs
   before selecting a different architecture.
+
+First screening: dense 40-pose / 780-edge / 128-point graphs measured 307 us GPU
+linearization+assembly versus 827 us existing CPU summaries, but 5208 us GPU
+setup. Sparse graphs lose. Next prerequisite is reusable workspace and contiguous
+CSR construction before estimator integration. Raw screening is in
+benchmarks/results/batch-summary/screening.csv (generated, not versioned).
