@@ -20,12 +20,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "form/optimization/constraints.hpp"
+#include "form/feature/summary.hpp"
+#ifdef FORM_ENABLE_CUDA
+#include "form/feature/cuda_qr.hpp"
+#endif
 #include <gtsam/linear/GaussianFactorGraph.h>
 #include <gtsam/linear/HessianFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/NonlinearOptimizerParams.h>
 #include <gtsam/nonlinear/Values.h>
 #include <tuple>
+#include <tbb/parallel_for.h>
+#include <unordered_set>
 
 using gtsam::Pose3;
 using gtsam::symbol_shorthand::X;
@@ -100,18 +106,106 @@ gtsam::Pose3 ConstraintManager::predict_next() const noexcept {
   }
 }
 
-gtsam::Values ConstraintManager::optimize(bool fast) noexcept {
+ConstraintManager::Workload ConstraintManager::workload() const noexcept {
+  Workload result;
+  for (const auto& [j, pairs] : m_constraints) {
+    for (const auto& [i, pair] : pairs) {
+      if (is_empty(pair)) continue;
+      ++result.factors;
+      result.planar_correspondences += std::get<0>(pair)->num_residuals();
+      result.point_correspondences += std::get<1>(pair)->num_residuals() / 3;
+    }
+  }
+  return result;
+}
+
+void ConstraintManager::prepare_cpu_summaries() {
+  profile::Scope timer(profile::summary_prepare_wall);
+  std::vector<std::tuple<PlanePoint::Ptr, PointPoint::Ptr>> pending;
+  std::unordered_set<const PlanePoint*> scheduled;
+  for (const auto& [j, pairs] : m_constraints) {
+    for (const auto& [i, pair] : pairs) {
+      if (!is_empty(pair) && !std::get<0>(pair)->summaryValidFor(std::get<1>(pair)) &&
+          scheduled.insert(std::get<0>(pair).get()).second)
+        pending.push_back(pair);
+    }
+  }
+  // Deduplicate cache owners, including aliases inserted through the public
+  // constraint map. Factor construction handles any other point-set pairing
+  // serially afterward. Finish all cache writes
+  // before constructing or linearizing factors that consume these snapshots.
+  tbb::parallel_for(size_t(0), pending.size(), [&](size_t index) {
+    const auto& planes = std::get<0>(pending[index]);
+    const auto& points = std::get<1>(pending[index]);
+    profile::Scope build_timer(profile::summary_build_cpu);
+    planes->summary_cache = std::make_shared<FeatureSummary>(*planes, *points);
+    planes->summary_point_revision = points->revision;
+    planes->summary_point_owner = points;
+  });
+}
+
+void ConstraintManager::prepare_cuda_summaries() {
+  profile::Scope timer(profile::summary_prepare_wall);
+#ifdef FORM_ENABLE_CUDA
+  std::vector<std::tuple<PlanePoint::Ptr, PointPoint::Ptr>> pending;
+  std::vector<BatchedCudaQr::Correspondences> inputs;
+  for (const auto& [j, pairs] : m_constraints) {
+    for (const auto& [i, pair] : pairs) {
+      if (is_empty(pair)) continue;
+      const auto& planes = std::get<0>(pair);
+      const auto& points = std::get<1>(pair);
+      if (planes->summaryValidFor(points)) continue;
+      pending.push_back(pair);
+      inputs.push_back({planes->p_i.data(),planes->p_j.data(),planes->n_i.data(),planes->num_constraints(),true});
+      inputs.push_back({points->p_i.data(),points->p_j.data(),nullptr,points->num_constraints(),false});
+    }
+  }
+  if (pending.empty()) return;
+  if (!m_cuda_qr) m_cuda_qr = std::make_shared<BatchedCudaQr>();
+  const auto roots = m_cuda_qr->computeCorrespondences(inputs);
+  for (size_t index = 0; index < pending.size(); ++index) {
+    auto& planes = std::get<0>(pending[index]);
+    auto& points = std::get<1>(pending[index]);
+    planes->summary_cache = std::make_shared<FeatureSummary>(roots[2*index], roots[2*index+1]);
+    planes->summary_point_revision = points->revision;
+    planes->summary_point_owner = points;
+  }
+#else
+  throw std::runtime_error("CUDA summary backend requested in a build without FORM_ENABLE_CUDA");
+#endif
+}
+
+gtsam::Values ConstraintManager::optimize(bool fast) {
+  if (m_params.use_cuda_dense_solver) {
+    if (m_params.cuda_solve_min_dimension < 1)
+      throw std::invalid_argument("cuda_solve_min_dimension must be positive");
+#ifdef FORM_ENABLE_CUDA
+    if (!m_cuda_solver) m_cuda_solver = std::make_shared<CudaDenseSolver>();
+#else
+    throw std::runtime_error("CUDA dense solver requested in a build without FORM_ENABLE_CUDA");
+#endif
+  }
+  if (m_params.use_cuda_summaries) prepare_cuda_summaries();
+  else if (m_params.use_summary) prepare_cpu_summaries();
   if (m_params.disable_smoothing) {
     auto graph = get_single_graph();
     gtsam::Values values;
     values.insert(X(m_scan), get_pose(m_scan));
 
-    DenseLMOptimizer optimizer(graph, values, m_params.opt_params);
-    return optimizer.optimize();
+    DenseLMOptimizer optimizer(graph, values, m_params.opt_params,
+                               m_cuda_solver, m_params.cuda_solve_min_dimension);
+    profile::last_initial_error.store(optimizer.error(), std::memory_order_relaxed);
+    auto result = optimizer.optimize();
+    profile::last_final_error.store(optimizer.error(), std::memory_order_relaxed);
+    return result;
   } else {
     auto graph = get_graph(fast);
-    DenseLMOptimizer optimizer(graph, m_values, m_params.opt_params);
-    return optimizer.optimize();
+    DenseLMOptimizer optimizer(graph, m_values, m_params.opt_params,
+                               m_cuda_solver, m_params.cuda_solve_min_dimension);
+    profile::last_initial_error.store(optimizer.error(), std::memory_order_relaxed);
+    auto result = optimizer.optimize();
+    profile::last_final_error.store(optimizer.error(), std::memory_order_relaxed);
+    return result;
   }
 
   // Solve!
@@ -155,7 +249,7 @@ void ConstraintManager::marginalize(const std::vector<ScanIndex> &scans) noexcep
 
       if (is_marg_scan(i) || is_marg_scan(j)) {
         dropped_factors.push_back(FeatureFactor(X(i), pose_j_key, planar_constraints,
-                                                m_params.planar_constraint_sigma));
+                                                m_params.planar_constraint_sigma, m_params.use_summary || m_params.use_cuda_summaries));
       }
     }
   }
@@ -241,8 +335,9 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_single_graph() noexcept {
       continue;
 
     auto factor = FeatureFactor(X(i), X(m_scan), planar_constraints,
-                                m_params.planar_constraint_sigma);
-    auto binary_factor = BinaryFactorWrapper::Create(get_pose(i), X(m_scan), factor);
+                                m_params.planar_constraint_sigma, m_params.use_summary || m_params.use_cuda_summaries);
+    auto binary_factor = BinaryFactorWrapper::Create(get_pose(i), X(m_scan), factor,
+        m_params.use_summary || m_params.use_cuda_summaries);
     graph.push_back(binary_factor);
   }
 
@@ -261,7 +356,7 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) noexcept {
         continue;
 
       graph.push_back(FeatureFactor(X(i), X(m_scan), planar_constraints,
-                                    m_params.planar_constraint_sigma));
+                                    m_params.planar_constraint_sigma, m_params.use_summary || m_params.use_cuda_summaries));
     }
 
     // If we don't have the linear factor, compute it
@@ -277,7 +372,7 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) noexcept {
             continue;
           previous_matches.push_back(
               FeatureFactor(X(i), pose_j_key, planar_constraints,
-                            m_params.planar_constraint_sigma));
+                            m_params.planar_constraint_sigma, m_params.use_summary || m_params.use_cuda_summaries));
         }
       }
       // Don't use linearizeToHessianFactor, as it linearizes sequentially.
@@ -299,7 +394,7 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) noexcept {
         if (is_empty(planar_constraints))
           continue;
         graph.push_back(FeatureFactor(X(i), pose_j_key, planar_constraints,
-                                      m_params.planar_constraint_sigma));
+                                      m_params.planar_constraint_sigma, m_params.use_summary || m_params.use_cuda_summaries));
       }
     }
   }

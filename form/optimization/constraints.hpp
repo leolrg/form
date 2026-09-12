@@ -40,6 +40,8 @@
 #include <optional>
 
 namespace form {
+class BatchedCudaQr;
+class CudaDenseSolver;
 
 using ScanIndex = size_t;
 
@@ -52,6 +54,12 @@ public:
   /// @brief Parameters for the constraint manager
   /// Rarely changed, defaults should be fine
   struct Params {
+    /// Exact fixed-correspondence QR summaries, retaining reference path by default.
+    bool use_summary = false;
+    bool use_cuda_summaries = false;
+    /// Experimental selective dense solving; independent of summary preparation.
+    bool use_cuda_dense_solver = false;
+    int cuda_solve_min_dimension = 240;
     // Used for ablations, optimize a single pose at a time
     bool disable_smoothing = false;
 
@@ -97,6 +105,10 @@ private:
   /// m_constraints[j][i] = (plane_point_factor, point_point_factor)
   /// where j > i
   ConstraintMapMap m_constraints;
+  std::shared_ptr<BatchedCudaQr> m_cuda_qr;
+  std::shared_ptr<CudaDenseSolver> m_cuda_solver;
+  void prepare_cuda_summaries();
+  void prepare_cpu_summaries();
 
 public:
   /// @brief Default constructor
@@ -119,7 +131,7 @@ public:
 
   /// @brief Optimize over the existing constraints, but don't save results
   /// fast => linearize previous matches
-  gtsam::Values optimize(bool fast = false) noexcept;
+  gtsam::Values optimize(bool fast = false);
 
   /// @brief Marginalize out the given scans
   void marginalize(const std::vector<ScanIndex> &scans) noexcept;
@@ -157,6 +169,12 @@ public:
 
   /// @brief Get the pose for the current scan
   const gtsam::Pose3 get_current_pose() const noexcept;
+
+  struct Workload {
+    size_t factors = 0, planar_correspondences = 0, point_correspondences = 0;
+  };
+  /// Current stored scan-pair constraints, before marginalization.
+  Workload workload() const noexcept;
 
   /// @brief Get all the current state estimates
   const gtsam::Values &get_values() const noexcept { return m_values; }

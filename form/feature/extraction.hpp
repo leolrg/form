@@ -34,6 +34,7 @@
 #include <tbb/parallel_for.h>
 
 #include <optional>
+#include <stdexcept>
 
 namespace form {
 
@@ -85,6 +86,10 @@ public:
     int num_columns = 1024;
     /// @brief Number of rows aka scanlines in the LiDAR scan
     int num_rows = 64;
+
+    /// @brief Suppress selected features within this many samples (exclusive).
+    /// Zero inherits neighbor_points; explicit values must not exceed it.
+    size_t feature_spacing = 0;
   };
 
   Params params;

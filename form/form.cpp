@@ -38,8 +38,10 @@ Estimator::Estimator(const Estimator::Params &params) noexcept
                      KeypointMap<PointFeat>(m_params.map)} {}
 
 std::tuple<std::vector<PlanarFeat>, std::vector<PointFeat>>
-Estimator::register_scan(const std::vector<PointXYZf> &scan) noexcept {
+Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   constexpr auto SEQ = std::make_index_sequence<2>{};
+  last_timing = {};
+  auto stage_start = profile::Clock::now();
 
   //
   // ############################ Feature Extraction ############################ //
@@ -53,6 +55,11 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) noexcept {
   const auto keypoints = m_extractor.extract(scan, scan_idx);
   const auto num_keypoints =
       std::apply([](auto &...kps) { return (kps.size() + ...); }, keypoints);
+  last_timing.extract_ms = profile::milliseconds(stage_start);
+  last_timing.planar_features = std::get<0>(keypoints).size();
+  last_timing.point_features = std::get<1>(keypoints).size();
+  last_timing.poses = m_constraints.get_values().size();
+  stage_start = profile::Clock::now();
 
   //
   // ############################### Optimization ############################### //
@@ -64,11 +71,15 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) noexcept {
                             m_params.matcher.max_dist_matching);
   });
 
+  last_timing.map_ms = profile::milliseconds(stage_start);
+
   // ICP loop
   gtsam::Values new_values;
   auto estimates = [&](size_t i) { return m_constraints.get_pose(i); };
   for (size_t idx = 0; idx < m_params.matcher.max_num_rematches; ++idx) {
+    ++last_timing.rematches;
     auto before = m_constraints.get_current_pose();
+    stage_start = profile::Clock::now();
 
     // -------------------------------- Matching -------------------------------- //
     // Match each type of feature
@@ -78,8 +89,12 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) noexcept {
                                                scan_constraints);
     });
 
+    last_timing.match_ms += profile::milliseconds(stage_start);
+    stage_start = profile::Clock::now();
+
     // ---------------------- Semi-Linearized Optimization ---------------------- //
     new_values = m_constraints.optimize(true);
+    last_timing.semi_ms += profile::milliseconds(stage_start);
     const auto after = new_values.at<Pose3>(X(scan_idx));
     const auto diff = before.localCoordinates(after).norm();
     if (diff < m_params.matcher.new_pose_threshold) {
@@ -89,8 +104,11 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) noexcept {
   }
 
   // ------------------------ Full Nonlinear Optimization ------------------------ //
+  stage_start = profile::Clock::now();
   new_values = m_constraints.optimize(false);
   m_constraints.update_values(new_values);
+  last_timing.full_ms = profile::milliseconds(stage_start);
+  stage_start = profile::Clock::now();
 
   //
   // ################################## Mapping ################################## //
@@ -105,10 +123,20 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) noexcept {
     return m_constraints.num_recent_connections(i, m_keyscanner.oldest_rf());
   };
   auto marg_scans = m_keyscanner.step(scan_idx, num_keypoints, connections);
+  last_timing.maintenance_ms = profile::milliseconds(stage_start);
+  stage_start = profile::Clock::now();
+
+  const auto workload = m_constraints.workload();
+  last_timing.factors = workload.factors;
+  last_timing.planar_correspondences = workload.planar_correspondences;
+  last_timing.point_correspondences = workload.point_correspondences;
 
   // ----------------------------- Marginalization ----------------------------- //
   m_constraints.marginalize(marg_scans);
+  last_timing.marginalize_ms = profile::milliseconds(stage_start);
+  stage_start = profile::Clock::now();
   tuple::for_each(m_keypoint_map, [&](auto &map) { map.remove(marg_scans); });
+  last_timing.maintenance_ms += profile::milliseconds(stage_start);
 
   return keypoints;
 }

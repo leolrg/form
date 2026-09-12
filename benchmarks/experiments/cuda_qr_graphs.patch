@@ -1,0 +1,65 @@
+--- a/form/feature/cuda_qr.cu
++++ b/form/feature/cuda_qr.cu
+@@ -6,6 +6,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <cstring>
++#include <cstdlib>
+ 
+ namespace form {
+ namespace {
+@@ -145,6 +146,9 @@
+ 
+ struct BatchedCudaQr::Impl {
+   cudaStream_t stream = nullptr;
++  cudaGraphExec_t graph = nullptr;
++  std::vector<uintptr_t> graph_key;
++  bool use_graphs = false;
+   Buffer<double> a, b;
+   Buffer<Task> descriptors;
+   HostBuffer<double> host_input, host_roots;
+@@ -158,9 +162,14 @@
+        (threads!=32 && threads!=64 && threads!=128 && threads!=256))
+       throw std::invalid_argument("Invalid CUDA QR tile or block size");
+     check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++    // Opt-in tuning experiment. Correspondence changes often invalidate the
++    // launch shape, so graph construction must be included in replay timing.
++    const char* graphs=std::getenv("FORM_CUDA_QR_GRAPHS");
++    use_graphs=graphs && std::strcmp(graphs,"1")==0;
+   }
+   ~Impl() {
+     if(stream) cudaStreamSynchronize(stream);
++    if(graph) cudaGraphExecDestroy(graph);
+     if(stream) cudaStreamDestroy(stream);
+   }
+ };
+@@ -303,7 +312,28 @@
+       first_level=false;
+     }
+   };
+-  launch();
++  if(use_graphs) {
++    std::vector<uintptr_t> key{reinterpret_cast<uintptr_t>(state.a.data),
++      reinterpret_cast<uintptr_t>(state.b.data),reinterpret_cast<uintptr_t>(state.descriptors.data)};
++    for(auto level:levels) {key.push_back(level.first);key.push_back(level.second);}
++    if(!graph || key!=graph_key) {
++      if(graph) {check(cudaGraphExecDestroy(graph));graph=nullptr;}
++      cudaGraph_t captured=nullptr;
++      check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
++      try {launch();}
++      catch(...) {
++        cudaStreamEndCapture(stream,&captured);
++        if(captured) cudaGraphDestroy(captured);
++        throw;
++      }
++      check(cudaStreamEndCapture(stream,&captured));
++      const auto status=cudaGraphInstantiateWithFlags(&graph,captured,0);
++      cudaGraphDestroy(captured);
++      check(status);
++      graph_key=std::move(key);
++    }
++    check(cudaGraphLaunch(graph,stream));
++  } else launch();
+   double* src=levels.size()%2?state.b.data:state.a.data;
+   check(cudaMemcpyAsync(state.host_roots.data,src,final_size*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
+   check(cudaStreamSynchronize(state.stream));

@@ -34,3 +34,6 @@ evalio_results
 figures
 graphics*
 *.mp4
+
+# Generated benchmark trajectories and timing records; publish curated reports in docs.
+benchmarks/results/

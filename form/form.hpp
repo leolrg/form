@@ -38,6 +38,13 @@ namespace form {
 
 /// @brief Main class for the FORM LiDAR odometry system
 struct Estimator {
+  struct ScanTiming {
+    double extract_ms = 0, map_ms = 0, match_ms = 0, semi_ms = 0;
+    double full_ms = 0, marginalize_ms = 0, maintenance_ms = 0;
+    size_t factors = 0, planar_correspondences = 0, point_correspondences = 0;
+    size_t poses = 0, planar_features = 0, point_features = 0, rematches = 0;
+  };
+  ScanTiming last_timing;
   /// @brief Parameters for the Estimator
   struct Params {
     /// @brief Extraction params
@@ -84,7 +91,7 @@ struct Estimator {
 
   /// @brief Register a new scan and return the extracted features
   std::tuple<std::vector<PlanarFeat>, std::vector<PointFeat>>
-  register_scan(const std::vector<PointXYZf> &scan) noexcept;
+  register_scan(const std::vector<PointXYZf> &scan);
 };
 
 } // namespace form

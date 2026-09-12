@@ -11,16 +11,16 @@ find_package(
 FetchContent_Declare(
     nanobind
     GIT_REPOSITORY https://github.com/wjakob/nanobind
-    GIT_TAG v2.12.0
-        FIND_PACKAGE_ARGS CONFIG
+    GIT_TAG v2.13.0
+        FIND_PACKAGE_ARGS 2.13.0 EXACT CONFIG
 )
 FetchContent_MakeAvailable(nanobind)
 
 FetchContent_Declare(
     evalio
     GIT_REPOSITORY https://github.com/contagon/evalio.git
-    GIT_TAG "v0.5.0"
-        FIND_PACKAGE_ARGS
+    GIT_TAG "v0.6.1"
+        FIND_PACKAGE_ARGS 0.6.1 EXACT
 )
 FetchContent_MakeAvailable(evalio)
 

@@ -77,6 +77,7 @@ public:
     (double,     planar_threshold, 1.0, params_.extraction.planar_threshold),
     (int, planar_feats_per_sector,  50, params_.extraction.planar_feats_per_sector),
     (int,  point_feats_per_sector,   3, params_.extraction.point_feats_per_sector),
+    (int,        feature_spacing,   0, params_.extraction.feature_spacing),
     (double,               radius, 1.0, params_.extraction.radius),
     (int,              min_points,   5, params_.extraction.min_points),
     // OPTIMIZATION
@@ -84,6 +85,10 @@ public:
     (double, new_pose_threshold,  1e-4, params_.matcher.new_pose_threshold),
     (int,     max_num_rematches,    30, params_.matcher.max_num_rematches),
     (bool,    disable_smoothing, false, params_.constraints.disable_smoothing),
+    (bool,         use_summary, false, params_.constraints.use_summary),
+    (bool,  use_cuda_summaries, false, params_.constraints.use_cuda_summaries),
+    (bool, use_cuda_dense_solver, false, params_.constraints.use_cuda_dense_solver),
+    (int, cuda_solve_min_dimension, 240, params_.constraints.cuda_solve_min_dimension),
     // MAPPING
     (int,         max_num_keyscans,  50, params_.scans.max_num_keyscans),
     (int,     max_num_recent_scans,  10, params_.scans.max_num_recent_scans),
@@ -145,6 +150,15 @@ NB_MODULE(_core, m) {
   m.doc() = "Custom evalio pipeline example";
 
   nb::module_ eval = nb::module_::import_("evalio");
+  // Cross-module inheritance requires the same nanobind ABI on both sides.
+  // Report incompatible installations before nb::class_ would abort the process.
+  nb::module_ eval_cpp = nb::module_::import_("evalio._cpp");
+  if (!nb::hasattr(eval_cpp, "abi_tag") ||
+      nb::cast<std::string>(eval_cpp.attr("abi_tag")()) != nb::detail::abi_tag()) {
+    throw nb::import_error(
+        "FORM and evalio use incompatible nanobind ABIs. Rebuild FORM with "
+        "evalio==0.6.1 and nanobind==2.13.0 in the build environment.");
+  }
 
   // Only have to override the static methods here
   // All the others will be automatically inherited from the base class

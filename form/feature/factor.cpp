@@ -20,12 +20,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "form/feature/factor.hpp"
+#include "form/feature/summary.hpp"
 #include "form/optimization/gtsam.hpp"
 #include <gtsam/linear/HessianFactor.h>
 #include <gtsam/linear/JacobianFactor.h>
 #include <gtsam/linear/NoiseModel.h>
 
 namespace form {
+bool PlanePoint::summaryValidFor(const std::shared_ptr<PointPoint> &points) const noexcept {
+  return summary_cache && points && summary_point_owner.lock() == points &&
+         summary_point_revision == points->revision;
+}
+
 // ------------------------- Separate Computation ------------------------- //
 [[nodiscard]] gtsam::Vector
 PlanePoint::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
@@ -131,17 +137,49 @@ PointPoint::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
 FeatureFactor::FeatureFactor(
     const gtsam::Key i, const gtsam::Key j,
     const std::tuple<PlanePoint::Ptr, PointPoint::Ptr> &constraints,
-    double sigma) noexcept
+    double sigma, bool use_summary) noexcept
     : DenseFactor(
           FastIsotropic::Sigma(sigma, std::get<0>(constraints)->num_residuals() +
                                           std::get<1>(constraints)->num_residuals()),
           i, j),
-      plane_point(std::get<0>(constraints)), point_point(std::get<1>(constraints)) {}
+      plane_point(std::get<0>(constraints)), point_point(std::get<1>(constraints)),
+      inverse_variance_(1.0 / (sigma * sigma)) {
+  if (use_summary) {
+    if (!plane_point->summaryValidFor(point_point)) {
+      profile::Scope summary_timer(profile::summary_build_cpu);
+      plane_point->summary_cache = std::make_shared<FeatureSummary>(*plane_point, *point_point);
+      plane_point->summary_point_revision = point_point->revision;
+      plane_point->summary_point_owner = point_point;
+    }
+    summary_ = plane_point->summary_cache;
+  }
+}
+
+boost::shared_ptr<gtsam::GaussianFactor>
+FeatureFactor::linearize(const gtsam::Values &values) const {
+  if (!active(values)) return {};
+  if (!summary_) return DenseFactor::linearize(values);
+  profile::Scope timer(profile::factor_linearize);
+  const auto h = (summary_->augmentedHessian(values.at<gtsam::Pose3>(key1()),
+                                           values.at<gtsam::Pose3>(key2())) * inverse_variance_).eval();
+  return boost::make_shared<gtsam::HessianFactor>(key1(), key2(),
+      h.block<6,6>(0,0), h.block<6,6>(0,6), h.block<6,1>(0,12),
+      h.block<6,6>(6,6), h.block<6,1>(6,12), h(12,12));
+}
+
+double FeatureFactor::error(const gtsam::Values &values) const {
+  if (!active(values)) return 0.0;
+  if (!summary_) return DenseFactor::error(values);
+  profile::Scope timer(profile::factor_error);
+  return 0.5 * inverse_variance_ * summary_->squaredError(
+      values.at<gtsam::Pose3>(key1()), values.at<gtsam::Pose3>(key2()));
+}
 
 [[nodiscard]] gtsam::Vector
 FeatureFactor::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
                              boost::optional<gtsam::Matrix &> H1,
                              boost::optional<gtsam::Matrix &> H2) const noexcept {
+  profile::Scope timer(H1 || H2 ? profile::factor_eval : profile::factor_error);
 
   size_t size = plane_point->num_residuals() + point_point->num_residuals();
   gtsam::Vector residual(size);

@@ -28,6 +28,8 @@
 #include "form/optimization/gtsam.hpp"
 
 namespace form {
+struct FeatureSummary;
+struct PointPoint;
 
 static void check(const gtsam::SharedNoiseModel &noiseModel, size_t m) {
   if (noiseModel && m != noiseModel->dim())
@@ -44,15 +46,30 @@ struct PlanePoint {
   /// @brief Shared pointer type
   typedef std::shared_ptr<PlanePoint> Ptr;
 
-  /// @brief Vectors to hold point and normal data
+  /// @brief Vectors to hold point and normal data.
+  /// Call invalidateSummary() after modifying these arrays directly.
   std::vector<double> p_i;
   std::vector<double> n_i;
   std::vector<double> p_j;
+  // Reused by all graph instances until either correspondence set changes.
+  std::shared_ptr<const FeatureSummary> summary_cache;
+  size_t summary_point_revision = 0;
+  std::weak_ptr<PointPoint> summary_point_owner;
 
   PlanePoint() = default;
 
+  /// Invalidate cached summaries after direct mutation of correspondence arrays.
+  /// Factors already constructed retain their immutable summary snapshots.
+  void invalidateSummary() noexcept {
+    summary_cache.reset();
+    summary_point_owner.reset();
+  }
+
+  bool summaryValidFor(const std::shared_ptr<PointPoint> &points) const noexcept;
+
   /// @brief Add a new plane-point correspondence
   void push_back(const PlanarFeat &p_i_, const PlanarFeat &p_j_) {
+    invalidateSummary();
     p_i.insert(p_i.end(), {p_i_.x, p_i_.y, p_i_.z});
     n_i.insert(n_i.end(), {p_i_.nx, p_i_.ny, p_i_.nz});
     p_j.insert(p_j.end(), {p_j_.x, p_j_.y, p_j_.z});
@@ -60,6 +77,7 @@ struct PlanePoint {
 
   /// @brief Clear all stored correspondences
   void clear() noexcept {
+    invalidateSummary();
     p_i.clear();
     n_i.clear();
     p_j.clear();
@@ -92,20 +110,27 @@ struct PointPoint {
   /// @brief Shared pointer type
   typedef std::shared_ptr<PointPoint> Ptr;
 
-  /// @brief Vectors to hold point data
+  /// @brief Vectors to hold point data.
+  /// Call invalidateSummary() after modifying these arrays directly.
   std::vector<double> p_i;
   std::vector<double> p_j;
+  size_t revision = 0;
 
   PointPoint() = default;
 
+  /// Invalidate dependent summaries after direct mutation of correspondence arrays.
+  void invalidateSummary() noexcept { ++revision; }
+
   /// @brief Add a new point-point correspondence
   void push_back(const PointFeat &p_i_, const PointFeat &p_j_) {
+    invalidateSummary();
     p_i.insert(p_i.end(), {p_i_.x, p_i_.y, p_i_.z});
     p_j.insert(p_j.end(), {p_j_.x, p_j_.y, p_j_.z});
   }
 
   /// @brief Clear all stored correspondences
   void clear() noexcept {
+    invalidateSummary();
     p_i.clear();
     p_j.clear();
   }
@@ -147,7 +172,17 @@ public:
   /// @param sigma The isotropic noise standard deviation
   FeatureFactor(const gtsam::Key i, const gtsam::Key j,
                 const std::tuple<PlanePoint::Ptr, PointPoint::Ptr> &constraint,
-                double sigma) noexcept;
+                double sigma, bool use_summary = false) noexcept;
+
+  boost::shared_ptr<gtsam::GaussianFactor>
+  linearize(const gtsam::Values &values) const override;
+  double error(const gtsam::Values &values) const override;
+
+private:
+  std::shared_ptr<const FeatureSummary> summary_;
+  double inverse_variance_;
+
+public:
 
   /// @brief Evaluate the residual given two poses
   ///

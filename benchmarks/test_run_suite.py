@@ -1,0 +1,109 @@
+import csv
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+import run_suite as r
+
+
+class SuiteTests(unittest.TestCase):
+    def test_workload_variants_change_independently(self):
+        self.assertEqual(r.CONFIGS['current'], {'points':3,'planes':50,'recent':10})
+        self.assertEqual(r.CONFIGS['features'], {'points':6,'planes':100,'feature-spacing':2,'recent':10})
+        self.assertEqual(r.CONFIGS['window'], {'points':3,'planes':50,'recent':40})
+
+    def test_quality_gate_has_absolute_floor_and_requires_all_metrics(self):
+        def report(value):
+            return {'matched_poses':100,**{f'rte_{n}m':{'translation_m':{metric:value for metric in ('mean','median','rmse','max')}}
+                                          for n in (1,30)}}
+        self.assertEqual(r.quality_gate(report(.1),report(.109))['status'],'pass')
+        self.assertEqual(r.quality_gate(report(.1),report(.111))['status'],'fail')
+        self.assertEqual(r.quality_gate(report(1),report(1.04))['status'],'pass')
+        self.assertEqual(r.quality_gate(report(1),report(1.06))['status'],'fail')
+        self.assertEqual(r.quality_gate(report(1),{})['status'],'missing')
+        for window in ('rte_1m','rte_30m'):
+            for metric in ('median','max'):
+                candidate=report(.1)
+                candidate[window]['translation_m'][metric]=.111
+                self.assertEqual(r.quality_gate(report(.1),candidate)['status'],'fail')
+                del candidate[window]['translation_m'][metric]
+                self.assertEqual(r.quality_gate(report(.1),candidate)['status'],'missing')
+        self.assertEqual(len(r.GATE['metrics']),8)
+        candidate=report(.1);candidate['matched_poses']=99
+        self.assertEqual(r.quality_gate(report(.1),candidate)['status'],'fail')
+
+    def test_verify_outputs_rejects_incomplete_and_wrong_stamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix=Path(tmp)/'run'
+            Path(str(prefix)+'.csv').write_text('scan,stamp_ns,total_ms\n0,1000000000,2\n1,2000000000,3\n')
+            Path(str(prefix)+'.tum').write_text('1 0 0 0 0 0 0 1\n2 0 0 0 0 0 0 1\n')
+            self.assertEqual(r.verify_outputs(prefix,2)['count'],2)
+            with self.assertRaises(ValueError):
+                r.verify_outputs(prefix,3)
+            Path(str(prefix)+'.tum').write_text('1 0 0 0 0 0 0 1\n3 0 0 0 0 0 0 1\n')
+            with self.assertRaises(ValueError):
+                r.verify_outputs(prefix,2)
+
+    def test_completed_resume_requires_matching_fingerprint_and_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix=Path(tmp)/'run'
+            Path(str(prefix)+'.csv').write_text('scan,stamp_ns,total_ms\n0,1000000000,2\n')
+            Path(str(prefix)+'.tum').write_text('1 0 0 0 0 0 0 1\n')
+            outputs=r.verify_outputs(prefix,1)
+            record={'status':'complete','fingerprint':'abc','outputs':outputs}
+            r.verify_resume(record,prefix,1,'abc')
+            with self.assertRaises(ValueError):
+                r.verify_resume(record,prefix,1,'different')
+            Path(str(prefix)+'.csv').write_text('scan,stamp_ns,total_ms\n0,1000000000,4\n')
+            with self.assertRaises(ValueError):
+                r.verify_resume(record,prefix,1,'abc')
+            record['status']='running'
+            with self.assertRaises(ValueError):
+                r.verify_resume(record,prefix,1,'abc')
+
+
+class RunnerIntegrationTests(unittest.TestCase):
+    def test_sequential_execution_resume_and_missing_aggregation(self):
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            worker=root/'fake_replay.py'
+            worker.write_text("""import sys
+from pathlib import Path
+prefix=Path(sys.argv[1])
+Path(str(prefix)+'.csv').write_text('scan,stamp_ns,total_ms,semi_ms,full_ms,marginalize_ms\\n'+''.join(f'{i},{(i+1)*1000000000},10,2,1,1\\n' for i in range(35)))
+Path(str(prefix)+'.tum').write_text(''.join(f'{i+1} {i} 0 0 0 0 0 1\\n' for i in range(35)))
+""")
+            gt=root/'gt.tum'
+            gt.write_text(''.join(f'{i+1} {i} 0 0 0 0 0 1\n' for i in range(35)))
+            specs=[]
+            for backend in ('reference','summary'):
+                spec={'id':backend,'sequence':'stairs','config':'current','backend':backend,
+                      'repeat':1,'expected_scans':35,'fingerprint':'fixed',
+                      'ground_truth':str(gt),'argv':[sys.executable,str(worker),str(root/backend)]}
+                specs.append(spec)
+            manifest={'runs':specs}
+            before=r.aggregate(manifest,root)
+            self.assertEqual(before['comparisons'][0]['quality_gate_status'],'missing')
+            for spec in specs:
+                r.execute(spec,root,{})
+                record=root/(spec['id']+'.run.json')
+                saved=record.read_bytes()
+                r.execute(spec,root,{})
+                self.assertEqual(record.read_bytes(),saved)
+            after=r.aggregate(manifest,root)
+            self.assertEqual(after['comparisons'][0]['quality_gate_status'],'pass')
+            self.assertTrue(all(item['status']=='complete' for item in after['runs']))
+            self.assertGreater(json.loads((root/'reference.run.json').read_text())['resources']['peak_rss_kib'],0)
+
+
+class GpuMemoryTests(unittest.TestCase):
+    def test_sums_only_target_process_memory_and_ignores_na(self):
+        sample='123, 12\n456, 1024\n123, 20\n789, [N/A]\n'
+        self.assertEqual(r.gpu_memory_from_csv(sample,{123,789}),32)
+        self.assertIsNone(r.gpu_memory_from_csv(sample,{999}))
+
+
+if __name__ == '__main__':
+    unittest.main()

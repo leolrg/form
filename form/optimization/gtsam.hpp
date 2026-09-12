@@ -26,6 +26,11 @@
 #include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/nonlinear/LevenbergMarquardtParams.h>
+#include <gtsam/linear/Scatter.h>
+#include "form/optimization/profile.hpp"
+#ifdef FORM_ENABLE_CUDA
+#include "form/optimization/cuda_solver.hpp"
+#endif
 
 /*
 This file contains a handful of helper to help gtsam run dense optimizations.
@@ -34,22 +39,57 @@ Most of gtsam is optimized for sparse problems, so we shortcut a handful of plac
 make it faster when sparsity isn't a concern.
 */
 namespace form {
+class CudaDenseSolver;
 
 /// @brief Extension of LM that uses dense optimization instead of sparse bayes tree
 /// solver.
 class DenseLMOptimizer : public gtsam::LevenbergMarquardtOptimizer {
+  std::shared_ptr<CudaDenseSolver> cuda_solver_;
+  int cuda_min_dimension_;
 public:
   /// @brief Constructor
   DenseLMOptimizer(const gtsam::NonlinearFactorGraph &graph,
                    const gtsam::Values &initialValues,
-                   const gtsam::LevenbergMarquardtParams &params)
-      : LevenbergMarquardtOptimizer(graph, initialValues, params) {}
+                   const gtsam::LevenbergMarquardtParams &params,
+                   std::shared_ptr<CudaDenseSolver> cuda_solver = {},
+                   int cuda_min_dimension = 240)
+      : LevenbergMarquardtOptimizer(graph, initialValues, params),
+        cuda_solver_(std::move(cuda_solver)), cuda_min_dimension_(cuda_min_dimension) {}
 
   /// @brief Solve densely instead of using the sparse solver
   gtsam::VectorValues
   solve(const gtsam::GaussianFactorGraph &gfg,
         const gtsam::NonlinearOptimizerParams &params) const override {
-    return gfg.optimizeDensely();
+    if (!profile::enabled && !cuda_solver_) return gfg.optimizeDensely();
+    // Same operations as GTSAM 4.2 optimizeDensely(), with the assembly and
+    // numerical solve measured separately.
+    auto start = profile::Clock::now();
+    gtsam::Scatter scatter(gfg);
+    gtsam::HessianFactor combined(gfg, scatter);
+    gtsam::Matrix augmented = combined.info().selfadjointView();
+    if (profile::enabled)
+      profile::assemble += static_cast<uint64_t>(profile::milliseconds(start) * 1e6);
+    if (profile::enabled && profile::solve_observer) profile::solve_observer(augmented);
+    profile::Scope timer(profile::solve);
+    const auto n = augmented.rows() - 1;
+#ifdef FORM_ENABLE_CUDA
+    if (cuda_solver_ && n >= cuda_min_dimension_) {
+      profile::cuda_solve_calls.fetch_add(1, std::memory_order_relaxed);
+      gtsam::Vector solution;
+      if (cuda_solver_->solve(augmented, solution))
+        return gtsam::VectorValues(solution, scatter);
+      profile::cuda_solve_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
+    Eigen::LLT<gtsam::Matrix, Eigen::Upper> llt(augmented.topLeftCorner(n, n));
+    gtsam::Vector solution = llt.solve(augmented.topRightCorner(n, 1));
+    return gtsam::VectorValues(solution, scatter);
+  }
+
+  gtsam::GaussianFactorGraph::shared_ptr linearize() const override {
+    profile::Scope timer(profile::linearize_wall);
+    profile::iterations.fetch_add(1, std::memory_order_relaxed);
+    return LevenbergMarquardtOptimizer::linearize();
   }
 };
 
@@ -66,6 +106,7 @@ public:
   // https://github.com/borglab/gtsam/blob/develop/gtsam/nonlinear/NonlinearFactor.cpp#L152
   boost::shared_ptr<gtsam::GaussianFactor>
   linearize(const gtsam::Values &x) const override {
+    profile::Scope timer(profile::factor_linearize);
     // Call evaluate error to get Jacobians and RHS vector b
     std::vector<gtsam::Matrix> A(size());
     gtsam::Vector b = -unwhitenedError(x, A);
@@ -148,16 +189,42 @@ class BinaryFactorWrapper : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
 private:
   boost::shared_ptr<Wrapped> factor_;
   gtsam::Pose3 pose_i_;
+  bool use_dense_;
 
 public:
   BinaryFactorWrapper(const gtsam::Pose3 &pose_i, const gtsam::Key &key,
-                      const boost::shared_ptr<Wrapped> &factor)
-      : Base(factor->noiseModel(), key), factor_(factor), pose_i_(pose_i) {}
+                      const boost::shared_ptr<Wrapped> &factor, bool use_dense = false)
+      : Base(factor->noiseModel(), key), factor_(factor), pose_i_(pose_i),
+        use_dense_(use_dense) {}
 
   template <typename T>
   static BinaryFactorWrapper Create(const gtsam::Pose3 &pose, const gtsam::Key &key,
-                                    const T &factor) {
-    return BinaryFactorWrapper(pose, key, boost::make_shared<T>(factor));
+                                    const T &factor, bool use_dense = false) {
+    return BinaryFactorWrapper(pose, key, boost::make_shared<T>(factor), use_dense);
+  }
+
+  /// Preserve the wrapped factor's dense/summarized implementation when requested.
+  boost::shared_ptr<gtsam::GaussianFactor>
+  linearize(const gtsam::Values &values) const override {
+    if (!use_dense_) return Base::linearize(values);
+    if (!active(values)) return {};
+    gtsam::Values binary_values;
+    binary_values.insert(factor_->key1(), pose_i_);
+    binary_values.insert(factor_->key2(), values.at<gtsam::Pose3>(key()));
+    const auto linear = factor_->linearize(binary_values);
+    if (!linear) return {};
+    const auto h = linear->augmentedInformation();
+    return boost::make_shared<gtsam::HessianFactor>(key(), h.block<6, 6>(6, 6),
+                                                  h.block<6, 1>(6, 12), h(12, 12));
+  }
+
+  double error(const gtsam::Values &values) const override {
+    if (!use_dense_) return Base::error(values);
+    if (!active(values)) return 0.0;
+    gtsam::Values binary_values;
+    binary_values.insert(factor_->key1(), pose_i_);
+    binary_values.insert(factor_->key2(), values.at<gtsam::Pose3>(key()));
+    return factor_->error(binary_values);
   }
 
   // Evaluate the factor

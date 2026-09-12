@@ -29,6 +29,9 @@ namespace form {
 template <typename Point>
 [[nodiscard]] std::tuple<std::vector<PlanarFeat>, std::vector<PointFeat>>
 FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const {
+  if (params.feature_spacing > params.neighbor_points) {
+    throw std::invalid_argument("feature_spacing must not exceed neighbor_points");
+  }
   using T = typename Point::Scalar;
   const size_t points_per_sector = params.num_columns / params.num_sectors;
 
@@ -337,6 +340,9 @@ void FeatureExtractor::extract_planar(const size_t &sector_start_point,
                                       std::vector<bool> &valid_mask) const noexcept {
 
   size_t num_sector_planar_features = 0;
+  const size_t feature_spacing = params.feature_spacing != 0
+                                     ? params.feature_spacing
+                                     : params.neighbor_points;
   // Iterate through all points in the sector
   for (size_t sorted_curv_idx = sector_start_point;
        sorted_curv_idx < sector_end_point; sorted_curv_idx++) {
@@ -344,7 +350,7 @@ void FeatureExtractor::extract_planar(const size_t &sector_start_point,
     if (valid_mask[curv.index] && curv.curvature < params.planar_threshold) {
       out_features.push_back(curv.index);
       // mark the neighbors as used so they aren't also added in
-      for (size_t n = 0; n < params.neighbor_points; n++) {
+      for (size_t n = 0; n < feature_spacing; n++) {
         valid_mask[curv.index + n] = false;
         valid_mask[curv.index - n] = false;
       }
@@ -362,6 +368,9 @@ void FeatureExtractor::extract_point(const size_t &sector_start_point,
                                      std::vector<size_t> &out_features,
                                      std::vector<bool> &valid_mask) const noexcept {
   size_t num_sector_point_features = 0;
+  const size_t feature_spacing = params.feature_spacing != 0
+                                     ? params.feature_spacing
+                                     : params.neighbor_points;
 
   if (params.point_feats_per_sector == 0) {
     return; // No point features to extract
@@ -385,7 +394,7 @@ void FeatureExtractor::extract_point(const size_t &sector_start_point,
       const size_t idx = unused_points[unused_idx];
       if (valid_mask[idx]) {
         out_features.push_back(idx);                          // Add to points
-        for (size_t n = 0; n < params.neighbor_points; n++) { // update mask
+        for (size_t n = 0; n < feature_spacing; n++) { // update mask
           valid_mask[idx + n] = false;
           valid_mask[idx - n] = false;
         }
