@@ -103,3 +103,7 @@ If you use FORM for any academic work, please cite:
   url={https://arxiv.org/abs/2510.09966}, 
 }
 ```
+
+The experimental `summary-batch` and `cuda-batch` replay backends also batch
+feature evaluation and dense assembly. See [broader CUDA results](docs/batched-cuda-results.md)
+for validation and the distinction between prefix screening and full-sequence results.

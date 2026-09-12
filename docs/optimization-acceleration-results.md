@@ -12,6 +12,10 @@ AMD EPYC Milan VM, with CUDA 13 and FP64 arithmetic. Performance on the intended
 desktop GPU remains unmeasured. The author's historical approximately 12 Hz result
 is not a measurement on this host or an acceptance threshold for this checkout.
 
+A subsequent opt-in resident graph-batching experiment is documented separately
+in [broader CUDA results](batched-cuda-results.md). Its prefix screening is not
+part of the 72 full replays summarized here.
+
 ## Current workload
 
 Mean optimization latency in milliseconds, averaging two runs per entry and
