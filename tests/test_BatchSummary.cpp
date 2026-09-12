@@ -74,3 +74,27 @@ TEST(BatchSummary, EmptyZeroResidualAndInvalidInputs) {
     EXPECT_THROW((form::BatchSummary(2,{{0,1,{},1.}},gpu)),std::invalid_argument);
   }
 }
+
+TEST(BatchSummary, ReusesWorkspaceAcrossGraphAndRootChanges) {
+  auto a=std::make_shared<form::FeatureSummary>(Eigen::Matrix<double,13,13>::Identity(),Eigen::Matrix<double,7,7>::Identity());
+  auto b=std::make_shared<form::FeatureSummary>((2*Eigen::Matrix<double,13,13>::Identity()).eval(),Eigen::Matrix<double,7,7>::Zero());
+  for(bool gpu:{false,true}) {
+#ifndef FORM_ENABLE_CUDA
+    if(gpu)continue;
+#endif
+    form::BatchSummary batch(2,{{0,1,a,1.}},gpu);
+    for(int n:{3,40,2,10}) {
+      std::vector<form::SummaryEdge> edges;
+      for(int i=0;i<n-1;++i)edges.push_back({i,n-1,i%2?a:b,.7});
+      std::vector<gtsam::Pose3> poses(n);
+      batch.reset(n,edges);
+      form::BatchSummary cpu(n,edges,false);
+      EXPECT_TRUE(batch.linearize(poses).isApprox(cpu.linearize(poses),2e-12));
+      EXPECT_NEAR(batch.error(poses),cpu.error(poses),2e-12);
+      for(auto& edge:edges){edge.summary=b;edge.weight=.3;}
+      batch.reset(n,edges);form::BatchSummary changed(n,edges,false);
+      EXPECT_TRUE(batch.linearize(poses).isApprox(changed.linearize(poses),2e-12));
+      batch.reset(n,{});EXPECT_TRUE(batch.linearize(poses).isZero());
+    }
+  }
+}

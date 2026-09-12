@@ -7,8 +7,15 @@ namespace form {
 namespace {
 void check(cudaError_t code) {if(code!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(code));}
 template<class T,bool Host=false> struct Buffer {
-  T* data=nullptr;
-  explicit Buffer(size_t count) {count=std::max<size_t>(1,count);if constexpr(Host) check(cudaMallocHost(reinterpret_cast<void**>(&data),count*sizeof(T)));else check(cudaMalloc(reinterpret_cast<void**>(&data),count*sizeof(T)));}
+  T* data=nullptr;size_t capacity=0;
+  explicit Buffer(size_t count) {reserve(count);}
+  void reserve(size_t count) {
+    count=std::max<size_t>(1,count);if(count<=capacity)return;
+    if(data) {if constexpr(Host)check(cudaFreeHost(data));else check(cudaFree(data));data=nullptr;capacity=0;}
+    if constexpr(Host)check(cudaMallocHost(reinterpret_cast<void**>(&data),count*sizeof(T)));
+    else check(cudaMalloc(reinterpret_cast<void**>(&data),count*sizeof(T)));
+    capacity=count;
+  }
   ~Buffer() {if constexpr(Host) cudaFreeHost(data);else cudaFree(data);}
   Buffer(const Buffer&)=delete;Buffer& operator=(const Buffer&)=delete;
 };
@@ -78,7 +85,12 @@ struct CudaSummaryBatch::Impl {
   ~Impl(){if(stream){cudaStreamSynchronize(stream);cudaStreamDestroy(stream);}}
 };
 CudaSummaryBatch::CudaSummaryBatch(int poses,const std::vector<BatchRoot>& roots,const std::vector<int>& offsets,const std::vector<int>& indices):impl_(std::make_unique<Impl>(poses,roots.size(),offsets.size(),indices.size())) {
-  auto& s=*impl_;
+  reset(poses,roots,offsets,indices);
+}
+void CudaSummaryBatch::reset(int poses,const std::vector<BatchRoot>& roots,const std::vector<int>& offsets,const std::vector<int>& indices) {
+  auto& s=*impl_;s.poses=poses;s.edges=roots.size();s.entries=(6*poses+1)*(6*poses+1);
+  s.roots.reserve(roots.size());s.pose_data.reserve(poses);s.offsets.reserve(offsets.size());s.indices.reserve(indices.size());
+  s.partial.reserve(roots.size()*169);s.output.reserve(s.entries);s.host_poses.reserve(poses);s.host_output.reserve(s.entries);
   if(!roots.empty())check(cudaMemcpyAsync(s.roots.data,roots.data(),roots.size()*sizeof(BatchRoot),cudaMemcpyHostToDevice,s.stream));
   check(cudaMemcpyAsync(s.offsets.data,offsets.data(),offsets.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));
   if(!indices.empty())check(cudaMemcpyAsync(s.indices.data,indices.data(),indices.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));

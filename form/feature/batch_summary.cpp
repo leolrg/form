@@ -9,7 +9,7 @@
 #include <stdexcept>
 namespace form {
 struct BatchSummary::Impl {
-  int poses,n;
+  int poses=0,n=0; bool gpu=false;
   std::vector<SummaryEdge> edges;
   std::vector<int> offsets,indices;
   std::vector<FeatureSummary::AugmentedHessian> partials;
@@ -30,21 +30,34 @@ struct BatchSummary::Impl {
   }
 };
 BatchSummary::BatchSummary(int pose_count,std::vector<SummaryEdge> edges,bool gpu):impl_(std::make_unique<Impl>()) {
+  impl_->gpu=gpu;reset(pose_count,std::move(edges));
+}
+void BatchSummary::reset(int pose_count,std::vector<SummaryEdge> edges) {
   if(pose_count<1 || pose_count>1000 || edges.size()>static_cast<size_t>(std::numeric_limits<int>::max()/169))
     throw std::invalid_argument("BatchSummary supports 1..1000 poses and int-indexed factors");
-  auto& s=*impl_; s.poses=pose_count;s.n=pose_count*6+1;s.edges=std::move(edges);
-  std::vector<std::vector<int>> contributions(static_cast<size_t>(s.n)*s.n);
-  for(size_t e=0;e<s.edges.size();++e) {
-    const auto& edge=s.edges[e];
+  auto& s=*impl_;
+  for(const auto& edge:edges)
     if(edge.i<0 || edge.j<0 || edge.i>=pose_count || edge.j>=pose_count || edge.i==edge.j || !edge.summary || !std::isfinite(edge.weight) || edge.weight<=0)
       throw std::invalid_argument("Invalid BatchSummary edge");
-    int mapping[13];for(int k=0;k<6;++k) {mapping[k]=6*edge.i+k;mapping[6+k]=6*edge.j+k;}mapping[12]=s.n-1;
-    for(int c=0;c<13;++c) for(int r=0;r<13;++r)
-      contributions[mapping[r]+s.n*mapping[c]].push_back(static_cast<int>(169*e+r+13*c));
+  bool same=pose_count==s.poses && edges.size()==s.edges.size();
+  if(same) for(size_t e=0;e<edges.size();++e) if(edges[e].i!=s.edges[e].i || edges[e].j!=s.edges[e].j) {same=false;break;}
+  s.poses=pose_count;s.n=pose_count*6+1;s.edges=std::move(edges);
+  if(!same) {
+    s.offsets.assign(static_cast<size_t>(s.n)*s.n+1,0);
+    auto entries=[&](auto consume) {
+      for(size_t e=0;e<s.edges.size();++e) {
+        const auto& edge=s.edges[e];int mapping[13];
+        for(int k=0;k<6;++k) {mapping[k]=6*edge.i+k;mapping[6+k]=6*edge.j+k;}mapping[12]=s.n-1;
+        for(int c=0;c<13;++c) for(int r=0;r<13;++r)
+          consume(mapping[r]+s.n*mapping[c],static_cast<int>(169*e+r+13*c));
+      }
+    };
+    entries([&](int cell,int){++s.offsets[cell+1];});
+    for(size_t k=1;k<s.offsets.size();++k)s.offsets[k]+=s.offsets[k-1];
+    s.indices.resize(s.offsets.back());auto cursor=s.offsets;
+    entries([&](int cell,int index){s.indices[cursor[cell]++]=index;});
   }
-  s.offsets.reserve(contributions.size()+1);s.offsets.push_back(0);
-  for(const auto& list:contributions) {s.indices.insert(s.indices.end(),list.begin(),list.end());s.offsets.push_back(s.indices.size());}
-  if(gpu) {
+  if(s.gpu) {
 #ifdef FORM_ENABLE_CUDA
     std::vector<BatchRoot> roots(s.edges.size());
     for(size_t e=0;e<roots.size();++e) {
@@ -52,7 +65,9 @@ BatchSummary::BatchSummary(int pose_count,std::vector<SummaryEdge> edges,bool gp
       std::copy_n(edge.summary->planeRoot().data(),169,root.plane);
       std::copy_n(edge.summary->pointRoot().data(),49,root.point);
     }
-    s.packed.resize(pose_count);s.cuda=std::make_unique<CudaSummaryBatch>(pose_count,roots,s.offsets,s.indices);
+    s.packed.resize(pose_count);
+    if(s.cuda)s.cuda->reset(pose_count,roots,s.offsets,s.indices);
+    else s.cuda=std::make_unique<CudaSummaryBatch>(pose_count,roots,s.offsets,s.indices);
 #else
     throw std::runtime_error("CUDA batch requested in CPU-only build");
 #endif

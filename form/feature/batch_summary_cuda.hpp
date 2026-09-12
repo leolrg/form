@@ -10,6 +10,8 @@ class CudaSummaryBatch {
   CudaSummaryBatch(int poses,const std::vector<BatchRoot>& roots,
                    const std::vector<int>& offsets,const std::vector<int>& indices);
   ~CudaSummaryBatch();
+  void reset(int poses,const std::vector<BatchRoot>& roots,
+             const std::vector<int>& offsets,const std::vector<int>& indices);
   // Output is column-major augmented system, or one squared error (without 1/2).
   void evaluate(const std::vector<BatchPose>& poses, double* output, bool cost);
  private:

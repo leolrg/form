@@ -17,7 +17,7 @@ int main() {
   tbb::global_control threads(tbb::global_control::max_allowed_parallelism,32);
   // Initialize the CUDA context before measuring per-graph setup.
   {form::BatchSummary warm(2,{},true);warm.error(std::vector<gtsam::Pose3>(2));}
-  std::cout<<std::setprecision(9)<<"poses,edges,points_per_edge,backend,setup_us,linearize_assemble_us,cost_us,setup_plus_5_iterations_us\n";
+  std::cout<<std::setprecision(9)<<"poses,edges,points_per_edge,backend,setup_us,reset_reuse_us,linearize_assemble_us,cost_us,modeled_reset_plus_5_iterations_us\n";
   for(int n:{10,30,40,80}) for(bool dense:{false,true}) for(int count:{32,128}) {
     std::vector<form::SummaryEdge> edges;std::vector<gtsam::Pose3> poses;gtsam::Values values;
     gtsam::NonlinearFactorGraph original,summary;
@@ -36,6 +36,8 @@ int main() {
     }
     std::unique_ptr<form::BatchSummary> cpu,gpu;std::vector<double> setups[2];
     for(int r=0;r<5;++r) for(int k=0;k<2;++k) {int b=(r+k)%2;std::unique_ptr<form::BatchSummary> temp;setups[b].push_back(timeUs([&]{temp=std::make_unique<form::BatchSummary>(n,edges,b==1);}));if(b)gpu=std::move(temp);else cpu=std::move(temp);}
+    std::vector<double> resets[2];
+    for(int r=0;r<12;++r) for(int k=0;k<2;++k) {int b=(r+k)%2;resets[b].push_back(timeUs([&]{(b?gpu:cpu)->reset(n,edges);}));}
     std::vector<double> linear[4],cost[4];
     for(int r=-2;r<12;++r) for(int k=0;k<4;++k) {
       int b=(r+2+k)%4;
@@ -44,8 +46,8 @@ int main() {
       if(r>=0){linear[b].push_back(l);cost[b].push_back(c);}
     }
     const char* labels[]={"original_cpu","summary_cpu","batch_cpu","batch_cuda"};
-    for(int b=0;b<4;++b) {double setup=b<2?0.:median(setups[b-2]),l=median(linear[b]),c=median(cost[b]);
-      std::cout<<n<<','<<edges.size()<<','<<count<<','<<labels[b]<<','<<setup<<','<<l<<','<<c<<','<<setup+5*(l+c)<<'\n';}
+    for(int b=0;b<4;++b) {double setup=b<2?0.:median(setups[b-2]),reset=b<2?0.:median(resets[b-2]),l=median(linear[b]),c=median(cost[b]);
+      std::cout<<n<<','<<edges.size()<<','<<count<<','<<labels[b]<<','<<setup<<','<<reset<<','<<l<<','<<c<<','<<reset+5*(l+c)<<'\n';}
     std::cout.flush();
   }
   std::cerr<<"checksum="<<checksum<<'\n';

@@ -14,6 +14,7 @@ class BatchSummary {
  public:
   BatchSummary(int pose_count, std::vector<SummaryEdge> edges, bool cuda);
   ~BatchSummary();
+  void reset(int pose_count, std::vector<SummaryEdge> edges);
   Eigen::MatrixXd linearize(const std::vector<gtsam::Pose3>& poses);
   double error(const std::vector<gtsam::Pose3>& poses);
  private:
