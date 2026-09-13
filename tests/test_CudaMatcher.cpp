@@ -1,4 +1,5 @@
 #include "form/optimization/cuda_matcher.hpp"
+#include "form/feature/cuda_qr.hpp"
 #include "form/feature/features.hpp"
 #include "form/mapping/map.hpp"
 #include <gtest/gtest.h>
@@ -166,4 +167,159 @@ TEST(CudaMatcher, FourDimensionalSearchStorageRefreshesAcrossRaggedResets) {
     EXPECT_EQ(result.index,count-1);
     EXPECT_DOUBLE_EQ(result.distance,.0625);
   }
+}
+
+
+namespace {
+const std::array<double,12> identity_pose{1,0,0,0,0,1,0,0,0,0,1,0};
+std::vector<Eigen::MatrixXd> grouped_inputs;
+void captureGroupedInputs(const std::vector<Eigen::MatrixXd>& inputs) { grouped_inputs=inputs; }
+struct GroupedInputCapture {
+  GroupedInputCapture() { grouped_inputs.clear(); form::BatchedCudaQr::setInputObserver(captureGroupedInputs); }
+  ~GroupedInputCapture() { form::BatchedCudaQr::setInputObserver(nullptr); }
+};
+}
+
+TEST(CudaMatcher, DeviceGroupingPreservesAcceptedQueryOrderAndLazyResults) {
+  CudaMatcher matcher;
+  std::vector<CudaMatcher::MapPoint> points={
+    {{.1,.2,.3,0},{10,20,30},{.2,.3,.4}},
+    {{.4,.2,.3,0},{11,21,31},{.5,.6,.7}},
+    {{.7,.2,.3,0},{12,22,32},{.8,.9,1.}}};
+  for(int rows:{1,259,4097,7}) {
+    std::vector<CudaMatcher::Query> queries(rows);
+    for(int i=0;i<rows;++i) queries[i]={{points[i%3].world[0]+(i%201)*1e-5,.2,.3,0}};
+    matcher.reset({{{0,0,0},0,3}},points,queries,1.);
+    matcher.setGroups({2,-1,0},4);
+    for(bool plane:{false,true}) {
+      auto pose=identity_pose; pose[3]=plane?.0001:0.;
+      const auto expected_results=matcher.search(pose);
+      std::vector<std::vector<int>> expected_groups(4);
+      for(int i=0;i<rows;++i) if(expected_results[i].distance<1e-6) {
+        const int group=std::array<int,3>{2,-1,0}[expected_results[i].index];
+        if(group>=0) expected_groups[group].push_back(i);
+      }
+      GroupedInputCapture capture;
+      const auto result=matcher.searchGrouped(pose,1e-6,plane);
+      ASSERT_EQ(result.roots.size(),4); ASSERT_EQ(result.counts.size(),4); ASSERT_EQ(grouped_inputs.size(),4);
+      for(int group=0;group<4;++group) {
+        EXPECT_EQ(result.counts[group],expected_groups[group].size());
+        Eigen::MatrixXd expected(expected_groups[group].size(),plane?13:7);
+        for(size_t row=0;row<expected_groups[group].size();++row) {
+          const int q=expected_groups[group][row]; const auto& p=points[expected_results[q].index];
+          Eigen::Map<const Eigen::Vector3d> pi(p.local),n(p.normal),pj(queries[q].point);
+          if(plane) {
+            for(int a=0;a<3;++a) expected.block<1,3>(row,3*a)=n[a]*pj.transpose();
+            expected.block<1,3>(row,9)=n.transpose(); expected(row,12)=n.dot(pj-pi);
+          } else { expected(row,0)=1.; expected.block<1,3>(row,1)=pi.transpose(); expected.block<1,3>(row,4)=(pj-pi).transpose(); }
+        }
+        EXPECT_TRUE(grouped_inputs[group].isApprox(expected,1e-15));
+        const Eigen::MatrixXd gram=expected.transpose()*expected;
+        EXPECT_LE((result.roots[group].transpose()*result.roots[group]-gram).norm(),1e-10*(1+gram.norm()));
+      }
+      const auto& downloaded=matcher.downloadResults(); ASSERT_EQ(downloaded.size(),expected_results.size());
+      for(size_t i=0;i<downloaded.size();++i) {
+        EXPECT_EQ(downloaded[i].index,expected_results[i].index);
+        EXPECT_DOUBLE_EQ(downloaded[i].distance,expected_results[i].distance);
+      }
+      EXPECT_EQ(&matcher.downloadResults(),&downloaded);
+      EXPECT_NO_THROW(matcher.summarize(expected_groups,plane));
+    }
+  }
+}
+
+TEST(CudaMatcher, DeviceGroupingStrictThresholdEmptyGroupsAndValidation) {
+  CudaMatcher matcher;
+  EXPECT_THROW(matcher.setGroups({},0),std::logic_error);
+  EXPECT_THROW(matcher.downloadResults(),std::logic_error);
+  matcher.reset({{{0,0,0},0,1}},{{{0,0,0,0},{},{}}},{{{1,0,0,0}},{{.5,0,0,0}},{{5,0,0,0}}},1.);
+  EXPECT_THROW(matcher.searchGrouped(identity_pose,1.,false),std::logic_error);
+  EXPECT_THROW(matcher.setGroups({},1),std::invalid_argument);
+  EXPECT_THROW(matcher.setGroups({1},1),std::invalid_argument);
+  EXPECT_THROW(matcher.setGroups({-2},1),std::invalid_argument);
+  EXPECT_THROW(matcher.setGroups({0},65536),std::invalid_argument);
+  matcher.setGroups({0},1);
+  for(double threshold:{0.,-1.,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()})
+    EXPECT_THROW(matcher.searchGrouped(identity_pose,threshold,false),std::invalid_argument);
+  const auto accepted=matcher.searchGrouped(identity_pose,1.,false);
+  EXPECT_EQ(accepted.counts,std::vector<size_t>{1}); // Equal distance is rejected.
+  matcher.setGroups({-1},0);
+  const auto empty=matcher.searchGrouped(identity_pose,1.,true);
+  EXPECT_TRUE(empty.roots.empty()); EXPECT_TRUE(empty.counts.empty());
+  EXPECT_EQ(matcher.downloadResults().size(),3);
+  auto invalid=identity_pose; invalid[3]=1e100;
+  EXPECT_THROW(matcher.searchGrouped(invalid,1.,true),std::invalid_argument);
+  EXPECT_THROW(matcher.downloadResults(),std::logic_error);
+  matcher.reset({}, {}, {},1.);
+  EXPECT_THROW(matcher.searchGrouped(identity_pose,1.,false),std::logic_error);
+  matcher.setGroups({},2);
+  const auto no_queries=matcher.searchGrouped(identity_pose,1.,false);
+  EXPECT_EQ(no_queries.counts,(std::vector<size_t>{0,0}));
+  ASSERT_EQ(no_queries.roots.size(),2); EXPECT_TRUE(no_queries.roots[0].isZero()); EXPECT_TRUE(no_queries.roots[1].isZero());
+  matcher.reset({}, {}, {{{0,0,0,0}}},1.); matcher.setGroups({},1);
+  EXPECT_EQ(matcher.searchGrouped(identity_pose,1.,false).counts,std::vector<size_t>{0});
+}
+
+
+TEST(CudaMatcher, DeviceInversePosesPreserveWorldSearchAndLocalFeatureRows) {
+  CudaMatcher matcher;
+  const std::vector<gtsam::Pose3> inverse={
+    gtsam::Pose3(gtsam::Rot3::RzRyRx(.13,-.21,.31),gtsam::Point3(1e4,-2e4,3e4)),
+    gtsam::Pose3(gtsam::Rot3::RzRyRx(-.42,.17,-.08),gtsam::Point3(-4e4,5e4,-6e4))};
+  std::vector<std::array<double,12>> matrices(2);
+  for(int p=0;p<2;++p) for(int r=0;r<3;++r) for(int c=0;c<4;++c) matrices[p][4*r+c]=inverse[p].matrix()(r,c);
+  for(int count:{1,257,17}) {
+    std::vector<CudaMatcher::MapPoint> points;
+    std::vector<CudaMatcher::Query> queries;
+    std::vector<int> pose_indices;
+    for(int i=0;i<count;++i) {
+      points.push_back({{.1+i*.0001,.2,.3,.25+i*.01},{99,98,97},{.2+i*.001,-.3,.4}});
+      queries.push_back({{points.back().world[0],.2,.3,points.back().world[3]}});
+      pose_indices.push_back(i%2);
+    }
+    matcher.reset({{{0,0,0},0,count}},points,queries,1.,matrices,pose_indices);
+    matcher.setGroups(std::vector<int>(count,0),1);
+    for(bool plane:{false,true}) {
+      GroupedInputCapture capture;
+      const auto summary=matcher.searchGrouped(identity_pose,1e-8,plane);
+      ASSERT_EQ(summary.counts,std::vector<size_t>{size_t(count)});
+      ASSERT_EQ(grouped_inputs.size(),1);
+      for(int i=0;i<count;++i) {
+        const auto& p=points[i];
+        const auto local=inverse[i%2]*gtsam::Point3(p.world[0],p.world[1],p.world[2]);
+        const auto normal=inverse[i%2].rotation()*gtsam::Point3(p.normal[0],p.normal[1],p.normal[2]);
+        Eigen::Map<const Eigen::Vector3d> query(queries[i].point);
+        if(plane) {
+          for(int a=0;a<3;++a) EXPECT_DOUBLE_EQ(grouped_inputs[0](i,9+a),normal[a]);
+          EXPECT_NEAR(grouped_inputs[0](i,12),normal.dot(query-local),1e-10);
+        } else for(int a=0;a<3;++a) EXPECT_DOUBLE_EQ(grouped_inputs[0](i,1+a),local[a]);
+      }
+      const auto& results=matcher.downloadResults();
+      for(int i=0;i<count;++i) { EXPECT_EQ(results[i].index,i); EXPECT_DOUBLE_EQ(results[i].distance,0.); }
+    }
+    // A subsequent ordinary reset must use the supplied local coordinates.
+    matcher.reset({{{0,0,0},0,count}},points,queries,1.);
+    matcher.search(identity_pose);
+    GroupedInputCapture capture;
+    matcher.summarize({{0}},false);
+    EXPECT_DOUBLE_EQ(grouped_inputs[0](0,1),99.);
+  }
+}
+
+TEST(CudaMatcher, DeviceInversePoseValidationAndOverflow) {
+  CudaMatcher matcher;
+  const std::vector<CudaMatcher::MapPoint> points={{{2,0,0,0},{2,0,0},{0,0,1}}};
+  const std::vector<CudaMatcher::Voxel> voxels={{{2,0,0},0,1}};
+  const std::vector<CudaMatcher::Query> queries={{{2,0,0,0}}};
+  EXPECT_THROW(matcher.reset(voxels,points,queries,1.,{}, {0}),std::invalid_argument);
+  EXPECT_THROW(matcher.reset(voxels,points,queries,1.,{identity_pose},{}),std::invalid_argument);
+  EXPECT_THROW(matcher.reset(voxels,points,queries,1.,{identity_pose},{-1}),std::invalid_argument);
+  EXPECT_THROW(matcher.reset(voxels,points,queries,1.,{identity_pose},{1}),std::invalid_argument);
+  auto bad=identity_pose; bad[0]=std::numeric_limits<double>::infinity();
+  EXPECT_THROW(matcher.reset(voxels,points,queries,1.,{bad},{0}),std::invalid_argument);
+  bad[0]=std::numeric_limits<double>::max();
+  EXPECT_THROW(matcher.reset(voxels,points,queries,1.,{bad},{0}),std::invalid_argument);
+  EXPECT_THROW(matcher.search(identity_pose),std::logic_error);
+  EXPECT_NO_THROW(matcher.reset(voxels,points,queries,1.,{identity_pose},{0}));
+  EXPECT_EQ(matcher.search(identity_pose)[0].index,0);
 }
