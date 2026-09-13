@@ -61,6 +61,7 @@ target_sources(FORM
 		form/optimization/constraints.hpp
 		form/optimization/gtsam.hpp
 		form/optimization/cuda_solver.hpp
+		form/optimization/resident_system.hpp
 		form/optimization/profile.hpp
 		form/optimization/matcher.hpp
 		# mapping

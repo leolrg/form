@@ -97,4 +97,37 @@ double BatchSummary::error(const std::vector<gtsam::Pose3>& poses) {
   });
   double sum=0;for(double cost:s.costs) sum+=cost;return .5*sum;
 }
+void BatchSummary::configureResident(const std::vector<FrozenSystem>& frozen,const std::vector<std::vector<int>>& auxiliary_poses) {
+#ifdef FORM_ENABLE_CUDA
+  if(impl_->cuda){impl_->cuda->configureResident(frozen,auxiliary_poses);return;}
+#endif
+  throw std::logic_error("Resident BatchSummary requires CUDA");
+}
+void BatchSummary::residentLinearize(const std::vector<gtsam::Pose3>& poses,const std::vector<double>& deltas,const std::vector<double>& auxiliary) {
+  auto& s=*impl_;s.check(poses);
+#ifdef FORM_ENABLE_CUDA
+  if(s.cuda){s.cuda->residentLinearize(s.packed,deltas,auxiliary);return;}
+#endif
+  throw std::logic_error("Resident BatchSummary requires CUDA");
+}
+double BatchSummary::residentError(const std::vector<gtsam::Pose3>& poses,const std::vector<double>& deltas) {
+  auto& s=*impl_;s.check(poses);
+#ifdef FORM_ENABLE_CUDA
+  if(s.cuda)return s.cuda->residentError(s.packed,deltas);
+#endif
+  throw std::logic_error("Resident BatchSummary requires CUDA");
+}
+bool BatchSummary::residentSolve(double lambda,bool diagonal,double minimum,double maximum,Eigen::VectorXd& delta,double& old_error,double& new_error) {
+#ifdef FORM_ENABLE_CUDA
+  if(impl_->cuda){std::vector<double> result;if(!impl_->cuda->residentSolve(lambda,diagonal,minimum,maximum,result,old_error,new_error))return false;delta=Eigen::Map<const Eigen::VectorXd>(result.data(),result.size());return true;}
+#endif
+  throw std::logic_error("Resident BatchSummary requires CUDA");
+}
+Eigen::MatrixXd BatchSummary::residentHessian() {
+#ifdef FORM_ENABLE_CUDA
+  if(impl_->cuda){Eigen::MatrixXd h(impl_->n,impl_->n);impl_->cuda->residentHessian(h.data());return h;}
+#endif
+  throw std::logic_error("Resident BatchSummary requires CUDA");
+}
+
 }

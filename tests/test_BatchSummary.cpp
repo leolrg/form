@@ -144,3 +144,49 @@ TEST(BatchSummary, PreservesDerivedFactorActivation) {
   EXPECT_EQ(batch[0],graph[0]);
   EXPECT_NO_THROW(EXPECT_NEAR(batch.error(values),graph.error(values),1e-12));
 }
+
+TEST(BatchSummary, ResidentFrozenAuxiliaryDampingAndTrialCost) {
+#ifndef FORM_ENABLE_CUDA
+  GTEST_SKIP() << "CUDA disabled";
+#else
+  const int n=18;
+  auto root=std::make_shared<form::FeatureSummary>(Eigen::Matrix<double,13,13>::Identity(),Eigen::Matrix<double,7,7>::Identity());
+  form::BatchSummary batch(3,{{0,2,root,.7}},true);
+  Eigen::MatrixXd f=Eigen::MatrixXd::Zero(13,13),aux=Eigen::MatrixXd::Zero(7,7);
+  f.topLeftCorner(12,12)=2*Eigen::MatrixXd::Identity(12,12);f(0,8)=f(8,0)=.2;
+  f.topRightCorner(12,1)=Eigen::VectorXd::LinSpaced(12,-.3,.4);f.bottomLeftCorner(1,12)=f.topRightCorner(12,1).transpose();f(12,12)=50;
+  aux.topLeftCorner(6,6)=3*Eigen::MatrixXd::Identity(6,6);aux(6,6)=10.;aux(2,6)=aux(6,2)=.2;
+  std::vector<double> fv(f.data(),f.data()+f.size()),av(aux.data(),aux.data()+aux.size());
+  batch.configureResident({{{0,2},fv,true}},{{1}});
+  std::vector<gtsam::Pose3> poses(3);
+  std::vector<double> offsets(12);for(int k=0;k<12;++k)offsets[k]=.01*k;
+  Eigen::Map<const Eigen::VectorXd> d(offsets.data(),12);
+  Eigen::MatrixXd shifted=f;const auto product=(f.topLeftCorner(12,12)*d).eval();
+  shifted.topRightCorner(12,1)-=product;shifted.bottomLeftCorner(1,12)=shifted.topRightCorner(12,1).transpose();
+  shifted(12,12)+=d.dot(product)-2*d.dot(f.col(12).head(12));
+  Eigen::MatrixXd expected=Eigen::MatrixXd::Zero(n+1,n+1);
+  auto scatter=[&](const Eigen::MatrixXd& h,std::vector<int> indices) {for(int c=0;c<h.cols();++c)for(int r=0;r<h.rows();++r)expected(indices[r],indices[c])+=h(r,c);};
+  std::vector<int> mapping={0,1,2,3,4,5,12,13,14,15,16,17,18};
+  scatter(.7*root->augmentedHessian(poses[0],poses[2]),mapping);scatter(shifted,mapping);scatter(aux,{6,7,8,9,10,11,18});
+  batch.residentLinearize(poses,offsets,av);
+  EXPECT_TRUE(batch.residentHessian().isApprox(expected,2e-12));
+  double error=.5*shifted(12,12)+.35*root->squaredError(poses[0],poses[2]);
+  EXPECT_NEAR(batch.residentError(poses,offsets),error,2e-12);
+  // Trial costs must not destroy the retained linear model for a lambda retry.
+  poses[2]=gtsam::Pose3(gtsam::Rot3::RzRyRx(.2,-.1,.3),{1,2,3});batch.residentError(poses,offsets);
+  for(bool diagonal:{false,true})for(double lambda:{1e-5,.1,100.}) {
+    Eigen::MatrixXd h=expected.topLeftCorner(n,n);
+    for(int i=0;i<n;++i){double a=1./(1./std::sqrt(lambda));if(diagonal)a*=std::sqrt(std::clamp(h(i,i),.01,10.));h(i,i)+=a*a;}
+    Eigen::VectorXd actual;double old_error,new_error;
+    ASSERT_TRUE(batch.residentSolve(lambda,diagonal,.01,10.,actual,old_error,new_error));
+    Eigen::VectorXd want=h.llt().solve(expected.topRightCorner(n,1));
+    EXPECT_TRUE(actual.isApprox(want,2e-12));
+    EXPECT_NEAR(old_error,.5*expected(n,n),2e-12);
+    EXPECT_NEAR(new_error,.5*(expected(n,n)-2*actual.dot(expected.col(n).head(n))+actual.dot(expected.topLeftCorner(n,n)*actual)),2e-11);
+  }
+  batch.configureResident({{{0,2},fv,false}},{{1}});
+  poses.assign(3,gtsam::Pose3{});
+  EXPECT_NEAR(batch.residentError(poses,offsets),.35*root->squaredError(poses[0],poses[2]),2e-12);
+  EXPECT_THROW(batch.residentLinearize(poses,{},av),std::invalid_argument);
+#endif
+}
