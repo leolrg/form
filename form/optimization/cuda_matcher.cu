@@ -34,16 +34,23 @@ struct Group { int first,rows; size_t offset; };
 __host__ __device__ uint32_t hash(int x,int y,int z) {
   return uint32_t(x)*73856093u ^ uint32_t(y)*19349669u ^ uint32_t(z)*83492791u;
 }
-__device__ __constant__ int shifts[81]={
-  0,0,0, 1,0,0, -1,0,0, 0,1,0, 0,-1,0, 0,0,1, 0,0,-1,
-  1,1,0, 1,-1,0, -1,1,0, -1,-1,0, 1,0,1, 1,0,-1,
-  -1,0,1, -1,0,-1, 0,1,1, 0,1,-1, 0,-1,1, 0,-1,-1,
-  1,1,1, 1,1,-1, 1,-1,1, 1,-1,-1, -1,1,1, -1,1,-1, -1,-1,1, -1,-1,-1};
+// Each coordinate uses two bits per neighbor (shift + 1), in FORM's exact
+// visit order. Immediate masks avoid serialized divergent constant-memory reads.
+__device__ int neighborShift(unsigned long long coordinates,int neighbor) {
+  return int((coordinates>>(2*neighbor))&3)-1;
+}
+
+__global__ void extractWorld(const CudaMatcher::MapPoint* points,int count,
+                             size_t stride,double* world) {
+  const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
+  for(int axis=0;axis<4;++axis) world[size_t(axis)*stride+i]=points[i].world[axis];
+}
 
 // One warp owns one query. Dense voxel rows are scanned cooperatively; the
 // lexicographic (distance, neighbor order, point order) reduction retains FORM's
 // first-hit tie rule even when different lanes discover equal-distance points.
-__global__ void nearest(const Bucket* buckets,int mask,const CudaMatcher::MapPoint* points,
+__global__ void nearest(const Bucket* buckets,int mask,const double* __restrict__ points,size_t point_stride,
                         const CudaMatcher::Query* queries,int count,double width,Pose pose,
                         CudaMatcher::Result* results) {
   const int lane=threadIdx.x%32;
@@ -63,23 +70,30 @@ __global__ void nearest(const Bucket* buckets,int mask,const CudaMatcher::MapPoi
   const int x=int(coords[0]), y=int(coords[1]), z=int(coords[2]);
   double best=__longlong_as_double(0x7fefffffffffffffLL);
   unsigned long long rank=~0ULL;
-  for(int n=0;n<27;++n) {
-    int begin=-1,length=0;
-    if(lane==0) {
-      const int a=x+shifts[3*n],b=y+shifts[3*n+1],c=z+shifts[3*n+2];
-      int slot=hash(a,b,c)&mask;
-      Bucket voxel=buckets[slot];
-      while(voxel.begin!=-1 && (voxel.x!=a || voxel.y!=b || voxel.z!=c)) {
-        slot=(slot+1)&mask; voxel=buckets[slot];
-      }
-      begin=voxel.begin; length=voxel.count;
+  // Independent hash probes occupy 27 lanes instead of serializing every
+  // lookup through lane zero. Divergent collision chains reconverge at ballot.
+  int neighbor_begin=-1,neighbor_length=0;
+  if(lane<27) {
+    const int a=x+neighborShift(0x2a9542829549ULL,lane);
+    const int b=y+neighborShift(0x2828295489495ULL,lane);
+    const int c=z+neighborShift(0x8888888954955ULL,lane);
+    int slot=hash(a,b,c)&mask;
+    Bucket voxel=buckets[slot];
+    while(voxel.begin!=-1 && (voxel.x!=a || voxel.y!=b || voxel.z!=c)) {
+      slot=(slot+1)&mask; voxel=buckets[slot];
     }
-    begin=__shfl_sync(0xffffffff,begin,0);
-    length=__shfl_sync(0xffffffff,length,0);
+    neighbor_begin=voxel.begin; neighbor_length=voxel.count;
+  }
+  unsigned occupied=__ballot_sync(0xffffffff,neighbor_length>0);
+  while(occupied) {
+    const int n=__ffs(occupied)-1;
+    occupied&=occupied-1;
+    const int begin=__shfl_sync(0xffffffff,neighbor_begin,n);
+    const int length=__shfl_sync(0xffffffff,neighbor_length,n);
     for(size_t offset=lane;offset<size_t(length);offset+=32) {
       const int j=begin+int(offset);
-      const auto p=points[j];
-      const double dx=p.world[0]-world[0],dy=p.world[1]-world[1],dz=p.world[2]-world[2],dw=p.world[3]-q.point[3];
+      const double dx=points[j]-world[0],dy=points[point_stride+j]-world[1];
+      const double dz=points[2*point_stride+j]-world[2],dw=points[3*point_stride+j]-q.point[3];
       const double distance=(dx*dx+dz*dz)+(dy*dy+dw*dw);
       if(distance<best) { best=distance; rank=(static_cast<unsigned long long>(n)<<32)|unsigned(j); }
     }
@@ -118,6 +132,8 @@ struct CudaMatcher::Impl {
   cudaStream_t stream=nullptr;
   Buffer<Bucket> buckets;
   Buffer<MapPoint> points;
+  Buffer<double> search_positions;
+  size_t point_stride=0;
   Buffer<Query> queries;
   Buffer<Result> results;
   Buffer<int> indices;
@@ -164,6 +180,14 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
   }
   check(cudaStreamSynchronize(s.stream));
   s.buckets.upload(buckets,s.stream); s.points.upload(points,s.stream); s.queries.upload(queries,s.stream);
+  // Keep the public map records for summary packing. Nearest only reads four
+  // world coordinates; plane starts are aligned for coalesced warp loads.
+  s.point_stride=(points.size()+31)/32*32;
+  s.search_positions.reserve(4*s.point_stride);
+  if(!points.empty()) {
+    extractWorld<<<1+(points.size()-1)/256,256,0,s.stream>>>(s.points.data,int(points.size()),s.point_stride,s.search_positions.data);
+    check(cudaGetLastError());
+  }
   s.results.reserve(queries.size()); s.host_results.resize(queries.size());
   s.mask=int(size-1); s.count=int(queries.size()); s.width=width;
   check(cudaStreamSynchronize(s.stream)); s.ready=true;
@@ -175,7 +199,10 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::search(const std::array<dou
   for(auto v:matrix) if(!std::isfinite(v)) throw std::invalid_argument("Nonfinite CUDA query pose");
   if(s.count) {
     Pose pose; std::copy(matrix.begin(),matrix.end(),pose.matrix);
-    nearest<<<1+(s.count-1)/4,128,0,s.stream>>>(s.buckets.data,s.mask,s.points.data,s.queries.data,s.count,s.width,pose,s.results.data);
+    // Two queries per block: A100 sweeps over 64/128/256/512 favor 64 for
+    // sparse and dense maps, with 62.5% occupancy and less block tail work.
+    constexpr int search_threads=64;
+    nearest<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data);
     check(cudaGetLastError());
     check(cudaMemcpyAsync(s.host_results.data(),s.results.data,s.count*sizeof(Result),cudaMemcpyDeviceToHost,s.stream));
     check(cudaStreamSynchronize(s.stream));

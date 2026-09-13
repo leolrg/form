@@ -131,3 +131,39 @@ TEST(CudaMatcher, DenseVoxelTailWinnerAndFirstHitAcrossLanes) {
     for(auto r:matcher.search({1,0,0,0,0,1,0,0,0,0,1,0})) EXPECT_EQ(r.index,1);
   }
 }
+
+
+TEST(CudaMatcher, EveryNeighborTieUsesVisitOrderBeforeStorageOrder) {
+  CudaMatcher matcher;
+  // Reverse snapshot order so an index-only reduction cannot satisfy first hit.
+  for(int first=0;first<26;++first) {
+    std::vector<CudaMatcher::MapPoint> points;
+    std::vector<CudaMatcher::Voxel> voxels;
+    for(int n=26;n>=first;--n) {
+      const auto shift=form::voxel_shifts[n];
+      voxels.push_back({{shift.x(),shift.y(),shift.z()},int(points.size()),65});
+      for(int j=0;j<65;++j) points.push_back({{.5,.5,.5,j==33?0.:1.},{},{}});
+    }
+    std::vector<CudaMatcher::Query> queries(131,CudaMatcher::Query{{.5,.5,.5,0}});
+    matcher.reset(voxels,points,queries,1.);
+    for(auto r:matcher.search({1,0,0,0,0,1,0,0,0,0,1,0})) {
+      EXPECT_EQ(r.index,(26-first)*65+33);
+      EXPECT_DOUBLE_EQ(r.distance,0.);
+    }
+  }
+}
+
+TEST(CudaMatcher, FourDimensionalSearchStorageRefreshesAcrossRaggedResets) {
+  CudaMatcher matcher;
+  for(int count:{1,33,4097,7,129}) {
+    std::vector<CudaMatcher::MapPoint> points(count);
+    for(int i=0;i<count;++i) {
+      points[i]={{.2,.3,.4,2.},{1000.+i,-2000.,3000.},{-4.,5.,-6.}};
+    }
+    points.back().world[3]=.25;
+    matcher.reset({{{0,0,0},0,count}},points,{{{.2,.3,.4,.5}}},1.);
+    const auto result=matcher.search({1,0,0,0,0,1,0,0,0,0,1,0})[0];
+    EXPECT_EQ(result.index,count-1);
+    EXPECT_DOUBLE_EQ(result.distance,.0625);
+  }
+}
