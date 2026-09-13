@@ -335,13 +335,15 @@ def execute(spec,output,provenance_info):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary',type=Path,default=ROOT/'build-accel/form-replay')
+    parser.add_argument('--previous-matching-binary',type=Path,
+                        help='frozen previous matcher for interleaved cuda-matching-previous controls')
     parser.add_argument('--input-dir',type=Path,default=Path('/home/ubuntu/datasets/form-input'))
     parser.add_argument('--output',type=Path,default=ROOT/'benchmarks/results/suite')
     parser.add_argument('--sequences',nargs='+',choices=SEQUENCES,default=SEQUENCES)
     parser.add_argument('--configs',nargs='+',choices=CONFIGS,default=list(CONFIGS))
     parser.add_argument('--sequence-first',action='store_true',
                         help='finish all workload settings for each sequence before the next')
-    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch','summary-resident','cuda-resident','cuda-resident-hybrid','cuda-matching'),default=['reference','summary'])
+    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch','summary-resident','cuda-resident','cuda-resident-hybrid','cuda-matching','cuda-matching-previous'),default=['reference','summary'])
     parser.add_argument('--threads',type=int,default=8)
     parser.add_argument('--repeats',type=int,default=2)
     parser.add_argument('--limit',type=int)
@@ -354,9 +356,11 @@ def main():
     parser.add_argument('--plan',action='store_true',help='print run descriptions; do not create outputs or run replay')
     parser.add_argument('--aggregate-only',action='store_true')
     args=parser.parse_args()
+    if ('cuda-matching-previous' in args.backends) != (args.previous_matching_binary is not None):
+        parser.error('cuda-matching-previous requires --previous-matching-binary, and vice versa')
     if args.cuda_solve_min_dimension is not None and args.cuda_solve_min_dimension < 1:
         parser.error('CUDA solve minimum dimension must be positive')
-    if args.cuda_solve_configs is not None and any(b in args.backends for b in ('cuda-resident-hybrid','cuda-matching')):
+    if args.cuda_solve_configs is not None and any(b in args.backends for b in ('cuda-resident-hybrid','cuda-matching','cuda-matching-previous')):
         parser.error('cuda-resident-hybrid selects every workload by dimension; omit --cuda-solve-configs')
     if args.cuda_solve_configs is not None and args.cuda_solve_min_dimension is None:
         parser.error('--cuda-solve-configs requires --cuda-solve-min-dimension')
@@ -369,7 +373,12 @@ def main():
             aggregate(json.loads((args.output/'suite.json').read_text()),args.output)
         return
     prov=provenance(args.binary,args.output)
+    if args.previous_matching_binary is not None:
+        args.previous_matching_binary=args.previous_matching_binary.resolve()
+        prov['comparison_binary']={'path':str(args.previous_matching_binary),'sha256':digest(args.previous_matching_binary)}
     identity={k:prov[k] for k in ('binary_sha256','git_revision','git_dirty_diff_sha256','untracked_file_sha256','environment','cpu_affinity')}
+    if 'comparison_binary' in prov:
+        identity['comparison_binary']=prov['comparison_binary']
     runs=[]
     for outer in dict.fromkeys(args.sequences if args.sequence_first else args.configs):
         for inner in dict.fromkeys(args.configs if args.sequence_first else args.sequences):
@@ -386,18 +395,21 @@ def main():
                 for backend in backend_order:
                     run_id=f'{seq}-{config}-{backend}-t{args.threads}-r{repeat}'
                     prefix=args.output/run_id
-                    argv=[str(args.binary),'--input',str(input_path),'--output',str(prefix),
-                          '--backend',backend,'--threads',str(args.threads)]
+                    selected_binary=args.previous_matching_binary if backend=='cuda-matching-previous' else args.binary
+                    actual_backend='cuda-matching' if backend=='cuda-matching-previous' else backend
+                    argv=[str(selected_binary),'--input',str(input_path),'--output',str(prefix),
+                          '--backend',actual_backend,'--threads',str(args.threads)]
                     for name,value in CONFIGS[config].items():
                         argv.extend(['--'+name,str(value)])
                     if args.limit:
                         argv.extend(['--limit',str(args.limit)])
                     if args.profile:
                         argv.append('--profile')
-                    if (backend in ('cuda','cuda-batch','cuda-resident-hybrid','cuda-matching') and args.cuda_solve_min_dimension is not None
+                    if (backend in ('cuda','cuda-batch','cuda-resident-hybrid','cuda-matching','cuda-matching-previous') and args.cuda_solve_min_dimension is not None
                             and (args.cuda_solve_configs is None or config in args.cuda_solve_configs)):
                         argv.extend(['--cuda-solve-min-dimension',str(args.cuda_solve_min_dimension)])
-                    spec={'id':run_id,'sequence':seq,'config':config,'backend':backend,'repeat':repeat,
+                    spec={'binary_sha256':prov['comparison_binary']['sha256'] if backend=='cuda-matching-previous' else prov['binary_sha256'],
+                          'id':run_id,'sequence':seq,'config':config,'backend':backend,'repeat':repeat,
                           'threads':args.threads,'settings':CONFIGS[config],'expected_scans':expected,
                           'gpu_sample_interval_seconds':args.gpu_sample_interval,
                           'source_scans':meta.get('source_scans',meta['scans']),
@@ -424,6 +436,8 @@ def main():
         for spec in manifest['runs']:
             if digest(args.binary)!=manifest['provenance']['binary_sha256']:
                 raise ValueError('binary changed during suite; stopping')
+            if digest(Path(spec['argv'][0]))!=spec['binary_sha256']:
+                raise ValueError('selected backend binary changed during suite; stopping')
             execute(spec,args.output,manifest['provenance'])
             aggregate(manifest,args.output)
         report=aggregate(manifest,args.output)

@@ -208,6 +208,8 @@ def main():
     manifests=[json.loads((suite/'suite.json').read_text()) for suite in args.suite]
     if len({m['provenance']['binary_sha256'] for m in manifests})!=1:
         raise ValueError('Cannot combine scaling suites built from different binaries')
+    if len({json.dumps(m['provenance'].get('comparison_binary'),sort_keys=True) for m in manifests})!=1:
+        raise ValueError('Cannot combine suites using different previous matching binaries')
     if len({json.dumps(m['quality_gate'],sort_keys=True) for m in manifests})!=1:
         raise ValueError('Cannot combine suites with different quality gates')
     records=[];comparisons=[];prefixes={};specs=[]

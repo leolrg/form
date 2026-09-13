@@ -8,6 +8,33 @@ import run_suite as r
 
 
 class SuiteTests(unittest.TestCase):
+    def test_previous_matcher_uses_frozen_binary_and_reversed_order(self):
+        import contextlib, io, sys
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'stairs.formpc').write_bytes(b'x')
+            (root/'stairs.gt.tum').write_text('')
+            (root/'stairs.json').write_text(json.dumps({'scans':1,'bytes':1}))
+            frozen=root/'previous'; frozen.write_bytes(b'old')
+            prov={k:None for k in ('binary_sha256','git_revision','git_dirty_diff_sha256',
+                                  'untracked_file_sha256','environment','cpu_affinity')}
+            argv=['run_suite.py','--plan','--input-dir',tmp,'--sequences','stairs',
+                  '--configs','current','--backends','reference','cuda-matching-previous','cuda-matching',
+                  '--previous-matching-binary',str(frozen),'--cuda-solve-min-dimension','600']
+            output=io.StringIO()
+            with patch.object(sys,'argv',argv), patch.object(r,'provenance',return_value=prov), contextlib.redirect_stdout(output):
+                r.main()
+            manifest=json.loads(output.getvalue()); runs=manifest['runs']
+            self.assertEqual([x['backend'] for x in runs[:3]],list(reversed([x['backend'] for x in runs[3:]])))
+            for run in runs:
+                if run['backend']=='cuda-matching-previous':
+                    self.assertEqual(run['argv'][0],str(frozen))
+                    self.assertEqual(run['argv'][run['argv'].index('--backend')+1],'cuda-matching')
+                    self.assertEqual(run['binary_sha256'],r.digest(frozen))
+                    self.assertEqual(run['argv'][run['argv'].index('--cuda-solve-min-dimension')+1],'600')
+            self.assertEqual(manifest['provenance']['comparison_binary']['sha256'],r.digest(frozen))
+
     def test_hybrid_rejects_legacy_config_restriction(self):
         import contextlib, io, sys
         from unittest.mock import patch
