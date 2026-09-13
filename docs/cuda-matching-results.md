@@ -1,5 +1,9 @@
 # CUDA matching and direct summary results
 
+This report records the first CUDA matching implementation at `c4d1064`. The
+subsequent [matching residency work](cuda-matching-residency-results.md) adds GPU
+grouping, deferred raw data, faster search, and local target preparation.
+
 GPU matching reduces total estimator processing time from **68.39 to 50.05 ms**
 at current settings, **216.75 to 102.17 ms** with denser features, and
 **93.40 to 72.75 ms** with a larger window, relative to the preceding hybrid

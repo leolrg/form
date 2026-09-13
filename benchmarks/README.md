@@ -323,9 +323,11 @@ A warp cooperatively searches each query's 27 neighbor voxels, retaining the CPU
 first-hit rule on distance ties. Accepted matches become compact feature rows on
 GPU and feed FP64 QR directly. There is no full correspondence upload for QR.
 
-The host still groups query indices by scan pair, retains raw correspondences for
-FORM's mapping and factor APIs, and receives QR roots. This is partial residency,
-not a fully device-controlled estimator. The world map is still built on CPU.
+Accepted query indices are grouped on GPU in stable query order. During ICP the
+host receives group counts and QR roots; raw matches and correspondence arrays
+are materialized once after the final rematch, or on demand through raw factor
+evaluation. World-to-local target preparation also runs on GPU. The world voxel
+map is still built on CPU, and the optimizer still uses the hybrid policy above.
 The existing CPU empty-feature behavior (retaining previous raw matches) is also
 preserved for comparison; this change does not independently repair that behavior.
 
@@ -347,3 +349,12 @@ Summary construction moves from `semi_ms` into `match_ms` in this backend. Compa
 `match_ms + semi_ms + full_ms`, and include `map_ms` to account for snapshot/upload
 cost. Neither `match_ms` nor `optimization_ms` alone isolates the change. Total
 processing time includes feature extraction, mapping and marginalization as well.
+
+To interleave a frozen previous matching executable with fresh CPU and CUDA
+controls, add `--previous-matching-binary /path/to/frozen/form-replay` and include
+`cuda-matching-previous` in `--backends`. The runner invokes its existing
+`cuda-matching` option, records both binary hashes, and reverses backend order on
+the second repeat. All workload and solver-threshold arguments remain identical.
+
+See [matching residency results](../docs/cuda-matching-residency-results.md) for
+implementation details, measured comparisons, and correctness coverage.
