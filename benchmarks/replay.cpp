@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
     params.extraction.num_rows = rows; params.extraction.num_columns = cols;
     std::ofstream timing(output + ".csv"), poses(output + ".tum");
     if (!timing || !poses) throw std::runtime_error("Cannot open output prefix");
-    timing << "scan,stamp_ns,total_ms,extract_ms,map_ms,match_ms,semi_ms,full_ms,marginalize_ms,maintenance_ms,poses,planar_features,point_features,rematches,lm_iterations,factor_linearize_cpu_ms,factor_eval_cpu_ms,factor_error_cpu_ms,linearize_wall_ms,assemble_ms,solve_ms,factors,planar_correspondences,point_correspondences,summary_build_cpu_ms,summary_prepare_wall_ms,full_initial_error,full_final_error,cuda_solve_calls,cuda_solve_fallbacks\n";
+    timing << "scan,stamp_ns,total_ms,extract_ms,map_ms,match_ms,semi_ms,full_ms,marginalize_ms,maintenance_ms,poses,planar_features,point_features,rematches,lm_iterations,factor_linearize_cpu_ms,factor_eval_cpu_ms,factor_error_cpu_ms,linearize_wall_ms,assemble_ms,solve_ms,factors,planar_correspondences,point_correspondences,summary_build_cpu_ms,summary_prepare_wall_ms,full_initial_error,full_final_error,cuda_solve_calls,cuda_solve_fallbacks,extract_validate_ms,extract_curvature_ms,extract_planar_select_ms,extract_point_mask_ms,extract_point_select_ms,extract_normals_ms,extract_pack_ms,normal_search_sample_cpu_ms,normal_eigen_sample_cpu_ms,normal_samples,resident_reset_wall_ms,resident_error_wall_ms,graph_build_wall_ms,map_world_wall_ms,map_snapshot_wall_ms,match_materialize_wall_ms\n";
     timing << std::setprecision(12); poses << std::setprecision(17);
     form::Estimator estimator(params);
     std::vector<form::PointXYZf> scan;
@@ -246,7 +246,24 @@ int main(int argc, char** argv) {
              << form::profile::last_initial_error.load() << ','
              << form::profile::last_final_error.load() << ','
              << form::profile::cuda_solve_calls.load() << ','
-             << form::profile::cuda_solve_fallbacks.load() << '\n';
+             << form::profile::cuda_solve_fallbacks.load()
+             << ',' << form::profile::ms(form::profile::extract_validate)
+             << ',' << form::profile::ms(form::profile::extract_curvature)
+             << ',' << form::profile::ms(form::profile::extract_planar_select)
+             << ',' << form::profile::ms(form::profile::extract_point_mask)
+             << ',' << form::profile::ms(form::profile::extract_point_select)
+             << ',' << form::profile::ms(form::profile::extract_normals)
+             << ',' << form::profile::ms(form::profile::extract_pack)
+             << ',' << form::profile::ms(form::profile::normal_search_sample_cpu)
+             << ',' << form::profile::ms(form::profile::normal_eigen_sample_cpu)
+             << ',' << form::profile::normal_samples.load()
+             << ',' << form::profile::ms(form::profile::resident_reset_wall)
+             << ',' << form::profile::ms(form::profile::resident_error_wall)
+             << ',' << form::profile::ms(form::profile::graph_build_wall)
+             << ',' << form::profile::ms(form::profile::map_world_wall)
+             << ',' << form::profile::ms(form::profile::map_snapshot_wall)
+             << ',' << form::profile::ms(form::profile::match_materialize_wall)
+             << '\n';
       const auto pose = estimator.current_lidar_estimate();
       const auto q = pose.rotation().toQuaternion();
       poses << stamp / 1000000000 << '.' << std::setfill('0') << std::setw(9)

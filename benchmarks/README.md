@@ -358,3 +358,13 @@ the second repeat. All workload and solver-threshold arguments remain identical.
 
 See [matching residency results](../docs/cuda-matching-residency-results.md) for
 implementation details, measured comparisons, and correctness coverage.
+
+### Remaining-stage diagnostics
+
+`form-replay --profile` also emits extraction substage wall timers, a deterministic
+approximately 1/64 sample of normal-construction worker durations, graph and
+resident-reset/error wall timers, CUDA map preparation timers, and final match
+materialization time. Normal sample CPU durations are nested inside the normal
+wall stage; do not sum them with wall stages. Detailed counters remain zero when
+profiling is disabled. Profiling measurements and the next runtime estimate are
+in [the remaining optimization report](../docs/remaining-optimization-profile.md).

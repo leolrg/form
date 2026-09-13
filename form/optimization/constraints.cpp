@@ -190,7 +190,10 @@ gtsam::Values ConstraintManager::optimize(bool fast) {
   }
   if (m_params.use_cuda_summaries) prepare_cuda_summaries();
   else if (m_params.use_summary) prepare_cpu_summaries();
-  auto graph = m_params.disable_smoothing ? get_single_graph() : get_graph(fast);
+  auto graph = [&] {
+    profile::Scope timer(profile::graph_build_wall);
+    return m_params.disable_smoothing ? get_single_graph() : get_graph(fast);
+  }();
   gtsam::Values values;
   if (m_params.disable_smoothing) values.insert(X(m_scan), get_pose(m_scan));
   else values = m_values;

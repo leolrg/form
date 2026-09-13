@@ -75,6 +75,7 @@ ResidentOptimizer::~ResidentOptimizer() = default;
 const gtsam::KeyVector& ResidentOptimizer::keys() const { return impl_->keys; }
 
 void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gtsam::Values& values) {
+  profile::Scope timer(profile::resident_reset_wall);
   auto& s = *impl_;
   s.ready = s.linearized = false;
   s.keys = values.keys();
@@ -207,6 +208,7 @@ Matrix ResidentOptimizer::model() {
 }
 
 double ResidentOptimizer::error(const gtsam::Values& values) {
+  profile::Scope timer(profile::resident_error_wall);
   auto& s = *impl_;
   s.pack(values);
   double cost = 0;

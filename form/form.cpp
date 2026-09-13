@@ -73,6 +73,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   // ############################### Optimization ############################### //
   //
   // ---------------------------- Generate World Map ---------------------------- //
+  auto map_profile_start = profile::enabled ? profile::Clock::now() : profile::Clock::time_point{};
   const auto world_map = tuple::transform(m_keypoint_map, [&](auto &map) {
     return map.to_voxel_map(m_constraints.get_values(),
                             // make voxel size match the max matching distance
@@ -81,10 +82,12 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
 
 #ifdef FORM_ENABLE_CUDA
   if (m_params.matcher.use_cuda) {
+    profile::checkpoint(profile::map_world_wall, map_profile_start);
     if (!m_cuda_matching) m_cuda_matching = std::make_shared<CudaMatching>();
     m_cuda_matching->reset(std::get<0>(world_map), std::get<1>(world_map),
         std::get<0>(keypoints), std::get<1>(keypoints),
         [&](size_t i) { return m_constraints.get_pose(i); }, m_params.matcher.max_dist_matching);
+    profile::checkpoint(profile::map_snapshot_wall, map_profile_start);
   }
 #endif
   last_timing.map_ms = profile::milliseconds(stage_start);
@@ -131,7 +134,10 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
 #ifdef FORM_ENABLE_CUDA
   if (m_params.matcher.use_cuda) {
     stage_start = profile::Clock::now();
-    m_cuda_matching->materialize(std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches);
+    {
+      profile::Scope timer(profile::match_materialize_wall);
+      m_cuda_matching->materialize(std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches);
+    }
     last_timing.match_ms += profile::milliseconds(stage_start);
   }
 #endif

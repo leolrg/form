@@ -22,6 +22,7 @@
 #pragma once
 
 #include "form/feature/extraction.hpp"
+#include "form/optimization/profile.hpp"
 
 namespace form {
 
@@ -35,11 +36,15 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
   using T = typename Point::Scalar;
   const size_t points_per_sector = params.num_columns / params.num_sectors;
 
+  auto profile_start = profile::enabled ? profile::Clock::now() : profile::Clock::time_point{};
+
   // First we validate that all the points are good
   auto valid_mask = compute_valid_points(scan);
+  profile::checkpoint(profile::extract_validate, profile_start);
 
   // ------------------------- Planar Features ------------------------- //
   auto curvature = compute_curvature(scan, valid_mask, scan_idx);
+  profile::checkpoint(profile::extract_curvature, profile_start);
 
   // Next get the planar features
   std::vector<size_t> planar_indices;
@@ -70,6 +75,8 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
     } // end sector search
   } // end scan line search
 
+  profile::checkpoint(profile::extract_planar_select, profile_start);
+
   // ------------------------- Point Features ------------------------- //
   // Get valid point features mask
   auto valid_mask_points = compute_point_valid_points(scan);
@@ -81,6 +88,8 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
         // good if (wasn't used as planar) AND (is valid point)
         (used_points[idx] == valid_mask[idx]) && valid_mask_points[idx];
   }
+
+  profile::checkpoint(profile::extract_point_mask, profile_start);
 
   for (size_t scan_line_idx = 0; scan_line_idx < params.num_rows; scan_line_idx++) {
     // Independently detect features in each sector of this scan_line
@@ -97,6 +106,8 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
                     valid_mask_points);
     }
   }
+
+  profile::checkpoint(profile::extract_point_select, profile_start);
 
   // Finally extract all normals
   tbb::concurrent_vector<PlanarFeat> result_planar_tbb;
@@ -118,6 +129,7 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
       }
     }
   });
+  profile::checkpoint(profile::extract_normals, profile_start);
   std::vector<PlanarFeat> result_planar(result_planar_tbb.begin(),
                                         result_planar_tbb.end());
 
@@ -131,6 +143,7 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
         static_cast<double>(point.z), static_cast<size_t>(scan_idx));
   }
 
+  profile::checkpoint(profile::extract_pack, profile_start);
   return std::make_tuple(result_planar, result_point);
 }
 
@@ -274,6 +287,10 @@ FeatureExtractor::compute_normal(
   const auto end = scan.cend();
   const auto &point = scan[idx];
 
+  const bool profile_sample = profile::enabled &&
+      (((static_cast<uint64_t>(idx) * 11400714819323198485ull) >> 58) == 0);
+  auto normal_start = profile_sample ? profile::Clock::now() : profile::Clock::time_point{};
+
   // First find neighbors on own scan line
   std::vector<Point> neighbors;
   find_neighbors(idx, scan, neighbors);
@@ -307,6 +324,11 @@ FeatureExtractor::compute_normal(
     }
   }
 
+  if (profile_sample) {
+    profile::checkpoint(profile::normal_search_sample_cpu, normal_start);
+    profile::normal_samples.fetch_add(1, std::memory_order_relaxed);
+  }
+
   // If there's not enough neighbors, return failed
   if (!found_other_scanline || neighbors.size() < params.min_points) {
     return std::nullopt;
@@ -327,6 +349,7 @@ FeatureExtractor::compute_normal(
       Cov, Eigen::ComputeEigenvectors);
   Eigen::Matrix<T, 3, 1> normal = b.eigenvectors().col(0);
   normal.normalize();
+  if (profile_sample) profile::checkpoint(profile::normal_eigen_sample_cpu, normal_start);
 
   return normal;
 }
