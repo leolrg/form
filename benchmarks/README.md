@@ -313,3 +313,37 @@ options; they are not exposed in the evalio Python wrapper.
 
 See [resident results](../docs/resident-cuda-results.md) for all-CUDA and hybrid
 comparisons, actual correspondence/pose scaling, validation and frozen binaries.
+
+### CUDA matching with direct summaries
+
+`cuda-matching` selects the same optimizer policy as `cuda-resident-hybrid` and
+also accelerates correspondence search. It uploads a snapshot of FORM's world
+voxel map and query features once per incoming scan, then reuses them through ICP.
+A warp cooperatively searches each query's 27 neighbor voxels, retaining the CPU
+first-hit rule on distance ties. Accepted matches become compact feature rows on
+GPU and feed FP64 QR directly. There is no full correspondence upload for QR.
+
+The host still groups query indices by scan pair, retains raw correspondences for
+FORM's mapping and factor APIs, and receives QR roots. This is partial residency,
+not a fully device-controlled estimator. The world map is still built on CPU.
+The existing CPU empty-feature behavior (retaining previous raw matches) is also
+preserved for comparison; this change does not independently repair that behavior.
+
+```bash
+python benchmarks/run_suite.py --binary build-accel/form-replay \
+  --output benchmarks/results/my-matching-comparison \
+  --sequences stairs --configs current features window \
+  --backends reference summary-resident cuda-resident-hybrid cuda-matching \
+  --threads 32 --repeats 2 --limit 250 --cuda-solve-min-dimension 240
+```
+
+Use the same threshold for both CUDA backends; `--cuda-solve-configs` is rejected
+for both because they select their matrix pipeline by dimension at every workload.
+C++ callers enable `params.matcher.use_cuda` together with CUDA summaries and the
+hybrid optimizer settings above. CUDA-disabled builds explicitly reject this path.
+This option is currently exposed through C++/replay, not the evalio Python wrapper.
+
+Summary construction moves from `semi_ms` into `match_ms` in this backend. Compare
+`match_ms + semi_ms + full_ms`, and include `map_ms` to account for snapshot/upload
+cost. Neither `match_ms` nor `optimization_ms` alone isolates the change. Total
+processing time includes feature extraction, mapping and marginalization as well.

@@ -8,6 +8,10 @@ combines CUDA summary preparation with CPU matrix processing for small systems.
 That hybrid measures **9.27 / 12.95 / 30.21 ms** at current / denser-point /
 larger-window settings, improving on paired direct CPU by **14% / 45% / 20%**.
 
+A subsequent [CUDA matching extension](cuda-matching-results.md) adds direct
+matching-to-summary construction and reports further end-to-end improvements,
+including paired CPU scaling and a complete-stairs accuracy check.
+
 ## Measurement scope
 
 - NVIDIA A100 80 GB PCIe; 32-vCPU EPYC Milan VM; 32 TBB threads.
