@@ -18,6 +18,27 @@ class SuiteTests(unittest.TestCase):
                 r.main()
             self.assertEqual(error.exception.code, 2)
 
+    def test_matching_and_hybrid_receive_same_threshold(self):
+        import contextlib, io, sys
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'stairs.formpc').write_bytes(b'x')
+            (root/'stairs.gt.tum').write_text('')
+            (root/'stairs.json').write_text(json.dumps({'scans':1,'bytes':1}))
+            prov={k:None for k in ('binary_sha256','git_revision','git_dirty_diff_sha256',
+                                  'untracked_file_sha256','environment','cpu_affinity')}
+            argv=['run_suite.py','--plan','--input-dir',tmp,'--sequences','stairs',
+                  '--configs','current','--backends','cuda-matching','cuda-resident-hybrid',
+                  '--cuda-solve-min-dimension','600']
+            output=io.StringIO()
+            with patch.object(sys,'argv',argv), patch.object(r,'provenance',return_value=prov), contextlib.redirect_stdout(output):
+                r.main()
+            for run in json.loads(output.getvalue())['runs']:
+                self.assertIn('--cuda-solve-min-dimension',run['argv'])
+                i=run['argv'].index('--cuda-solve-min-dimension')
+                self.assertEqual(run['argv'][i+1],'600')
+
     def test_workload_variants_change_independently(self):
         self.assertEqual(r.CONFIGS['current'], {'points':3,'planes':50,'recent':10})
         self.assertEqual(r.CONFIGS['features'], {'points':6,'planes':100,'feature-spacing':2,'recent':10})

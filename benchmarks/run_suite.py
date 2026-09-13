@@ -341,7 +341,7 @@ def main():
     parser.add_argument('--configs',nargs='+',choices=CONFIGS,default=list(CONFIGS))
     parser.add_argument('--sequence-first',action='store_true',
                         help='finish all workload settings for each sequence before the next')
-    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch','summary-resident','cuda-resident','cuda-resident-hybrid'),default=['reference','summary'])
+    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch','summary-resident','cuda-resident','cuda-resident-hybrid','cuda-matching'),default=['reference','summary'])
     parser.add_argument('--threads',type=int,default=8)
     parser.add_argument('--repeats',type=int,default=2)
     parser.add_argument('--limit',type=int)
@@ -356,7 +356,7 @@ def main():
     args=parser.parse_args()
     if args.cuda_solve_min_dimension is not None and args.cuda_solve_min_dimension < 1:
         parser.error('CUDA solve minimum dimension must be positive')
-    if args.cuda_solve_configs is not None and 'cuda-resident-hybrid' in args.backends:
+    if args.cuda_solve_configs is not None and any(b in args.backends for b in ('cuda-resident-hybrid','cuda-matching')):
         parser.error('cuda-resident-hybrid selects every workload by dimension; omit --cuda-solve-configs')
     if args.cuda_solve_configs is not None and args.cuda_solve_min_dimension is None:
         parser.error('--cuda-solve-configs requires --cuda-solve-min-dimension')
@@ -394,7 +394,7 @@ def main():
                         argv.extend(['--limit',str(args.limit)])
                     if args.profile:
                         argv.append('--profile')
-                    if (backend in ('cuda','cuda-batch','cuda-resident-hybrid') and args.cuda_solve_min_dimension is not None
+                    if (backend in ('cuda','cuda-batch','cuda-resident-hybrid','cuda-matching') and args.cuda_solve_min_dimension is not None
                             and (args.cuda_solve_configs is None or config in args.cuda_solve_configs)):
                         argv.extend(['--cuda-solve-min-dimension',str(args.cuda_solve_min_dimension)])
                     spec={'id':run_id,'sequence':seq,'config':config,'backend':backend,'repeat':repeat,

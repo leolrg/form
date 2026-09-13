@@ -66,6 +66,8 @@ target_sources(FORM
 		form/optimization/resident_optimizer.hpp
 		form/optimization/profile.hpp
 		form/optimization/matcher.hpp
+		form/optimization/cuda_matcher.hpp
+		form/optimization/cuda_matching.hpp
 		# mapping
 		form/mapping/map.hpp
 		form/mapping/keyscanner.hpp
@@ -84,9 +86,10 @@ target_link_libraries(FORM
 if(FORM_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    target_sources(FORM PRIVATE form/feature/batch_summary_cuda.cu form/feature/cuda_qr.cu form/optimization/cuda_solver.cpp)
+    target_sources(FORM PRIVATE form/feature/batch_summary_cuda.cu form/feature/cuda_qr.cu form/optimization/cuda_matcher.cu form/optimization/cuda_matching.cpp form/optimization/cuda_solver.cpp)
     target_link_libraries(FORM PUBLIC CUDA::cudart CUDA::cusolver)
     target_compile_definitions(FORM PUBLIC FORM_ENABLE_CUDA=1)
+    set_source_files_properties(form/optimization/cuda_matcher.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
     set_target_properties(FORM PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 endif()
 

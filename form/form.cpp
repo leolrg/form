@@ -21,6 +21,9 @@
 // SOFTWARE.
 #include "form/form.hpp"
 #include "form/utils.hpp"
+#ifdef FORM_ENABLE_CUDA
+#include "form/optimization/cuda_matching.hpp"
+#endif
 
 namespace form {
 
@@ -41,6 +44,11 @@ std::tuple<std::vector<PlanarFeat>, std::vector<PointFeat>>
 Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   constexpr auto SEQ = std::make_index_sequence<2>{};
   last_timing = {};
+#ifndef FORM_ENABLE_CUDA
+  if (m_params.matcher.use_cuda) throw std::runtime_error("CUDA matching requested without FORM_ENABLE_CUDA");
+#endif
+  if (m_params.matcher.use_cuda && !m_params.constraints.use_cuda_summaries)
+    throw std::invalid_argument("CUDA matching requires CUDA summaries");
   auto stage_start = profile::Clock::now();
 
   //
@@ -71,6 +79,14 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
                             m_params.matcher.max_dist_matching);
   });
 
+#ifdef FORM_ENABLE_CUDA
+  if (m_params.matcher.use_cuda) {
+    if (!m_cuda_matching) m_cuda_matching = std::make_shared<CudaMatching>();
+    m_cuda_matching->reset(std::get<0>(world_map), std::get<1>(world_map),
+        std::get<0>(keypoints), std::get<1>(keypoints),
+        [&](size_t i) { return m_constraints.get_pose(i); }, m_params.matcher.max_dist_matching);
+  }
+#endif
   last_timing.map_ms = profile::milliseconds(stage_start);
 
   // ICP loop
@@ -83,11 +99,18 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
 
     // -------------------------------- Matching -------------------------------- //
     // Match each type of feature
-    tuple::for_seq(SEQ, [&](auto I) {
-      std::get<I>(m_matcher).template match<I>(std::get<I>(world_map),
-                                               std::get<I>(keypoints), estimates,
-                                               scan_constraints);
-    });
+#ifdef FORM_ENABLE_CUDA
+    if (m_params.matcher.use_cuda) {
+      m_cuda_matching->match(before, m_params.matcher.max_dist_matching, scan_constraints,
+          std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches);
+    } else
+#endif
+    {
+      tuple::for_seq(SEQ, [&](auto I) {
+        std::get<I>(m_matcher).template match<I>(std::get<I>(world_map),
+            std::get<I>(keypoints), estimates, scan_constraints);
+      });
+    }
 
     last_timing.match_ms += profile::milliseconds(stage_start);
     stage_start = profile::Clock::now();

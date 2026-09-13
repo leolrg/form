@@ -35,6 +35,7 @@
 #include <vector>
 
 namespace form {
+class CudaMatching;
 
 /// @brief Main class for the FORM LiDAR odometry system
 struct Estimator {
@@ -71,6 +72,8 @@ struct Estimator {
   /// @brief Optimization
   ConstraintManager m_constraints;
   std::tuple<Matcher<PlanarFeat>, Matcher<PointFeat>> m_matcher;
+
+  std::shared_ptr<CudaMatching> m_cuda_matching;
 
   /// @brief Mapping
   KeyScanner m_keyscanner;

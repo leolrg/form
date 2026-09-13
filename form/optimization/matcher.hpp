@@ -38,6 +38,9 @@ struct MatcherParams {
 
   /// @brief Maximum number of ICP rematches to perform
   size_t max_num_rematches = 30;
+
+  /// Optional device matching and direct exact summary preparation.
+  bool use_cuda = false;
 };
 
 /// @brief Class for matching keypoints to a map
