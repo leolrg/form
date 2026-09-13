@@ -127,3 +127,41 @@ TEST(CudaMatching, RequiresResetBeforeMatching) {
   tbb::concurrent_vector<form::Match<form::PointFeat>> qm;
   EXPECT_THROW(gpu.match({},1.,constraints,pm,qm,true),std::logic_error);
 }
+
+TEST(CudaMatching, FailedHostResetBlocksMatchingWithoutMutatingConstraintsAndRecovers) {
+  form::CudaMatching gpu;
+  form::VoxelMap<form::PlanarFeat> planes(1.);
+  form::VoxelMap<form::PointFeat> points(1.);
+  points.push_back(form::PointFeat(0,0,0,0));
+  auto pose=[](size_t) { return gtsam::Pose3(); };
+  form::CudaMatching::ConstraintMap constraints;
+  constraints[0]={std::make_shared<form::PlanePoint>(),std::make_shared<form::PointPoint>()};
+  tbb::concurrent_vector<form::Match<form::PlanarFeat>> pm;
+  tbb::concurrent_vector<form::Match<form::PointFeat>> qm;
+  gpu.reset(planes,points,{},{{.5,0,0,1}},pose,1.);
+  gpu.match({},1.,constraints,pm,qm);
+  const auto p=std::get<0>(constraints.at(0));
+  const auto q=std::get<1>(constraints.at(0));
+  const auto summary=p->summary_cache;
+  const auto revision=q->revision;
+  ASSERT_EQ(qm.size(),1);
+  ASSERT_DOUBLE_EQ(q->evaluateError({},{}).squaredNorm(),.25);
+
+  // The empty plane snapshot resets successfully, then point host packing
+  // fails before it can invalidate the previous device snapshot and groups.
+  auto failing_pose=[](size_t)->gtsam::Pose3 { throw std::runtime_error("pose lookup failed"); };
+  ASSERT_THROW(gpu.reset(planes,points,{},{{.25,0,0,1}},failing_pose,1.),std::runtime_error);
+  ASSERT_THROW(gpu.match({},1.,constraints,pm,qm,true),std::logic_error);
+  EXPECT_EQ(p->summary_cache,summary);
+  EXPECT_EQ(q->revision,revision);
+  EXPECT_DOUBLE_EQ(q->evaluateError({},{}).squaredNorm(),.25);
+  EXPECT_DOUBLE_EQ(qm[0].dist_sqrd,.25);
+
+  gpu.reset(planes,points,{},{{.125,0,0,1}},pose,1.);
+  gpu.match({},1.,constraints,pm,qm);
+  ASSERT_EQ(qm.size(),1);
+  EXPECT_DOUBLE_EQ(qm[0].dist_sqrd,.015625);
+  EXPECT_DOUBLE_EQ(q->evaluateError({},{}).squaredNorm(),.015625);
+  ASSERT_TRUE(p->summaryValidFor(q));
+  EXPECT_NEAR(p->summary_cache->squaredError({},{}),.015625,1e-14);
+}

@@ -86,22 +86,39 @@ template<class Point> struct MatchBatch {
 template<class Point> struct Snapshot {
   std::shared_ptr<CudaMatcher> device=std::make_shared<CudaMatcher>();
   std::shared_ptr<HostMap<Point>> map;
-  std::shared_ptr<MatchBatch<Point>> current;
+  std::shared_ptr<MatchBatch<Point>> current,idle_batch;
   std::shared_ptr<std::vector<int>> target_groups;
   std::vector<size_t> scan_order;
+  // Upload staging is never captured by deferred callbacks. reset() completes
+  // device reads before returning, so these capacities can span snapshots.
+  std::vector<CudaMatcher::Voxel> voxels;
+  std::vector<CudaMatcher::MapPoint> points;
+  std::vector<CudaMatcher::Query> packed;
+  std::vector<std::array<double,12>> inverse_matrices;
+  std::unordered_map<size_t,int> pose_slots;
   void freezeSurvivors() {
-    if(current && current.use_count()>1) current->ensure();
-    current.reset();
+    if(!current) return;
+    if(current.use_count()>1) {
+      current->ensure();
+      current.reset();
+      return;
+    }
+    // Only an unleased batch can be recycled. Drop its snapshot references
+    // before checking map uniqueness, but retain its large match allocation.
+    idle_batch=std::move(current);
+    idle_batch->map.reset(); idle_batch->device.reset(); idle_batch->target_groups.reset();
+    idle_batch->group_count=0; idle_batch->threshold=0.; idle_batch->loaded=false;
+    idle_batch->matches.clear(); idle_batch->groups.clear();
   }
   void reset(const VoxelMap<Point>& world_map,const std::vector<Point>& query,
              const std::function<gtsam::Pose3(size_t)>& estimates,double width) {
     freezeSurvivors();
-    map=std::make_shared<HostMap<Point>>();
+    // Leased maps remain immutable, including for callbacks copied from older
+    // factors. The common unleased path reuses point and query allocations.
+    if(!map || map.use_count()!=1) map=std::make_shared<HostMap<Point>>();
+    map->world_points.clear(); map->pose_indices.clear(); map->inverse_poses.clear();
     map->queries=query;
-    std::vector<CudaMatcher::Voxel> voxels;
-    std::vector<CudaMatcher::MapPoint> points;
-    std::vector<std::array<double,12>> inverse_matrices;
-    std::unordered_map<size_t,int> pose_slots;
+    voxels.clear(); points.clear(); packed.clear(); inverse_matrices.clear(); pose_slots.clear();
     voxels.reserve(world_map.size());
     size_t total=0;
     for(const auto& entry:world_map) total+=entry.second.size();
@@ -125,7 +142,6 @@ template<class Point> struct Snapshot {
         points.push_back(p);
       }
     }
-    std::vector<CudaMatcher::Query> packed;
     packed.reserve(query.size());
     for(const auto& q:query) packed.push_back({{q.x,q.y,q.z,q._}});
     device->reset(voxels,points,packed,width,inverse_matrices,map->pose_indices);
@@ -145,7 +161,8 @@ template<class Point> struct Snapshot {
       device->setGroups(*target_groups,scans.size());
     }
     auto summaries=device->searchGrouped(pose,threshold,I==0);
-    current=std::make_shared<MatchBatch<Point>>();
+    if(idle_batch) current=std::move(idle_batch);
+    else current=std::make_shared<MatchBatch<Point>>();
     current->map=map; current->device=device; current->target_groups=target_groups;
     current->group_count=scans.size(); current->threshold=threshold;
     for(size_t i=0;i<pairs.size();++i) {
@@ -157,6 +174,7 @@ template<class Point> struct Snapshot {
 };
 }
 struct CudaMatching::Impl {
+  bool ready=false;
   Snapshot<PlanarFeat> planes;
   Snapshot<PointFeat> points;
   std::vector<std::pair<std::weak_ptr<PlanePoint>,std::weak_ptr<PointPoint>>> pending;
@@ -166,12 +184,15 @@ CudaMatching::~CudaMatching()=default;
 void CudaMatching::reset(const VoxelMap<PlanarFeat>& planes,const VoxelMap<PointFeat>& points,
     const std::vector<PlanarFeat>& pq,const std::vector<PointFeat>& qq,
     const std::function<gtsam::Pose3(size_t)>& estimates,double width) {
+  impl_->ready=false;
   impl_->planes.reset(planes,pq,estimates,width);
   impl_->points.reset(points,qq,estimates,width);
+  impl_->ready=true;
 }
 void CudaMatching::match(const gtsam::Pose3& pose,double max_distance,ConstraintMap& constraints,
     tbb::concurrent_vector<Match<PlanarFeat>>& planes,tbb::concurrent_vector<Match<PointFeat>>& points,
     bool defer_raw) {
+  if(!impl_->ready) throw std::logic_error("CUDA matching requires a successful reset");
   if(!std::isfinite(max_distance) || max_distance<=0) throw std::invalid_argument("Invalid CUDA matching distance");
   std::vector<size_t> scans;
   std::vector<std::tuple<PlanePoint::Ptr,PointPoint::Ptr>> pairs;
