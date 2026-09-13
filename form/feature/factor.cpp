@@ -35,7 +35,8 @@ bool PlanePoint::summaryValidFor(const std::shared_ptr<PointPoint> &points) cons
 // ------------------------- Separate Computation ------------------------- //
 [[nodiscard]] gtsam::Vector
 PlanePoint::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
-                          OptionalJacobian H1, OptionalJacobian H2) const noexcept {
+                          OptionalJacobian H1, OptionalJacobian H2) const {
+  ensureRaw();
   // Only use the added constraints
   Eigen::Map<const Eigen::Matrix3Xd> p_i(this->p_i.data(), 3, num_constraints());
   Eigen::Map<const Eigen::Matrix3Xd> n_i(this->n_i.data(), 3, num_constraints());
@@ -87,7 +88,8 @@ PlanePoint::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
 
 [[nodiscard]] gtsam::Vector
 PointPoint::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
-                          OptionalJacobian H1, OptionalJacobian H2) const noexcept {
+                          OptionalJacobian H1, OptionalJacobian H2) const {
+  ensureRaw();
   // Only use the added constraints
   Eigen::Map<const Eigen::Matrix3Xd> p_i(this->p_i.data(), 3, num_constraints());
   Eigen::Map<const Eigen::Matrix3Xd> p_j(this->p_j.data(), 3, num_constraints());
@@ -137,7 +139,7 @@ PointPoint::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
 FeatureFactor::FeatureFactor(
     const gtsam::Key i, const gtsam::Key j,
     const std::tuple<PlanePoint::Ptr, PointPoint::Ptr> &constraints,
-    double sigma, bool use_summary) noexcept
+    double sigma, bool use_summary)
     : DenseFactor(
           FastIsotropic::Sigma(sigma, std::get<0>(constraints)->num_residuals() +
                                           std::get<1>(constraints)->num_residuals()),
@@ -178,7 +180,7 @@ double FeatureFactor::error(const gtsam::Values &values) const {
 [[nodiscard]] gtsam::Vector
 FeatureFactor::evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
                              boost::optional<gtsam::Matrix &> H1,
-                             boost::optional<gtsam::Matrix &> H2) const noexcept {
+                             boost::optional<gtsam::Matrix &> H2) const {
   profile::Scope timer(H1 || H2 ? profile::factor_eval : profile::factor_error);
 
   size_t size = plane_point->num_residuals() + point_point->num_residuals();

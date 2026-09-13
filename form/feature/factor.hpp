@@ -23,6 +23,9 @@
 
 #include <gtsam/geometry/Pose3.h>
 #include <vector>
+#include <functional>
+#include <optional>
+#include <mutex>
 
 #include "form/feature/features.hpp"
 #include "form/optimization/gtsam.hpp"
@@ -47,10 +50,10 @@ struct PlanePoint {
   typedef std::shared_ptr<PlanePoint> Ptr;
 
   /// @brief Vectors to hold point and normal data.
-  /// Call invalidateSummary() after modifying these arrays directly.
-  std::vector<double> p_i;
-  std::vector<double> n_i;
-  std::vector<double> p_j;
+  /// Call ensureRaw() before direct access, then invalidateSummary() after edits.
+  mutable std::vector<double> p_i;
+  mutable std::vector<double> n_i;
+  mutable std::vector<double> p_j;
   // Reused by all graph instances until either correspondence set changes.
   std::shared_ptr<const FeatureSummary> summary_cache;
   size_t summary_point_revision = 0;
@@ -58,9 +61,32 @@ struct PlanePoint {
 
   PlanePoint() = default;
 
+  // Summary backends can retain rows outside host memory. Counts are available
+  // immediately; raw evaluation and explicit array access call ensureRaw().
+  void deferRaw(size_t count, std::function<void(const PlanePoint&)> loader) {
+    clear();
+    if (!loader) throw std::invalid_argument("Deferred rows require a loader");
+    raw_mutex_ = std::make_shared<std::mutex>();
+    raw_loader_ = std::move(loader);
+    deferred_count_ = count;
+  }
+  void ensureRaw() const {
+    if (!deferred_count_) return;
+    std::lock_guard<std::mutex> lock(*raw_mutex_);
+    if (raw_loader_) { raw_loader_(*this); raw_loader_ = {}; }
+  }
+private:
+  std::optional<size_t> deferred_count_;
+  std::shared_ptr<std::mutex> raw_mutex_;
+  mutable std::function<void(const PlanePoint&)> raw_loader_;
+public:
+
+
   /// Invalidate cached summaries after direct mutation of correspondence arrays.
   /// Factors already constructed retain their immutable summary snapshots.
-  void invalidateSummary() noexcept {
+  void invalidateSummary() {
+    ensureRaw();
+    deferred_count_.reset();
     summary_cache.reset();
     summary_point_owner.reset();
   }
@@ -77,6 +103,8 @@ struct PlanePoint {
 
   /// @brief Clear all stored correspondences
   void clear() noexcept {
+    raw_loader_ = {};
+    deferred_count_.reset();
     invalidateSummary();
     p_i.clear();
     n_i.clear();
@@ -84,10 +112,10 @@ struct PlanePoint {
   }
 
   /// @brief Get the number of residuals (one per correspondence)
-  size_t num_residuals() const noexcept { return p_i.size() / 3; }
+  size_t num_residuals() const noexcept { return num_constraints(); }
 
   /// @brief Get the number of constraints / correspondences
-  size_t num_constraints() const noexcept { return p_i.size() / 3; }
+  size_t num_constraints() const noexcept { return deferred_count_ ? *deferred_count_ : p_i.size() / 3; }
 
   /// @brief Evaluate the residual given two poses
   ///
@@ -99,7 +127,7 @@ struct PlanePoint {
   [[nodiscard]] gtsam::Vector
   evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
                 OptionalJacobian residual_D_Ti = boost::none,
-                OptionalJacobian residual_D_Tj = boost::none) const noexcept;
+                OptionalJacobian residual_D_Tj = boost::none) const;
 };
 
 /// @brief Structure that holds point-point correspondences and computes their error
@@ -111,15 +139,36 @@ struct PointPoint {
   typedef std::shared_ptr<PointPoint> Ptr;
 
   /// @brief Vectors to hold point data.
-  /// Call invalidateSummary() after modifying these arrays directly.
-  std::vector<double> p_i;
-  std::vector<double> p_j;
+  /// Call ensureRaw() before direct access, then invalidateSummary() after edits.
+  mutable std::vector<double> p_i;
+  mutable std::vector<double> p_j;
   size_t revision = 0;
 
   PointPoint() = default;
 
+  // Summary backends can retain rows outside host memory. Counts are available
+  // immediately; raw evaluation and explicit array access call ensureRaw().
+  void deferRaw(size_t count, std::function<void(const PointPoint&)> loader) {
+    clear();
+    if (!loader) throw std::invalid_argument("Deferred rows require a loader");
+    raw_mutex_ = std::make_shared<std::mutex>();
+    raw_loader_ = std::move(loader);
+    deferred_count_ = count;
+  }
+  void ensureRaw() const {
+    if (!deferred_count_) return;
+    std::lock_guard<std::mutex> lock(*raw_mutex_);
+    if (raw_loader_) { raw_loader_(*this); raw_loader_ = {}; }
+  }
+private:
+  std::optional<size_t> deferred_count_;
+  std::shared_ptr<std::mutex> raw_mutex_;
+  mutable std::function<void(const PointPoint&)> raw_loader_;
+public:
+
+
   /// Invalidate dependent summaries after direct mutation of correspondence arrays.
-  void invalidateSummary() noexcept { ++revision; }
+  void invalidateSummary() { ensureRaw(); deferred_count_.reset(); ++revision; }
 
   /// @brief Add a new point-point correspondence
   void push_back(const PointFeat &p_i_, const PointFeat &p_j_) {
@@ -130,16 +179,18 @@ struct PointPoint {
 
   /// @brief Clear all stored correspondences
   void clear() noexcept {
+    raw_loader_ = {};
+    deferred_count_.reset();
     invalidateSummary();
     p_i.clear();
     p_j.clear();
   }
 
   /// @brief Get the number of residuals (three per correspondence)
-  size_t num_residuals() const noexcept { return p_i.size(); }
+  size_t num_residuals() const noexcept { return 3 * num_constraints(); }
 
   /// @brief Get the number of constraints / correspondences
-  size_t num_constraints() const noexcept { return p_i.size() / 3; }
+  size_t num_constraints() const noexcept { return deferred_count_ ? *deferred_count_ : p_i.size() / 3; }
 
   /// @brief Evaluate the residual given two poses
   ///
@@ -151,7 +202,7 @@ struct PointPoint {
   [[nodiscard]] gtsam::Vector
   evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
                 OptionalJacobian residual_D_Ti = boost::none,
-                OptionalJacobian residual_D_Tj = boost::none) const noexcept;
+                OptionalJacobian residual_D_Tj = boost::none) const;
 };
 
 /// @brief A wrapper factor that holds both plane-point and point-point constraints
@@ -172,7 +223,7 @@ public:
   /// @param sigma The isotropic noise standard deviation
   FeatureFactor(const gtsam::Key i, const gtsam::Key j,
                 const std::tuple<PlanePoint::Ptr, PointPoint::Ptr> &constraint,
-                double sigma, bool use_summary = false) noexcept;
+                double sigma, bool use_summary = false);
 
   boost::shared_ptr<gtsam::GaussianFactor>
   linearize(const gtsam::Values &values) const override;
@@ -197,7 +248,7 @@ public:
   evaluateError(const gtsam::Pose3 &Ti, const gtsam::Pose3 &Tj,
                 boost::optional<gtsam::Matrix &> residual_D_Ti = boost::none,
                 boost::optional<gtsam::Matrix &> residual_D_Tj =
-                    boost::none) const noexcept override;
+                    boost::none) const override;
 };
 
 } // namespace form

@@ -157,6 +157,7 @@ void ConstraintManager::prepare_cuda_summaries() {
       const auto& planes = std::get<0>(pair);
       const auto& points = std::get<1>(pair);
       if (planes->summaryValidFor(points)) continue;
+      planes->ensureRaw(); points->ensureRaw();
       pending.push_back(pair);
       inputs.push_back({planes->p_i.data(),planes->p_j.data(),planes->n_i.data(),planes->num_constraints(),true});
       inputs.push_back({points->p_i.data(),points->p_j.data(),nullptr,points->num_constraints(),false});

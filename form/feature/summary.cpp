@@ -56,6 +56,7 @@ FeatureSummary::FeatureSummary(const Eigen::Matrix<double, 13, 13> &planeRoot,
       plane_rows_(planeRoot.isZero(0.) ? 0 : 13) {}
 
 Eigen::MatrixXd FeatureSummary::pointFeatures(const PointPoint &points) {
+  points.ensureRaw();
   Eigen::MatrixXd features(points.num_constraints(), 7);
   for (Eigen::Index k = 0; k < features.rows(); ++k) {
     const Eigen::Map<const Eigen::Vector3d> pi(points.p_i.data() + 3 * k);
@@ -68,6 +69,7 @@ Eigen::MatrixXd FeatureSummary::pointFeatures(const PointPoint &points) {
 }
 
 Eigen::MatrixXd FeatureSummary::planeFeatures(const PlanePoint &planes) {
+  planes.ensureRaw();
   Eigen::MatrixXd features(planes.num_constraints(), 13);
   for (Eigen::Index k = 0; k < features.rows(); ++k) {
     const Eigen::Map<const Eigen::Vector3d> pi(planes.p_i.data() + 3 * k);

@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 #include <Eigen/QR>
 #include <random>
+#include <thread>
+#include <atomic>
 
 namespace {
 using Matrix13 = Eigen::Matrix<double, 13, 13>;
@@ -151,3 +153,58 @@ TEST(FeatureSummary, ExternalQrRootsHaveTheSameNormalEquations) {
   EXPECT_NEAR(summary.squaredError(Ti, Tj), expected(12, 12), 2e-13 * expected(12, 12));
 }
 } // namespace
+TEST(FeatureSummary, DeferredRowsPreserveCountsAndMaterializeOnce) {
+  form::PlanePoint planes;
+  form::PointPoint points;
+  int plane_loads=0, point_loads=0;
+  planes.deferRaw(1,[&](const form::PlanePoint& p) {
+    ++plane_loads; p.p_i={1,2,3}; p.p_j={2,4,6}; p.n_i={0,0,1};
+  });
+  points.deferRaw(1,[&](const form::PointPoint& p) {
+    ++point_loads; p.p_i={1,2,3}; p.p_j={2,4,6};
+  });
+  EXPECT_EQ(planes.num_constraints(),1); EXPECT_EQ(points.num_residuals(),3);
+  EXPECT_TRUE(planes.p_i.empty()); EXPECT_TRUE(points.p_i.empty());
+  EXPECT_DOUBLE_EQ(planes.evaluateError({},{}).squaredNorm(),9.);
+  EXPECT_DOUBLE_EQ(points.evaluateError({},{}).squaredNorm(),14.);
+  form::FeatureSummary summary(planes,points);
+  EXPECT_NEAR(summary.squaredError({},{}),23.,1e-12);
+  EXPECT_EQ(plane_loads,1); EXPECT_EQ(point_loads,1);
+}
+
+TEST(FeatureSummary, DeferredRowsClearCancelsAndAppendMaterializes) {
+  form::PointPoint points;
+  int loads=0;
+  auto load=[&](const form::PointPoint& p) { ++loads; p.p_i={1,2,3}; p.p_j={2,4,6}; };
+  points.deferRaw(1,load);
+  points.clear();
+  EXPECT_EQ(loads,0); EXPECT_EQ(points.num_constraints(),0);
+  points.deferRaw(1,load);
+  points.push_back(form::PointFeat(0,0,0,0),form::PointFeat(1,0,0,1));
+  EXPECT_EQ(loads,1); EXPECT_EQ(points.num_constraints(),2);
+  EXPECT_DOUBLE_EQ(points.evaluateError({},{}).squaredNorm(),15.);
+}
+
+TEST(FeatureSummary, DeferredRowsConcurrentReadsCopiesAndRetry) {
+  form::PointPoint points;
+  std::atomic<int> loads{0};
+  points.deferRaw(1,[&](const form::PointPoint& p) {
+    ++loads; p.p_i={1,2,3}; p.p_j={2,4,6};
+  });
+  auto copy=points;
+  std::vector<std::thread> readers;
+  for(int i=0;i<8;++i) readers.emplace_back([&] {
+    for(int j=0;j<50;++j) EXPECT_DOUBLE_EQ(points.evaluateError({},{}).squaredNorm(),14.);
+  });
+  for(auto& reader:readers) reader.join();
+  EXPECT_EQ(loads,1);
+  EXPECT_DOUBLE_EQ(copy.evaluateError({},{}).squaredNorm(),14.);
+  EXPECT_EQ(loads,2);
+  points.deferRaw(1,[&](const form::PointPoint& p) {
+    if(++loads==3) throw std::runtime_error("download failed");
+    p.p_i={0,0,0}; p.p_j={1,0,0};
+  });
+  EXPECT_THROW(points.evaluateError({},{}),std::runtime_error);
+  EXPECT_EQ(points.num_constraints(),1);
+  EXPECT_DOUBLE_EQ(points.evaluateError({},{}).squaredNorm(),1.);
+}
