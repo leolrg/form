@@ -72,3 +72,58 @@ TEST(CudaMatching, StrictThresholdAndCpuEmptyFeatureCompatibility) {
   EXPECT_TRUE(pm.empty()); EXPECT_EQ(qm.size(),2); // CPU retains the previous matches on empty feature input.
   EXPECT_EQ(std::get<1>(constraints.at(0))->num_constraints(),0);
 }
+
+TEST(CudaMatching, DeferredRematchesMaterializeOnlyLatestAndSurviveReset) {
+  form::VoxelMap<form::PlanarFeat> planes(1.);
+  form::VoxelMap<form::PointFeat> points(1.);
+  points.push_back(form::PointFeat(0,0,0,0));
+  auto pose=[](size_t) { return gtsam::Pose3(); };
+  form::CudaMatching gpu;
+  form::CudaMatching::ConstraintMap constraints;
+  constraints[0]={std::make_shared<form::PlanePoint>(),std::make_shared<form::PointPoint>()};
+  tbb::concurrent_vector<form::Match<form::PlanarFeat>> pm;
+  tbb::concurrent_vector<form::Match<form::PointFeat>> qm;
+  gpu.reset(planes,points,{},{{.5,0,0,1},{3,0,0,1}},pose,1.);
+  gpu.match({},1.,constraints,pm,qm,true);
+  auto p=std::get<0>(constraints.at(0)); auto q=std::get<1>(constraints.at(0));
+  EXPECT_TRUE(qm.empty()); EXPECT_TRUE(q->p_i.empty()); EXPECT_EQ(q->num_constraints(),1);
+  ASSERT_TRUE(p->summaryValidFor(q));
+  EXPECT_NEAR(p->summary_cache->squaredError({},{}),.25,1e-13);
+  gpu.match(gtsam::Pose3(gtsam::Rot3(),{.1,0,0}),1.,constraints,pm,qm,true);
+  EXPECT_TRUE(q->p_i.empty());
+  gpu.materialize(pm,qm);
+  ASSERT_EQ(qm.size(),2); EXPECT_DOUBLE_EQ(qm[0].dist_sqrd,.36);
+  EXPECT_DOUBLE_EQ(q->evaluateError({},{}).squaredNorm(),.25);
+
+  gpu.match({},1.,constraints,pm,qm,true);
+  auto retained=std::make_shared<form::PointPoint>(*q);
+  gpu.reset(planes,points,{},{{.1,0,0,2}},pose,1.);
+  gpu.match({},1.,constraints,pm,qm,true);
+  EXPECT_DOUBLE_EQ(retained->evaluateError({},{}).squaredNorm(),.25);
+  EXPECT_NEAR(q->evaluateError({},{}).squaredNorm(),.01,1e-14);
+}
+
+TEST(CudaMatching, DeferredRawOutlivesMatcher) {
+  auto q=std::make_shared<form::PointPoint>();
+  {
+    form::CudaMatching gpu;
+    form::VoxelMap<form::PlanarFeat> planes(1.);
+    form::VoxelMap<form::PointFeat> points(1.);
+    points.push_back(form::PointFeat(0,0,0,0));
+    form::CudaMatching::ConstraintMap constraints;
+    constraints[0]={std::make_shared<form::PlanePoint>(),q};
+    tbb::concurrent_vector<form::Match<form::PlanarFeat>> pm;
+    tbb::concurrent_vector<form::Match<form::PointFeat>> qm;
+    gpu.reset(planes,points,{},{{.5,0,0,1}},[](size_t) {return gtsam::Pose3();},1.);
+    gpu.match({},1.,constraints,pm,qm,true);
+  }
+  EXPECT_DOUBLE_EQ(q->evaluateError({},{}).squaredNorm(),.25);
+}
+
+TEST(CudaMatching, RequiresResetBeforeMatching) {
+  form::CudaMatching gpu;
+  form::CudaMatching::ConstraintMap constraints;
+  tbb::concurrent_vector<form::Match<form::PlanarFeat>> pm;
+  tbb::concurrent_vector<form::Match<form::PointFeat>> qm;
+  EXPECT_THROW(gpu.match({},1.,constraints,pm,qm,true),std::logic_error);
+}

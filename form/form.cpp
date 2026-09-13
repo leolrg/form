@@ -102,7 +102,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
 #ifdef FORM_ENABLE_CUDA
     if (m_params.matcher.use_cuda) {
       m_cuda_matching->match(before, m_params.matcher.max_dist_matching, scan_constraints,
-          std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches);
+          std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches, true);
     } else
 #endif
     {
@@ -125,6 +125,16 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
     }
     m_constraints.update_current_pose(after);
   }
+
+  // Download and materialize only the final rematch. Include this work in the
+  // matching timer so deferred bookkeeping cannot disappear from comparisons.
+#ifdef FORM_ENABLE_CUDA
+  if (m_params.matcher.use_cuda) {
+    stage_start = profile::Clock::now();
+    m_cuda_matching->materialize(std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches);
+    last_timing.match_ms += profile::milliseconds(stage_start);
+  }
+#endif
 
   // ------------------------ Full Nonlinear Optimization ------------------------ //
   stage_start = profile::Clock::now();
