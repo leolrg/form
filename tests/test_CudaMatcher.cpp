@@ -117,3 +117,17 @@ TEST(CudaMatcher, VisitsEveryNeighborOfQueryVoxel) {
     EXPECT_EQ(matcher.search({1,0,0,0,0,1,0,0,0,0,1,0})[0].index,0);
   }
 }
+
+TEST(CudaMatcher, DenseVoxelTailWinnerAndFirstHitAcrossLanes) {
+  CudaMatcher matcher;
+  for(int count:{33,65,257,4097}) {
+    std::vector<CudaMatcher::MapPoint> points(count,CudaMatcher::MapPoint{{.7,0,0,0},{},{}});
+    points.back().world[0]=.125;
+    std::vector<CudaMatcher::Query> queries(137,CudaMatcher::Query{{0,0,0,0}});
+    matcher.reset({{{0,0,0},0,count}},points,queries,1.);
+    for(auto r:matcher.search({1,0,0,0,0,1,0,0,0,0,1,0})) EXPECT_EQ(r.index,count-1);
+    points[1].world[0]=.125;
+    matcher.reset({{{0,0,0},0,count}},points,queries,1.);
+    for(auto r:matcher.search({1,0,0,0,0,1,0,0,0,0,1,0})) EXPECT_EQ(r.index,1);
+  }
+}
