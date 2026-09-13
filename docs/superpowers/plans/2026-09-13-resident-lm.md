@@ -26,5 +26,5 @@ and a common LM loop retaining GTSAM state/retraction/convergence semantics.
 
 - [x] Add measured hybrid follow-up: choose the complete CPU/CUDA matrix pipeline
   before assembly, with threshold-transition and unary-dimension regressions.
-- [ ] Benchmark the hybrid against original and optimized CPU at every workload;
+- [x] Benchmark the hybrid against original and optimized CPU at every workload;
   document both all-CUDA and hybrid results and their validation limits.

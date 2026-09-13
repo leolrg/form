@@ -275,3 +275,41 @@ neighborhoods keep the original `neighbor_points`. Spacing1 marks the selected
 sample only, spacing2 also marks the adjacent sample on each side. Explicit
 spacing may not exceed `neighbor_points`. Final scaling must report retained
 counts, not assume feature count doubles when caps double.
+
+### Resident matrix pipeline
+
+The experimental `summary-resident` backend combines CPU QR preparation with a
+direct dense CPU evaluator and LM controller. `cuda-resident` uses CUDA QR and
+retains frozen terms, assembly, damping, Cholesky and model errors on the device.
+Pose retraction and LM decisions remain on CPU. The original backend is unchanged.
+
+`cuda-resident-hybrid` retains CUDA QR preparation and selects the whole matrix
+pipeline before assembly: CPU below 240 scalar unknowns, resident CUDA at/above
+240. Override this policy with `--cuda-solve-min-dimension N`; it uses the actual
+optimized pose count, including unary ablation mode. It is a measured experimental
+policy for the test host, not an automatically tuned or portable crossover.
+Resident numerical factorization failures follow the LM damping retry policy;
+they do not invoke the legacy CPU solve fallback.
+
+```bash
+python benchmarks/run_suite.py --binary build-accel/form-replay \
+  --output benchmarks/results/my-resident-comparison \
+  --sequences stairs --configs current features window \
+  --backends reference summary-resident cuda-resident-hybrid \
+  --threads 32 --repeats 2 --limit 250 --cuda-solve-min-dimension 240
+```
+
+Use a new output directory. Omit `--cuda-solve-configs` for the hybrid: it selects
+by dimension for every workload, and the suite rejects that incompatible option.
+For the all-CUDA resident experiment, select `cuda-resident` without a selective
+solver flag. Repeat with full sequences before claiming the complete quality gate.
+
+C++ callers set `use_resident_optimizer=true`; `use_cuda_summaries` selects the
+summary preparation backend and, by default, the resident matrix backend. Setting
+`use_cuda_dense_solver=true` instead selects the matrix backend by
+`cuda_solve_min_dimension`. Set `use_batch_summaries=true` to match replay's batching
+of previous matches before freezing. Resident/batch flags are currently C++/replay
+options; they are not exposed in the evalio Python wrapper.
+
+See [resident results](../docs/resident-cuda-results.md) for all-CUDA and hybrid
+comparisons, actual correspondence/pose scaling, validation and frozen binaries.

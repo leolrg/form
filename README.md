@@ -44,7 +44,7 @@ preparation, or `use_cuda_summaries=true` for batched CUDA preparation. The same
 parameter names are exposed through evalio.
 
 CUDA support is opt-in at build time (`-DFORM_ENABLE_CUDA=ON`); select an
-appropriate `CMAKE_CUDA_ARCHITECTURES` value for your GPU. The common optimizer
+appropriate `CMAKE_CUDA_ARCHITECTURES` value for your GPU. The default optimizer
 remains on the CPU; optional `use_cuda_dense_solver` dispatches sufficiently
 large dense systems to FP64 cuSolver. See the [design and build instructions](docs/optimization-acceleration-design.md)
 and [reproducible benchmarks](benchmarks/README.md) for backend selection,
@@ -52,6 +52,13 @@ validation, and the Newer College 2021 evaluation matrix.
 
 The [completed tuning and scaling evaluation](docs/optimization-acceleration-results.md)
 reports all 72 runs, backend choices, accuracy tradeoffs, and measured limitations.
+
+The experimental [resident CPU/CUDA optimizer](docs/resident-cuda-results.md)
+removes repeated Gaussian graph assembly and keeps CUDA matrices resident through
+LM retries. C++ and standalone replay expose direct CPU, resident CUDA, and hybrid
+backends. The hybrid uses CUDA summary preparation and chooses the entire matrix
+pipeline by problem dimension. See the report for paired scaling results and the
+limits of the shorter screening runs.
 
 ## Running Experiments from Source
 All experiments are ran through [evalio](https://github.com/contagon/evalio/tree/master), our internal LiDAR-inertial odometry evaluation tool. Downloading the desired datasets is done as:
