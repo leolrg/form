@@ -13,13 +13,29 @@ void check(cudaError_t status) {
   if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA QR: ") + cudaGetErrorString(status));
 }
 BatchedCudaQr::InputObserver input_observer = nullptr;
+size_t addElements(size_t total, size_t count) {
+  if(total > std::numeric_limits<size_t>::max()/sizeof(double) ||
+     count > std::numeric_limits<size_t>::max()/sizeof(double) - total)
+    throw std::invalid_argument("CUDA QR input or scratch size overflows");
+  return total+count;
+}
+struct Event {
+  cudaEvent_t value = nullptr;
+  Event() { check(cudaEventCreateWithFlags(&value,cudaEventDisableTiming)); }
+  ~Event() { if(value) cudaEventDestroy(value); }
+};
+template<class T> size_t grownCapacity(size_t count,size_t capacity) {
+  const size_t limit=std::numeric_limits<size_t>::max()/sizeof(T);
+  if(count>limit) throw std::invalid_argument("CUDA QR allocation size overflows");
+  return std::max(count,capacity+std::min(capacity/2,limit-capacity));
+}
 template<class T> struct Buffer {
   T* data = nullptr;
   size_t capacity = 0;
   ~Buffer() { if (data) cudaFree(data); }
   void reserve(size_t count) {
     if (count <= capacity) return;
-    const size_t next_capacity = std::max(count, capacity + capacity / 2);
+    const size_t next_capacity = grownCapacity<T>(count,capacity);
     T* next = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&next), next_capacity * sizeof(T)));
     if (data) cudaFree(data);
@@ -42,7 +58,7 @@ template<class T> struct HostBuffer {
   }
   void reserve(size_t count) {
     if (count <= capacity) return;
-    const size_t next_capacity = std::max(count, capacity + capacity / 2);
+    const size_t next_capacity = grownCapacity<T>(count,capacity);
     T* next = nullptr;
     if (pinned) check(cudaHostAlloc(reinterpret_cast<void**>(&next), next_capacity*sizeof(T), cudaHostAllocDefault));
     else next = new T[next_capacity];
@@ -135,7 +151,7 @@ __device__ void qrWarp(const double* input, double* output, const Task& task) {
 template<int Rows>
 __global__ void qrTiles(const double* input, double* output,
                         const Task* tasks, int count) {
-  const int tile = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const size_t tile = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
   if (tile >= count) return;
   const Task task = tasks[tile];
   if(task.width==7) qrWarp<7,Rows>(input,output,task);
@@ -145,12 +161,14 @@ __global__ void qrTiles(const double* input, double* output,
 
 struct BatchedCudaQr::Impl {
   cudaStream_t stream = nullptr;
+  Event producer_ready;
   Buffer<double> a, b;
   Buffer<Task> descriptors;
   HostBuffer<double> host_input, host_roots;
   HostBuffer<Task> host_tasks;
   int first_rows,reduction_rows,block_threads;
-  std::vector<Eigen::MatrixXd> run(const std::vector<InputLayout>& input, size_t total);
+  std::vector<Eigen::MatrixXd> run(const std::vector<InputLayout>& input, size_t total,
+                                   const double* device_input = nullptr, bool device = false);
   explicit Impl(bool pinned,int first,int reduction,int threads)
       : host_input(pinned), host_roots(pinned), host_tasks(pinned),
         first_rows(first),reduction_rows(reduction),block_threads(threads) {
@@ -219,6 +237,49 @@ BatchedCudaQr::computeCorrespondences(const std::vector<Correspondences>& input)
 }
 
 std::vector<Eigen::MatrixXd>
+BatchedCudaQr::computeDevicePacked(const double* packed,
+                                  const std::vector<DeviceInput>& input,
+                                  void* producer_stream) {
+  if(input.empty()) return {};
+  size_t total=0;
+  std::vector<InputLayout> shapes;
+  shapes.reserve(input.size());
+  for(const auto& item:input) {
+    if(item.rows>static_cast<size_t>(std::numeric_limits<int>::max()) ||
+       item.rows>std::numeric_limits<size_t>::max()/7)
+      throw std::invalid_argument("CUDA QR input has too many rows");
+    total=addElements(total,item.rows*7);
+    shapes.push_back({static_cast<int>(item.rows),item.plane?13:7,7});
+  }
+  if(total && !packed) throw std::invalid_argument("CUDA QR device input pointer is null");
+  auto& state=*impl_;
+  check(cudaEventRecord(state.producer_ready.value,static_cast<cudaStream_t>(producer_stream)));
+  check(cudaStreamWaitEvent(state.stream,state.producer_ready.value,0));
+  if(input_observer) {
+    state.host_input.reserve(std::max<size_t>(1,total));
+    if(total) check(cudaMemcpyAsync(state.host_input.data,packed,total*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
+    check(cudaStreamSynchronize(state.stream));
+    std::vector<Eigen::MatrixXd> observed;
+    size_t offset=0;
+    for(const auto& item:input) {
+      const Eigen::Map<const Eigen::Matrix<double,Eigen::Dynamic,7>> compact(state.host_input.data+offset,item.rows,7);
+      if(!item.plane) observed.emplace_back(compact);
+      else {
+        Eigen::MatrixXd expanded(item.rows,13);
+        for(int a=0;a<3;++a) for(int b=0;b<3;++b)
+          expanded.col(3*a+b)=compact.col(3+a).cwiseProduct(compact.col(b));
+        expanded.middleCols(9,3)=compact.middleCols(3,3);
+        expanded.col(12)=compact.col(6);
+        observed.emplace_back(std::move(expanded));
+      }
+      offset+=item.rows*7;
+    }
+    input_observer(observed);
+  }
+  return state.run(shapes,total,packed,true);
+}
+
+std::vector<Eigen::MatrixXd>
 BatchedCudaQr::compute(const std::vector<Eigen::MatrixXd>& input) {
   if (input.empty()) return {};
   size_t total = 0;
@@ -243,7 +304,8 @@ BatchedCudaQr::compute(const std::vector<Eigen::MatrixXd>& input) {
 }
 
 std::vector<Eigen::MatrixXd>
-BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total) {
+BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total,
+                         const double* device_input,bool device) {
   auto& state=*this;
   std::vector<Task> first;
   std::vector<Layout> layout;
@@ -253,9 +315,10 @@ BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total) {
     const int roots=rows?1+(rows-1)/first_rows:1;
     layout.push_back({output_offset,roots,width});
     for(int tile=0;tile<roots;++tile)
-      first.push_back({input_offset+tile*first_rows,output_offset+tile*width*width,
+      first.push_back({input_offset+tile*first_rows,output_offset+static_cast<size_t>(tile)*width*width,
                        std::max(0,std::min(first_rows,rows-tile*first_rows)),width,rows,width!=matrix.stored_width?2:0});
-    input_offset += static_cast<size_t>(rows)*matrix.stored_width; output_offset += roots*width*width;
+    input_offset = addElements(input_offset,static_cast<size_t>(rows)*matrix.stored_width);
+    output_offset = addElements(output_offset,static_cast<size_t>(roots)*width*width);
   }
   // Build every reduction level before upload: descriptor storage remains
   // immutable until the stream has finished all kernels.
@@ -271,25 +334,29 @@ BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total) {
       const int roots=(l.roots+group-1)/group;
       next.push_back({destination,roots,l.width});
       for(int r=0;r<roots;++r)
-        all.push_back({l.offset+static_cast<size_t>(r*group*l.width*l.width),
-                       destination+static_cast<size_t>(r*l.width*l.width),
+        all.push_back({l.offset+static_cast<size_t>(r)*group*l.width*l.width,
+                       destination+static_cast<size_t>(r)*l.width*l.width,
                        std::min(group,l.roots-r*group)*l.width,l.width,l.width,1});
-      destination += roots*l.width*l.width;
+      destination = addElements(destination,static_cast<size_t>(roots)*l.width*l.width);
     }
     levels.push_back({begin,all.size()-begin});
     layout=std::move(next);
   }
   const size_t final_size=layout.back().offset+layout.back().width*layout.back().width;
   state.host_roots.reserve(final_size);
-  state.a.reserve(std::max<size_t>(1,std::max(total,max_output)));
+  state.a.reserve(std::max<size_t>(1,std::max(device?size_t(0):total,max_output)));
   state.b.reserve(std::max<size_t>(1,max_output));
+  for(auto level:levels)
+    if(level.second>static_cast<size_t>(std::numeric_limits<int>::max()))
+      throw std::invalid_argument("CUDA QR has too many tiles");
   state.descriptors.reserve(all.size());
   state.host_tasks.reserve(all.size());
   std::memcpy(state.host_tasks.data, all.data(), all.size()*sizeof(Task));
-  if(total) check(cudaMemcpyAsync(state.a.data,state.host_input.data,total*sizeof(double),cudaMemcpyHostToDevice,state.stream));
+  if(!device && total) check(cudaMemcpyAsync(state.a.data,state.host_input.data,total*sizeof(double),cudaMemcpyHostToDevice,state.stream));
   check(cudaMemcpyAsync(state.descriptors.data,state.host_tasks.data,all.size()*sizeof(Task),cudaMemcpyHostToDevice,state.stream));
   auto launch=[&] {
-    double* src=state.a.data; double* dst=state.b.data;
+    const double* src=device?device_input:state.a.data;
+    double* dst=state.b.data;
     bool first_level=true;
     for(auto level:levels) {
       const int warps=block_threads/32;
@@ -299,7 +366,9 @@ BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total) {
       else
         qrTiles<64><<<blocks,block_threads,0,state.stream>>>(src,dst,state.descriptors.data+level.first,level.second);
       check(cudaGetLastError());
-      std::swap(src,dst);
+      src=dst;
+      // Never use the caller's device pointer as a reduction destination.
+      dst=dst==state.b.data?state.a.data:state.b.data;
       first_level=false;
     }
   };

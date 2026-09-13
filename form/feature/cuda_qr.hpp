@@ -25,6 +25,18 @@ public:
   /// Coordinates/normals are interleaved xyz. Packs seven doubles per row
   /// directly into staging memory; expands plane tensors in the first kernel.
   std::vector<Eigen::MatrixXd> computeCorrespondences(const std::vector<Correspondences>& input);
+  struct DeviceInput {
+    size_t rows;
+    bool plane;
+  };
+  /// Caller-owned device matrices concatenated in column-major rows x 7 layout.
+  /// Point rows are [1, pi, pj-pi]; plane rows are [pj, n, n.dot(pj-pi)].
+  /// The producer stream (nullptr for the default stream) is waited on by event.
+  /// Input is never modified; all reads finish before this synchronous return.
+  /// Diagnostic observers receive expanded host matrices when enabled.
+  std::vector<Eigen::MatrixXd> computeDevicePacked(
+      const double* packed, const std::vector<DeviceInput>& input,
+      void* producer_stream = nullptr);
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
