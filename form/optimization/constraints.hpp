@@ -43,6 +43,7 @@ namespace form {
 class BatchedCudaQr;
 class CudaDenseSolver;
 class BatchSummary;
+class ResidentOptimizer;
 
 using ScanIndex = size_t;
 
@@ -61,6 +62,8 @@ public:
     /// Experimental resident graph evaluation/assembly, opt in independently.
     bool use_batch_summaries = false;
     size_t batch_min_edges = 64;
+    /// Direct dense LM; CUDA summaries select the resident device matrix pipeline.
+    bool use_resident_optimizer = false;
     /// Experimental selective dense solving; independent of summary preparation.
     bool use_cuda_dense_solver = false;
     int cuda_solve_min_dimension = 240;
@@ -112,6 +115,7 @@ private:
   std::shared_ptr<BatchedCudaQr> m_cuda_qr;
   std::shared_ptr<CudaDenseSolver> m_cuda_solver;
   std::shared_ptr<BatchSummary> m_batch_summary;
+  std::shared_ptr<ResidentOptimizer> m_resident_optimizer;
   void prepare_cuda_summaries();
   void prepare_cpu_summaries();
 

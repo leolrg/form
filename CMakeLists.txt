@@ -40,6 +40,7 @@ add_library(FORM
 	form/feature/summary.cpp
 	form/feature/batch_summary.cpp
 	form/feature/batch_factor.cpp
+	form/optimization/resident_optimizer.cpp
 	form/optimization/constraints.cpp
 	form/mapping/keyscanner.cpp
 )
@@ -62,6 +63,7 @@ target_sources(FORM
 		form/optimization/gtsam.hpp
 		form/optimization/cuda_solver.hpp
 		form/optimization/resident_system.hpp
+		form/optimization/resident_optimizer.hpp
 		form/optimization/profile.hpp
 		form/optimization/matcher.hpp
 		# mapping

@@ -22,6 +22,7 @@
 #include "form/optimization/constraints.hpp"
 #include "form/feature/summary.hpp"
 #include "form/feature/batch_factor.hpp"
+#include "form/optimization/resident_optimizer.hpp"
 #ifdef FORM_ENABLE_CUDA
 #include "form/feature/cuda_qr.hpp"
 #endif
@@ -177,7 +178,7 @@ void ConstraintManager::prepare_cuda_summaries() {
 }
 
 gtsam::Values ConstraintManager::optimize(bool fast) {
-  if (m_params.use_cuda_dense_solver) {
+  if (m_params.use_cuda_dense_solver && !m_params.use_resident_optimizer) {
     if (m_params.cuda_solve_min_dimension < 1)
       throw std::invalid_argument("cuda_solve_min_dimension must be positive");
 #ifdef FORM_ENABLE_CUDA
@@ -188,28 +189,25 @@ gtsam::Values ConstraintManager::optimize(bool fast) {
   }
   if (m_params.use_cuda_summaries) prepare_cuda_summaries();
   else if (m_params.use_summary) prepare_cpu_summaries();
-  if (m_params.disable_smoothing) {
-    auto graph = get_single_graph();
-    gtsam::Values values;
-    values.insert(X(m_scan), get_pose(m_scan));
-
-    DenseLMOptimizer optimizer(graph, values, m_params.opt_params,
-                               m_cuda_solver, m_params.cuda_solve_min_dimension);
-    profile::last_initial_error.store(optimizer.error(), std::memory_order_relaxed);
-    auto result = optimizer.optimize();
-    profile::last_final_error.store(optimizer.error(), std::memory_order_relaxed);
-    return result;
-  } else {
-    auto graph = get_graph(fast);
-    DenseLMOptimizer optimizer(graph, m_values, m_params.opt_params,
-                               m_cuda_solver, m_params.cuda_solve_min_dimension);
-    profile::last_initial_error.store(optimizer.error(), std::memory_order_relaxed);
-    auto result = optimizer.optimize();
-    profile::last_final_error.store(optimizer.error(), std::memory_order_relaxed);
-    return result;
+  auto graph = m_params.disable_smoothing ? get_single_graph() : get_graph(fast);
+  gtsam::Values values;
+  if (m_params.disable_smoothing) values.insert(X(m_scan), get_pose(m_scan));
+  else values = m_values;
+  if (m_params.use_resident_optimizer) {
+    if (!m_resident_optimizer)
+      m_resident_optimizer = std::make_shared<ResidentOptimizer>(m_params.use_cuda_summaries);
+    m_resident_optimizer->reset(graph, values);
+    auto result = m_resident_optimizer->optimize(values, m_params.opt_params);
+    profile::last_initial_error.store(result.initial_error, std::memory_order_relaxed);
+    profile::last_final_error.store(result.final_error, std::memory_order_relaxed);
+    return std::move(result.values);
   }
-
-  // Solve!
+  DenseLMOptimizer optimizer(graph, values, m_params.opt_params,
+                             m_cuda_solver, m_params.cuda_solve_min_dimension);
+  profile::last_initial_error.store(optimizer.error(), std::memory_order_relaxed);
+  auto result = optimizer.optimize();
+  profile::last_final_error.store(optimizer.error(), std::memory_order_relaxed);
+  return result;
 }
 
 void ConstraintManager::marginalize(const std::vector<ScanIndex> &scans) noexcept {
@@ -403,7 +401,7 @@ gtsam::NonlinearFactorGraph ConstraintManager::get_graph(bool fast) {
     }
   }
 
-  if (m_params.use_batch_summaries)
+  if (m_params.use_batch_summaries && !m_params.use_resident_optimizer)
     graph = batchFeatureGraph(graph, m_params.use_cuda_summaries,
                               m_params.batch_min_edges, m_batch_summary);
   return graph;

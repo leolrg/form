@@ -1,3 +1,4 @@
+#include <numeric>
 #include <gtest/gtest.h>
 #include <gtsam/linear/HessianFactor.h>
 #include <gtsam/linear/GaussianFactorGraph.h>
@@ -188,5 +189,41 @@ TEST(BatchSummary, ResidentFrozenAuxiliaryDampingAndTrialCost) {
   poses.assign(3,gtsam::Pose3{});
   EXPECT_NEAR(batch.residentError(poses,offsets),.35*root->squaredError(poses[0],poses[2]),2e-12);
   EXPECT_THROW(batch.residentLinearize(poses,{},av),std::invalid_argument);
+#endif
+}
+
+TEST(BatchSummary, ResidentDimensionsResetAndFailedCholesky) {
+#ifndef FORM_ENABLE_CUDA
+  GTEST_SKIP() << "CUDA disabled";
+#else
+  form::BatchSummary batch(1,{},true);
+  for(int count:{1,7,43,1}) {
+    const int n=6*count;
+    batch.reset(count,{});
+    EXPECT_THROW(batch.residentHessian(),std::logic_error);
+    Eigen::MatrixXd h=Eigen::MatrixXd::Zero(n+1,n+1);
+    h.topLeftCorner(n,n).diagonal().setConstant(4.);
+    for(int i=1;i<n;++i)h(i,i-1)=h(i-1,i)=.3;
+    h.col(n).head(n)=Eigen::VectorXd::LinSpaced(n,-1.,1.);h.row(n).head(n)=h.col(n).head(n).transpose();h(n,n)=20.;
+    std::vector<int> indices(count);std::iota(indices.begin(),indices.end(),0);
+    batch.configureResident({{indices,{h.data(),h.data()+h.size()},true}},{});
+    std::vector<double> d(n,.01);std::vector<gtsam::Pose3> poses(count);
+    batch.residentLinearize(poses,d,{});
+    Eigen::VectorXd delta;double old_error,new_error;
+    ASSERT_TRUE(batch.residentSolve(.1,false,1e-6,1e32,delta,old_error,new_error));
+    Eigen::MatrixXd damped=h.topLeftCorner(n,n);damped.diagonal().array()+=.1;
+    Eigen::VectorXd rhs=h.col(n).head(n)-h.topLeftCorner(n,n)*Eigen::VectorXd::Constant(n,.01);
+    EXPECT_TRUE(delta.isApprox(damped.llt().solve(rhs),2e-12));
+  }
+  Eigen::MatrixXd h=Eigen::MatrixXd::Identity(7,7);h(0,0)=-1;h(0,6)=h(6,0)=.2;
+  batch.configureResident({{{0},{h.data(),h.data()+h.size()},true}},{});
+  batch.residentLinearize({gtsam::Pose3{}},std::vector<double>(6,0.),{});
+  Eigen::VectorXd delta=Eigen::VectorXd::Constant(6,123.);double old_error=123.,new_error=123.;
+  EXPECT_FALSE(batch.residentSolve(.1,false,1e-6,1e32,delta,old_error,new_error));
+  EXPECT_TRUE(delta.isApprox(Eigen::VectorXd::Constant(6,123.)));EXPECT_EQ(old_error,123.);EXPECT_EQ(new_error,123.);
+  EXPECT_TRUE(batch.residentSolve(2.,false,1e-6,1e32,delta,old_error,new_error));
+  EXPECT_NEAR(delta[0],.2,1e-14);
+  EXPECT_THROW(batch.residentSolve(-1.,false,1e-6,1e32,delta,old_error,new_error),std::invalid_argument);
+  EXPECT_THROW(batch.configureResident({{{0,0},std::vector<double>(169),true}},{}),std::invalid_argument);
 #endif
 }

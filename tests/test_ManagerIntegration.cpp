@@ -144,6 +144,7 @@ protected:
     result.use_summary = !(GetParam() & 1);
     result.use_cuda_summaries = GetParam() & 1;
     result.use_batch_summaries = GetParam() >= 2;
+    result.use_resident_optimizer = GetParam() >= 4;
     result.batch_min_edges = 0;
     result.disable_smoothing = single;
     return result;
@@ -221,5 +222,5 @@ TEST_P(ManagerIntegration, DisableSmoothingUsesUnarySummariesAcrossRematches) {
   }
 }
 
-INSTANTIATE_TEST_SUITE_P(CpuAndCuda, ManagerIntegration, testing::Values(0,1,2,3));
+INSTANTIATE_TEST_SUITE_P(CpuAndCuda, ManagerIntegration, testing::Values(0,1,2,3,4,5));
 } // namespace

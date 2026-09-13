@@ -341,7 +341,7 @@ def main():
     parser.add_argument('--configs',nargs='+',choices=CONFIGS,default=list(CONFIGS))
     parser.add_argument('--sequence-first',action='store_true',
                         help='finish all workload settings for each sequence before the next')
-    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch'),default=['reference','summary'])
+    parser.add_argument('--backends',nargs='+',choices=('reference','summary','cuda','summary-batch','cuda-batch','summary-resident','cuda-resident'),default=['reference','summary'])
     parser.add_argument('--threads',type=int,default=8)
     parser.add_argument('--repeats',type=int,default=2)
     parser.add_argument('--limit',type=int)

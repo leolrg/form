@@ -8,6 +8,7 @@ add_executable(form-tests
     test_Summary.cpp
     test_SummaryIntegration.cpp
     test_ManagerIntegration.cpp
+    test_ResidentOptimizer.cpp
     test_FeatureExtraction.cpp
 )
 target_link_libraries(form-tests 
