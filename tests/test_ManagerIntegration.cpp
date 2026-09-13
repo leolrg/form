@@ -222,5 +222,115 @@ TEST_P(ManagerIntegration, DisableSmoothingUsesUnarySummariesAcrossRematches) {
   }
 }
 
+#ifdef FORM_ENABLE_CUDA
+TEST(ResidentManagerDispatch, SwitchesWholePipelineAcrossThresholdAndMarginalization) {
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+    GTEST_SKIP() << "CUDA device unavailable";
+  struct Restore {
+    bool enabled = form::profile::enabled;
+    ~Restore() { form::profile::enabled = enabled; }
+  } restore;
+  form::profile::enabled = false;
+
+  ConstraintManager::Params params;
+  params.use_resident_optimizer = true;
+  params.use_cuda_summaries = true;
+  params.use_cuda_dense_solver = true;
+  params.cuda_solve_min_dimension = 18;
+  ConstraintManager reference;
+  ConstraintManager accelerated(params);
+
+  const auto optimizeAndCheck = [&](bool expect_gpu) {
+    const auto expected = reference.optimize(false);
+    form::profile::reset();
+    const auto actual = accelerated.optimize(false);
+    const auto calls = form::profile::cuda_solve_calls.load();
+    const auto iterations = form::profile::iterations.load();
+    ASSERT_GT(iterations, 0u) << "Perturbed values must exercise the selected solver";
+    if (expect_gpu) EXPECT_GE(calls, iterations);
+    else EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(form::profile::cuda_solve_fallbacks.load(), 0u);
+    expectValuesNear(expected, actual);
+    reference.update_values(expected);
+    accelerated.update_values(actual);
+  };
+
+  // The threshold counts pose dimensions, excluding the augmented constant.
+  for (size_t scan = 0; scan <= 2; ++scan) {
+    SCOPED_TRACE(::testing::Message() << "initial scan=" << scan);
+    reference.step(initial(scan));
+    accelerated.step(initial(scan));
+    if (scan == 0) continue;
+    fillCurrent(reference, scan);
+    fillCurrent(accelerated, scan);
+    ASSERT_EQ(accelerated.get_values().size(), scan+1);
+    optimizeAndCheck(scan == 2);  // 12 dimensions on CPU, exactly 18 on GPU.
+  }
+
+  // Shrinking the same manager must select its cached CPU workspace again.
+  reference.marginalize({0});
+  accelerated.marginalize({0});
+  ASSERT_EQ(accelerated.get_values().size(), 2u);
+  reference.update_current_pose(initial(2));
+  accelerated.update_current_pose(initial(2));
+  optimizeAndCheck(false);
+
+  // Revisit the GPU threshold with changed keys, roots, and a frozen marginal.
+  reference.step(initial(3));
+  accelerated.step(initial(3));
+  fillCurrent(reference, 3);
+  fillCurrent(accelerated, 3);
+  ASSERT_EQ(accelerated.get_values().size(), 3u);
+  optimizeAndCheck(true);
+
+  reference.marginalize({1, 2});
+  accelerated.marginalize({1, 2});
+  ASSERT_EQ(accelerated.get_values().size(), 1u);
+  reference.update_current_pose(initial(3));
+  accelerated.update_current_pose(initial(3));
+  optimizeAndCheck(false);
+}
+
+TEST(ResidentManagerDispatch, UnaryOptimizationUsesItsOwnDimensionWithCudaSummaries) {
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+    GTEST_SKIP() << "CUDA device unavailable";
+  struct Restore {
+    bool enabled = form::profile::enabled;
+    ~Restore() { form::profile::enabled = enabled; }
+  } restore;
+  form::profile::enabled = false;
+
+  ConstraintManager::Params reference_params;
+  reference_params.disable_smoothing = true;
+  ConstraintManager::Params params = reference_params;
+  params.use_resident_optimizer = true;
+  params.use_cuda_summaries = true;
+  params.use_cuda_dense_solver = true;
+  params.cuda_solve_min_dimension = 18;
+  ConstraintManager reference(reference_params);
+  ConstraintManager accelerated(params);
+  for (size_t scan = 0; scan < 4; ++scan) {
+    SCOPED_TRACE(::testing::Message() << "scan=" << scan);
+    reference.step(initial(scan));
+    accelerated.step(initial(scan));
+    if (scan == 0) continue;
+    fillCurrent(reference, scan);
+    fillCurrent(accelerated, scan);
+    const auto expected = reference.optimize(false);
+    form::profile::reset();
+    const auto actual = accelerated.optimize(false);
+    ASSERT_EQ(actual.size(), 1u);
+    ASSERT_GT(form::profile::iterations.load(), 0u);
+    EXPECT_EQ(form::profile::cuda_solve_calls.load(), 0u);
+    EXPECT_EQ(form::profile::cuda_solve_fallbacks.load(), 0u);
+    expectValuesNear(expected, actual);
+    reference.update_values(expected);
+    accelerated.update_values(actual);
+  }
+}
+#endif
+
 INSTANTIATE_TEST_SUITE_P(CpuAndCuda, ManagerIntegration, testing::Values(0,1,2,3,4,5));
 } // namespace

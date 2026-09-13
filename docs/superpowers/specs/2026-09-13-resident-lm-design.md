@@ -45,3 +45,25 @@ failure, and CPU-only build. Sanitize new CUDA code. Then run matched replays fo
 current/features/window with original CPU, best previous CPU/CUDA, and both new
 implementations. Profile separately from timing, include setup/transfers, and
 report per-backend scaling, trajectory agreement and unavailable quality metrics.
+
+## Measured follow-up: choose the whole matrix pipeline by dimension
+
+The completed 36-run pilot at commit `60dfaee` found mean optimization latency
+(CPU resident / CUDA resident) of 10.74 / 12.39 ms at current size,
+23.79 / 15.32 ms with denser points, and 39.92 / 30.52 ms with the larger window.
+The current-size profile separately shows faster GPU summary preparation, while
+the direct CPU linearization/solve scopes are faster for these small systems.
+
+Add an explicit hybrid experiment: CUDA summary preparation remains enabled;
+choose the resident matrix pipeline before assembly, using actual optimized
+Pose3 dimension. Reuse separate CPU and CUDA workspaces across changes in size.
+This avoids GPU assembly followed by a dense model download for a small CPU solve.
+The existing selective-solver flag and dimension threshold control this choice
+when resident LM is enabled. The replay preset `cuda-resident-hybrid` uses 240
+scalar variables; this is an experimental hardware-specific policy, not a claim
+of an optimal crossover. `cuda-resident` without selective solving retains its
+all-CUDA matrix pipeline. Original defaults remain unchanged.
+
+Test exact-threshold transitions, shrink/grow after marginalization, unary
+optimization dimension, pose agreement, and actual solver dispatch counts. Run
+matched original CPU, direct CPU, and hybrid comparisons at all three workloads.

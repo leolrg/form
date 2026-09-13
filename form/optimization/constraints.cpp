@@ -178,9 +178,9 @@ void ConstraintManager::prepare_cuda_summaries() {
 }
 
 gtsam::Values ConstraintManager::optimize(bool fast) {
+  if (m_params.use_cuda_dense_solver && m_params.cuda_solve_min_dimension < 1)
+    throw std::invalid_argument("cuda_solve_min_dimension must be positive");
   if (m_params.use_cuda_dense_solver && !m_params.use_resident_optimizer) {
-    if (m_params.cuda_solve_min_dimension < 1)
-      throw std::invalid_argument("cuda_solve_min_dimension must be positive");
 #ifdef FORM_ENABLE_CUDA
     if (!m_cuda_solver) m_cuda_solver = std::make_shared<CudaDenseSolver>();
 #else
@@ -194,10 +194,15 @@ gtsam::Values ConstraintManager::optimize(bool fast) {
   if (m_params.disable_smoothing) values.insert(X(m_scan), get_pose(m_scan));
   else values = m_values;
   if (m_params.use_resident_optimizer) {
-    if (!m_resident_optimizer)
-      m_resident_optimizer = std::make_shared<ResidentOptimizer>(m_params.use_cuda_summaries);
-    m_resident_optimizer->reset(graph, values);
-    auto result = m_resident_optimizer->optimize(values, m_params.opt_params);
+    // Choose before assembly so a small CPU solve never requires a dense
+    // device-to-host model transfer. Keep both workspaces across size changes.
+    const bool gpu = m_params.use_cuda_dense_solver
+        ? 6 * values.size() >= static_cast<size_t>(m_params.cuda_solve_min_dimension)
+        : m_params.use_cuda_summaries;
+    auto& workspace = gpu ? m_resident_cuda_optimizer : m_resident_cpu_optimizer;
+    if (!workspace) workspace = std::make_shared<ResidentOptimizer>(gpu);
+    workspace->reset(graph, values);
+    auto result = workspace->optimize(values, m_params.opt_params);
     profile::last_initial_error.store(result.initial_error, std::memory_order_relaxed);
     profile::last_final_error.store(result.final_error, std::memory_order_relaxed);
     return std::move(result.values);

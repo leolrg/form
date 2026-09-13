@@ -20,6 +20,11 @@ and a common LM loop retaining GTSAM state/retraction/convergence semantics.
   with DenseLMOptimizer; preserve hooks, thresholds and lambda policies.
 - [x] Integrate explicit CPU/GPU resident backends into replay and the manager.
 - [x] Run C++/CPU-only tests and Compute Sanitizer, review code and commit.
-- [ ] Freeze a binary; run matched current/features/window screening with CPU
+- [x] Freeze a binary; run matched current/features/window screening with CPU
   baselines and both new paths. Investigate regressions instead of enabling a
   slower default. Commit measured results and CPU/CUDA scaling tables.
+
+- [x] Add measured hybrid follow-up: choose the complete CPU/CUDA matrix pipeline
+  before assembly, with threshold-transition and unary-dimension regressions.
+- [ ] Benchmark the hybrid against original and optimized CPU at every workload;
+  document both all-CUDA and hybrid results and their validation limits.

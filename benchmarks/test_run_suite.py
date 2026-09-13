@@ -8,6 +8,16 @@ import run_suite as r
 
 
 class SuiteTests(unittest.TestCase):
+    def test_hybrid_rejects_legacy_config_restriction(self):
+        import contextlib, io, sys
+        from unittest.mock import patch
+        argv = ['run_suite.py', '--output', '/unused', '--backends', 'cuda-resident-hybrid',
+                '--cuda-solve-min-dimension', '240', '--cuda-solve-configs', 'window']
+        with patch.object(sys, 'argv', argv), patch.object(r, 'provenance', side_effect=AssertionError('must reject before provenance')):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                r.main()
+            self.assertEqual(error.exception.code, 2)
+
     def test_workload_variants_change_independently(self):
         self.assertEqual(r.CONFIGS['current'], {'points':3,'planes':50,'recent':10})
         self.assertEqual(r.CONFIGS['features'], {'points':6,'planes':100,'feature-spacing':2,'recent':10})

@@ -65,6 +65,7 @@ public:
     /// Direct dense LM; CUDA summaries select the resident device matrix pipeline.
     bool use_resident_optimizer = false;
     /// Experimental selective dense solving; independent of summary preparation.
+    /// In resident LM this selects the entire CPU/CUDA matrix pipeline.
     bool use_cuda_dense_solver = false;
     int cuda_solve_min_dimension = 240;
     // Used for ablations, optimize a single pose at a time
@@ -115,7 +116,7 @@ private:
   std::shared_ptr<BatchedCudaQr> m_cuda_qr;
   std::shared_ptr<CudaDenseSolver> m_cuda_solver;
   std::shared_ptr<BatchSummary> m_batch_summary;
-  std::shared_ptr<ResidentOptimizer> m_resident_optimizer;
+  std::shared_ptr<ResidentOptimizer> m_resident_cpu_optimizer, m_resident_cuda_optimizer;
   void prepare_cuda_summaries();
   void prepare_cpu_summaries();
 
