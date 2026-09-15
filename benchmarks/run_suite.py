@@ -339,7 +339,7 @@ def main():
                         help='frozen previous matcher for interleaved cuda-matching-previous controls')
     parser.add_argument('--input-dir',type=Path,default=Path('/home/ubuntu/datasets/form-input'))
     parser.add_argument('--output',type=Path,default=ROOT/'benchmarks/results/suite')
-    parser.add_argument('--sequences',nargs='+',choices=SEQUENCES,default=SEQUENCES)
+    parser.add_argument('--sequences',nargs='+',choices=SEQUENCES+('basement_2','tuhh_day_04'),default=SEQUENCES)
     parser.add_argument('--configs',nargs='+',choices=CONFIGS,default=list(CONFIGS))
     parser.add_argument('--sequence-first',action='store_true',
                         help='finish all workload settings for each sequence before the next')
@@ -388,6 +388,10 @@ def main():
             if input_path.stat().st_size!=meta['bytes']:
                 raise ValueError(f'input size does not match metadata: {seq}')
             expected=min(args.limit,meta['scans']) if args.limit else meta['scans']
+            sensor=meta.get('replay_settings',{})
+            if set(sensor)-{'min-range','max-range'}:
+                raise ValueError('unsupported sensor replay settings')
+            settings={**CONFIGS[config],**sensor}
             for repeat in range(1,args.repeats+1):
                 backend_order=list(dict.fromkeys(args.backends))
                 if repeat%2==0:
@@ -399,7 +403,7 @@ def main():
                     actual_backend='cuda-matching' if backend=='cuda-matching-previous' else backend
                     argv=[str(selected_binary),'--input',str(input_path),'--output',str(prefix),
                           '--backend',actual_backend,'--threads',str(args.threads)]
-                    for name,value in CONFIGS[config].items():
+                    for name,value in settings.items():
                         argv.extend(['--'+name,str(value)])
                     if args.limit:
                         argv.extend(['--limit',str(args.limit)])
@@ -410,7 +414,7 @@ def main():
                         argv.extend(['--cuda-solve-min-dimension',str(args.cuda_solve_min_dimension)])
                     spec={'binary_sha256':prov['comparison_binary']['sha256'] if backend=='cuda-matching-previous' else prov['binary_sha256'],
                           'id':run_id,'sequence':seq,'config':config,'backend':backend,'repeat':repeat,
-                          'threads':args.threads,'settings':CONFIGS[config],'expected_scans':expected,
+                          'threads':args.threads,'settings':settings,'expected_scans':expected,
                           'gpu_sample_interval_seconds':args.gpu_sample_interval,
                           'source_scans':meta.get('source_scans',meta['scans']),
                           'full_sequence':meta.get('complete_sequence',False) and expected==meta['scans'],

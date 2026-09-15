@@ -368,3 +368,35 @@ materialization time. Normal sample CPU durations are nested inside the normal
 wall stage; do not sum them with wall stages. Detailed counters remain zero when
 profiling is disabled. Profiling measurements and the next runtime estimate are
 in [the remaining optimization report](../docs/remaining-optimization-profile.md).
+
+## Hilti 2022 and Multi-Campus inputs
+
+The downloaded `hilti_2022/basement_2` and `multi_campus/tuhh_day_04` sequences use
+sensor-specific evalio conversion, including Hilti point reordering/padding and
+MCD end-to-start timestamp adjustment. Ground truth is exported in the LiDAR
+frame with the existing calibrated transform and quaternion normalization.
+
+```bash
+PYTHON=/home/ubuntu/.local/share/uv/tools/evalio/bin/python
+$PYTHON benchmarks/prepare_evalio.py \
+  --data-root benchmarks/results/additional-datasets \
+  --output benchmarks/results/additional-input
+$PYTHON benchmarks/run_suite.py \
+  --binary build-accel/form-replay \
+  --input-dir benchmarks/results/additional-input \
+  --output benchmarks/results/additional-current \
+  --sequences basement_2 tuhh_day_04 --configs current \
+  --backends reference summary-resident cuda-matching \
+  --threads 32 --repeats 2 --cuda-solve-min-dimension 240
+$PYTHON benchmarks/form_report.py \
+  --suite benchmarks/results/additional-current \
+  --output benchmarks/results/additional-current/final
+```
+
+All backends receive the same sensor range limits from input metadata: 0.5–120 m
+for Hilti and 0.1–120 m for MCD, matching evalio's dataset settings. Existing N21
+metadata without `replay_settings` keeps the replay's original 0.1–50 m defaults.
+The preparation adapter writes evalio XYZ coordinates as float32, in normalized
+row-major order, without deskewing. It records complete-sequence coverage,
+source files, dimensions, sample point hashes, timestamps, and calibration.
+Sensor normalization and input-file loading are outside estimator timings.

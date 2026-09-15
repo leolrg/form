@@ -146,6 +146,13 @@ int main(int argc, char** argv) {
       else if (arg == "--capture-scan") capture_scan = std::stoull(value);
       else if (arg == "--limit") limit = std::stoull(value);
       else if (arg == "--threads") params.num_threads = std::stoull(value);
+      else if (arg == "--min-range" || arg == "--max-range") {
+        const double range=std::stod(value);
+        if (!std::isfinite(range) || range < 0 || !std::isfinite(range*range))
+          throw std::runtime_error("Invalid sensor range");
+        if (arg == "--min-range") params.extraction.min_norm_squared=range*range;
+        else params.extraction.max_norm_squared=range*range;
+      }
       else if (arg == "--points") params.extraction.point_feats_per_sector = std::stoull(value);
       else if (arg == "--planes") params.extraction.planar_feats_per_sector = std::stoull(value);
       else if (arg == "--feature-spacing") params.extraction.feature_spacing = std::stoull(value);
@@ -167,6 +174,8 @@ int main(int argc, char** argv) {
       }
       else throw std::runtime_error("Unknown argument " + arg);
     }
+    if (params.extraction.max_norm_squared <= params.extraction.min_norm_squared)
+      throw std::runtime_error("Maximum sensor range must exceed minimum");
     if (input.empty() || output.empty())
       throw std::runtime_error("Usage: form-replay --input sequence.formpc --output prefix [--limit N] [--threads N] [--points N] [--recent N] [--profile]");
     if(!system_capture_directory.empty()) {

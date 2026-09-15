@@ -8,6 +8,29 @@ import run_suite as r
 
 
 class SuiteTests(unittest.TestCase):
+    def test_additional_dataset_ranges_apply_to_every_backend(self):
+        import contextlib, io, sys
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'basement_2.formpc').write_bytes(b'x')
+            (root/'basement_2.gt.tum').write_text('')
+            (root/'basement_2.json').write_text(json.dumps({'scans':1,'bytes':1,
+                'replay_settings':{'min-range':.5,'max-range':120.}}))
+            prov={k:None for k in ('binary_sha256','git_revision','git_dirty_diff_sha256',
+                                  'untracked_file_sha256','environment','cpu_affinity')}
+            argv=['run_suite.py','--plan','--input-dir',tmp,'--sequences','basement_2',
+                  '--configs','current','--backends','reference','summary-resident','cuda-matching']
+            output=io.StringIO()
+            with patch.object(sys,'argv',argv), patch.object(r,'provenance',return_value=prov), contextlib.redirect_stdout(output):
+                r.main()
+            runs=json.loads(output.getvalue())['runs']
+            self.assertEqual(len(runs),6)
+            for run in runs:
+                self.assertEqual(float(run['argv'][run['argv'].index('--min-range')+1]),.5)
+                self.assertEqual(float(run['argv'][run['argv'].index('--max-range')+1]),120.)
+                self.assertEqual(run['settings']['min-range'],.5)
+
     def test_previous_matcher_uses_frozen_binary_and_reversed_order(self):
         import contextlib, io, sys
         from unittest.mock import patch
