@@ -79,6 +79,8 @@ def analyze(path,warmup=20):
                 if r['copyKind']==1:scope['h2d_bytes']+=r['bytes']
                 if r['copyKind']==2:scope['d2h_bytes']+=r['bytes']
                 if clipped:copy_intervals.append((lo,hi))
+    if outside_scan_ns:
+        raise ValueError('CUDA activity spills outside its issuing scan; cannot use per-scan clipped busy accounting')
     scan_ns=sum(r['end']-r['start'] for r in scans.values())
     return dict(trace=str(path),warmup=warmup,timed_scans=len(scans),scan_wall_ms=scan_ns*1e-6,
         device_busy_union_ms=union_duration(busy)*1e-6,kernel_union_ms=union_duration(kernel_intervals)*1e-6,

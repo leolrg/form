@@ -27,9 +27,9 @@ def main():
         if threshold:cmd+=['--cuda-solve-min-dimension',str(threshold)]
         commands.append(cmd)
     suite('clean-full',['reference','cpu-extraction','cuda-extraction'],['current'],3)
-    suite('clean-scaling',['reference','cpu-extraction','cuda-extraction'],['features','window'],limit=250)
+    suite('clean-scaling',['reference','cpu-extraction','cuda-extraction'],['current','features','window'],limit=250)
     suite('profile-full',['cpu-extraction','cuda-extraction'],['current'],profile=True)
-    suite('profile-scaling',['cpu-extraction','cuda-extraction'],['features','window'],limit=250,profile=True)
+    suite('profile-scaling',['cpu-extraction','cuda-extraction'],['current','features','window'],limit=250,profile=True)
     # Matching/extraction stay CUDA; only the post-QR optimizer policy changes.
     suite('force-cpu',['cuda-extraction'],['current','window'],limit=250,profile=True,threshold=6000)
     suite('force-gpu',['cuda-extraction'],['current','window'],limit=250,profile=True,threshold=1)

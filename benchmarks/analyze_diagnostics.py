@@ -115,6 +115,7 @@ def main():
     agreements=[]
     for run in runs:
         key=(run['sequence'],run['config'],run['scans']);reference=references.get(key)
+        if not reference: raise ValueError(f'No matched reference for {key}')
         if reference:
             agreement=trace_agreement(Path(reference),Path(run['prefix']))
             agreements.append(dict(run=run['prefix'],reference=reference,**agreement))
