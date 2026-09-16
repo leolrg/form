@@ -442,3 +442,6 @@ The standalone Python extraction parameters expose `use_cuda` and
 `parallel_selection`. CUDA extraction requires a `FORM_ENABLE_CUDA=ON` build;
 CPU-only builds reject an explicit CUDA request. Buffer capacity is reused across
 scans and calls sharing an extractor serialize access to its CUDA workspace.
+
+Measured full-sequence timings, matched scaling controls, and validation details
+are in [CUDA extraction results](../docs/cuda-extraction-results.md).

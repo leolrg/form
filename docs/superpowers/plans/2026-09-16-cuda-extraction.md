@@ -13,8 +13,8 @@
 - [x] Integrate optional curvature and batched normal-neighbor indices in `extraction.hpp/.tpp`. Keep original CPU path unchanged. Include upload/download in extraction timing; synchronize only before CPU consumption. Serialize use of a reusable workspace.
 - [x] Add `cuda-extraction` replay/suite backend (existing CUDA matcher/optimizer plus extraction), public Python parameter, and documentation.
 - [x] Run extraction and complete CUDA tests, CPU-only build/tests, sanitizer on new kernels. Check same inputs produce identical feature sets and normals.
-- [ ] Benchmark sequential reversed repeats against existing CUDA matching and original/optimized CPU at identical settings. Start with short stairs parity; then full stairs and denser/larger-window prefixes. Report actual timing and workload/trajectory differences, including regressions. No speedup claim from kernel time alone.
-- [ ] Commit implementation and measured report; retain baseline backend and default behavior.
+- [x] Benchmark sequential reversed repeats against existing CUDA matching and original/optimized CPU at identical settings. Start with short stairs parity; then full stairs and denser/larger-window prefixes. Report actual timing and workload/trajectory differences, including regressions. No speedup claim from kernel time alone.
+- [x] Commit implementation and measured report; retain baseline backend and default behavior.
 
 ## Checks and risks
 
