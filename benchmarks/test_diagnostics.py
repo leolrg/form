@@ -1,4 +1,7 @@
 import unittest
+import json
+from pathlib import Path
+import tempfile
 from analyze_diagnostics import union_duration, summarize_optimizer
 
 class DiagnosticsTests(unittest.TestCase):
@@ -32,3 +35,27 @@ class TraceAttributionTests(unittest.TestCase):
         self.assertEqual(out[(0,2)]['scope'],'wait')
         self.assertEqual(out[(0,1)]['scan'],20)
         self.assertNotIn((0,3),out)
+
+class PolicyTests(unittest.TestCase):
+    def test_pairs_require_matching_invocations(self):
+        from analyze_optimizer_policy import pair_calls
+        a=dict(scan='20',call='1',phase='semi',dimension='120',wall_ms='2')
+        b={**a,'wall_ms':'3'}
+        self.assertEqual(len(pair_calls([a],[b])),1)
+        with self.assertRaises(ValueError):pair_calls([a],[{**b,'dimension':'126'}])
+        with self.assertRaises(ValueError):pair_calls([a,a],[b])
+
+class ArtifactTests(unittest.TestCase):
+    def test_profile_artifacts_required_and_mutation_rejected(self):
+        from analyze_diagnostics import optimizer_manifest
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);suite=base/'profile';suite.mkdir()
+            (suite/'suite.json').write_text(json.dumps({'runs':[{'id':'run','argv':['--profile']}]}))
+            (suite/'run.run.json').write_text(json.dumps({'status':'complete'}))
+            with self.assertRaises(FileNotFoundError):optimizer_manifest(base,create=True)
+            artifact=suite/'run.optimizer.csv';artifact.write_text('scan,wall_ms\n')
+            with self.assertRaises(ValueError):optimizer_manifest(base,create=True)
+            artifact.write_text('scan,wall_ms\n20,1\n')
+            optimizer_manifest(base,create=True);optimizer_manifest(base)
+            artifact.write_text('scan,wall_ms\n20,2\n')
+            with self.assertRaises(ValueError):optimizer_manifest(base)

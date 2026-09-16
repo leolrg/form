@@ -448,6 +448,9 @@ are in [CUDA extraction results](../docs/cuda-extraction-results.md).
 
 ### Detailed diagnostic campaign
 
+The completed measurements, timer hierarchy, backend-policy comparison, and
+remaining bottlenecks are in [the detailed diagnostics report](../docs/detailed-diagnostics-results.md).
+
 `benchmarks/run_diagnostics.py --binary <frozen-form-replay> --output <new-directory>`
 runs sequential clean controls, explicit profiles, and CPU/GPU optimizer-policy
 experiments on stairs. Use `--plan` to inspect commands. Run with the same Python
@@ -491,3 +494,22 @@ the launch rather than charging that work to the later wait.
 accounting and reference counts, reports per-run tails, repeated-run dispersion,
 slow scans, workload correlations, backend/phase groups, and timer residuals.
 Clean timings, profiled timings, and traced timings must be reported separately.
+
+After every run is complete, the analyzer creates `optimizer-artifacts.json` once
+and verifies it on subsequent analyses. This is explicitly a **post-campaign**
+hash snapshot, supplementing the completion-time CSV/TUM hashes; missing or empty
+profile tables fail validation. Full stairs must pass trajectory quality gates.
+Short prefixes lacking 30 m ground-truth segments are reported as missing quality
+metrics, even when their workload counts and trajectories match the reference.
+
+Run `benchmarks/analyze_optimizer_policy.py <campaign-directory>` after the main
+analyzer to pair forced CPU/GPU calls by scan, invocation, phase and dimension.
+It reports complete-call and solve-only ratios, setup costs, decision-count
+agreement and separate repeat results. These profiles keep CUDA extraction and
+matching enabled while changing only the resident optimizer policy.
+
+`benchmarks/run_diagnostic_calibration.py --campaign <campaign-directory>
+--previous <pre-instrumentation-binary> --previous-revision <revision>` adds six
+full runs in old/disabled/enabled/enabled/disabled/old order. Run calibration before
+creating the optimizer artifact snapshot. The enabled setting includes existing
+profile counters as well as new diagnostics; it does not enable NVTX tracing.

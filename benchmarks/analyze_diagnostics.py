@@ -8,6 +8,7 @@ from pathlib import Path
 import statistics
 
 from form_report import trace_agreement
+from run_suite import digest, now, quality_gate, save, verify_resume
 
 STAGES=('extract_ms','map_ms','match_ms','semi_ms','full_ms','marginalize_ms','maintenance_ms')
 
@@ -66,7 +67,29 @@ def correlations(rows):
     return result
 
 
-def analyze_run(prefix):
+def optimizer_manifest(directory, create=False):
+    """Snapshot after campaign completion; subsequent analyses reject mutation."""
+    artifacts={}
+    for suite_path in sorted(directory.glob('*/suite.json')):
+        for spec in json.loads(suite_path.read_text())['runs']:
+            prefix=suite_path.parent/spec['id']
+            record=json.loads(Path(str(prefix)+'.run.json').read_text())
+            if record['status']!='complete':raise ValueError(f'incomplete: {prefix}')
+            if '--profile' not in spec['argv']:continue
+            path=Path(str(prefix)+'.optimizer.csv')
+            with path.open() as f:
+                if not list(csv.DictReader(f)):raise ValueError(f'empty optimizer table: {path}')
+            artifacts[str(path.relative_to(directory))]=digest(path)
+    path=directory/'optimizer-artifacts.json'
+    if path.exists():
+        if json.loads(path.read_text())['sha256']!=artifacts:raise ValueError('optimizer artifacts changed')
+    elif create:
+        save(path,dict(captured_at=now(),scope='Post-campaign snapshot, not completion-time hashes',sha256=artifacts))
+    else:raise ValueError('run analyze_diagnostics first to snapshot optimizer artifacts')
+    return artifacts
+
+
+def analyze_run(prefix, profile=False):
     with Path(str(prefix)+'.csv').open() as f: rows=list(csv.DictReader(f))
     selected=rows[20:]
     if not selected:raise ValueError('no steady-state scans')
@@ -80,8 +103,10 @@ def analyze_run(prefix):
         stage_residual_ms=describe(residual),spearman_total=correlations(selected),
         slowest=[{k:r[k] for k in ('scan','total_ms',*STAGES,'poses','rematches','lm_iterations')} for r in sorted(selected,key=lambda r:float(r['total_ms']),reverse=True)[:10]])
     opt=Path(str(prefix)+'.optimizer.csv')
+    if profile and not opt.exists():raise ValueError(f'missing optimizer table: {opt}')
     if opt.exists():
         with opt.open() as f: calls=list(csv.DictReader(f))
+        if not calls:raise ValueError(f'empty optimizer table: {opt}')
         result['optimizer']=summarize_optimizer(calls,len(selected))
         # Exact event accounting: one decision per solve attempt, one record per
         # semi/full invocation. Counts are exact integers, not rounded means.
@@ -101,24 +126,32 @@ def analyze_run(prefix):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('directory',type=Path);args=parser.parse_args()
+    optimizer_manifest(args.directory,create=True)
     runs=[]; groups=defaultdict(list);references={}
     for suite_path in sorted(args.directory.glob('*/suite.json')):
         suite=json.loads(suite_path.read_text())
         for spec in suite['runs']:
             prefix=suite_path.parent/spec['id'];record=json.loads(Path(str(prefix)+'.run.json').read_text())
             if record['status']!='complete':raise ValueError(f'incomplete: {prefix}')
-            result=analyze_run(prefix)
+            verify_resume(record,prefix,spec['expected_scans'],spec['fingerprint'])
+            result=analyze_run(prefix,profile='--profile' in spec['argv'])
             run=dict(suite=suite_path.parent.name,id=spec['id'],sequence=spec['sequence'],backend=spec['backend'],config=spec['config'],
-                     repeat=spec['repeat'],prefix=str(prefix),**result)
+                     repeat=spec['repeat'],prefix=str(prefix),resources=record['resources'],trajectory=record['analysis']['trajectory'],**result)
             runs.append(run);groups[(run['suite'],run['sequence'],run['config'],run['backend'])].append(run)
             if run['backend']=='reference':references.setdefault((run['sequence'],run['config'],run['scans']),run['prefix'])
     agreements=[]
+    lookup={r['prefix']:r for r in runs}
     for run in runs:
         key=(run['sequence'],run['config'],run['scans']);reference=references.get(key)
         if not reference: raise ValueError(f'No matched reference for {key}')
         if reference:
             agreement=trace_agreement(Path(reference),Path(run['prefix']))
-            agreements.append(dict(run=run['prefix'],reference=reference,**agreement))
+            gate=quality_gate(lookup[reference]['trajectory'],run['trajectory'])
+            agreements.append(dict(run=run['prefix'],reference=reference,quality_gate=gate,**agreement))
+            if gate['status']=='fail':raise ValueError(f'quality failed: {agreements[-1]}')
+            if run['scans']==1190 and gate['status']!='pass':raise ValueError('full-sequence quality metrics missing')
+            if agreement['max_translation_difference_m']>1e-8 or agreement['max_rotation_difference_rad']>1e-8:
+                raise ValueError(f'trajectory parity exceeded 1e-8: {agreements[-1]}')
             if any(agreement['changed_counts'].values()):raise ValueError(f'workload changed: {agreements[-1]}')
     grouped=[]
     for (suite,sequence,config,backend),items in groups.items():
@@ -127,9 +160,10 @@ def main():
             mean_per_run_p95=statistics.mean(r['total']['p95'] for r in items),
             mean_per_run_p99=statistics.mean(r['total']['p99'] for r in items),
             means={k:statistics.mean(r['means'][k] for r in items) for k in items[0]['means']}))
-    out=dict(warmup=20,run_count=len(runs),groups=grouped,runs=runs,trace_agreements=agreements)
+    quality_counts={status:sum(a['quality_gate']['status']==status for a in agreements) for status in ('pass','missing','fail')}
+    out=dict(warmup=20,run_count=len(runs),quality_status_counts=quality_counts,groups=grouped,runs=runs,trace_agreements=agreements)
     (args.directory/'analysis.json').write_text(json.dumps(out,indent=2,allow_nan=False)+'\n')
-    print('Verified',len(runs),'runs;',len(agreements),'reference comparisons')
+    print('Verified artifact/count/pose parity:',len(runs),'runs; trajectory quality gates:',quality_counts)
     for r in grouped:print(r['suite'],r['config'],r['backend'],round(r['total_run_means']['mean'],3))
 
 if __name__=='__main__':main()
