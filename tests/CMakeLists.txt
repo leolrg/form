@@ -16,7 +16,7 @@ target_link_libraries(form-tests
     FORM 
 )
 if(FORM_ENABLE_CUDA)
-    target_sources(form-tests PRIVATE test_CudaQr.cpp test_CudaSolver.cpp test_CudaMatcher.cpp test_CudaMatching.cpp)
+    target_sources(form-tests PRIVATE test_CudaExtraction.cpp test_CudaQr.cpp test_CudaSolver.cpp test_CudaMatcher.cpp test_CudaMatching.cpp)
 endif()
 include(GoogleTest)
 gtest_discover_tests(form-tests)

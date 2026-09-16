@@ -400,3 +400,45 @@ The preparation adapter writes evalio XYZ coordinates as float32, in normalized
 row-major order, without deskewing. It records complete-sequence coverage,
 source files, dimensions, sample point hashes, timestamps, and calibration.
 Sensor normalization and input-file loading are outside estimator timings.
+
+### GPU-assisted feature extraction
+
+`--backend cuda-extraction` extends `cuda-matching` with CUDA curvature and
+batched exact nearest-point searches on adjacent scanlines. The ordered feature
+selector and Eigen covariance/eigenvector calculations remain on the CPU. Rows
+are selected in parallel, but sectors within a row keep their original order and
+suppression rules. The extraction timer includes scan packing, uploads, downloads,
+and CPU completion; this is a hybrid extractor, not a fully GPU-resident one.
+
+The controls separate CPU parallelism from GPU offload:
+
+| Backend | Feature extraction | Matching/optimizer |
+|---|---|---|
+| `reference` | Original CPU | Original FORM CPU |
+| `summary-resident` | Original CPU | Optimized CPU |
+| `cpu-extraction` | CPU with row-parallel selection | Optimized CPU |
+| `cuda-matching` | Original CPU | Existing CUDA matching/hybrid optimizer |
+| `cuda-selection` | CPU with row-parallel selection | Existing CUDA matching/hybrid optimizer |
+| `cuda-extraction` | CUDA curvature/search plus row-parallel CPU selection and CPU normal completion | Existing CUDA matching/hybrid optimizer |
+
+```bash
+python benchmarks/run_suite.py \
+  --binary build-accel/form-replay \
+  --input-dir /path/to/form-input \
+  --output benchmarks/results/my-extraction-comparison \
+  --sequences stairs --configs current features window \
+  --backends reference cpu-extraction cuda-matching cuda-selection cuda-extraction \
+  --threads 32 --repeats 2 --limit 250
+```
+
+Omit `--limit` and use `--configs current` for a complete-sequence run. Replays are
+sequential and reverse backend order on the second repeat. Use the same range,
+feature-spacing, point/plane caps, and pose-window settings for every backend.
+
+For C++, independently set `params.extraction.use_cuda` and
+`params.extraction.parallel_selection`; both default to false. In evalio FORMDev,
+the corresponding settings are `use_cuda_extraction` and `parallel_selection`.
+The standalone Python extraction parameters expose `use_cuda` and
+`parallel_selection`. CUDA extraction requires a `FORM_ENABLE_CUDA=ON` build;
+CPU-only builds reject an explicit CUDA request. Buffer capacity is reused across
+scans and calls sharing an extractor serialize access to its CUDA workspace.

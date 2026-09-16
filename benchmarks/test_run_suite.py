@@ -79,7 +79,7 @@ class SuiteTests(unittest.TestCase):
             prov={k:None for k in ('binary_sha256','git_revision','git_dirty_diff_sha256',
                                   'untracked_file_sha256','environment','cpu_affinity')}
             argv=['run_suite.py','--plan','--input-dir',tmp,'--sequences','stairs',
-                  '--configs','current','--backends','cuda-matching','cuda-resident-hybrid',
+                  '--configs','current','--backends','cuda-matching','cuda-resident-hybrid','cuda-selection','cuda-extraction',
                   '--cuda-solve-min-dimension','600']
             output=io.StringIO()
             with patch.object(sys,'argv',argv), patch.object(r,'provenance',return_value=prov), contextlib.redirect_stdout(output):

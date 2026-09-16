@@ -157,3 +157,85 @@ TEST(FeatureExtraction, RejectsSpacingBeyondNeighborhoodAtEveryExtraction) {
   extractor.params.neighbor_points = 1;
   EXPECT_THROW((void)extractor.extract(scan, 0), std::invalid_argument);
 }
+
+#ifdef FORM_ENABLE_CUDA
+TEST(FeatureExtraction, CudaPreservesFeaturesAndNormalsAcrossRepeatedScans) {
+  auto params = planarParams();
+  params.num_rows = 5;
+  params.num_columns = 131; // partial warp and uneven sectors
+  params.num_sectors = 6;
+  params.planar_feats_per_sector = 5;
+  params.point_feats_per_sector = 3;
+  for (size_t spacing : {size_t{0}, size_t{2}}) {
+    params.feature_spacing = spacing;
+    form::FeatureExtractor cpu(params, 1);
+    params.use_cuda = true;
+    params.parallel_selection = true;
+    form::FeatureExtractor gpu(params, 1);
+    params.use_cuda = false;
+    params.parallel_selection = false;
+    for (int repetition = 0; repetition < 3; ++repetition) {
+      auto scan = planarScan(params);
+      scan[60].vec3().setZero();
+      scan[131 + 65].vec3().setZero();
+      for (size_t i = 0; i < scan.size(); ++i) {
+        if (scan[i].x != 0) scan[i].x += 0.001 * std::sin(i * 0.37 + repetition);
+      }
+      auto [cp, cq] = cpu.extract(scan, repetition);
+      auto [gp, gq] = gpu.extract(scan, repetition);
+      sortFeatures(cp); sortFeatures(gp);
+      ASSERT_FALSE(cp.empty());
+      EXPECT_EQ(cp, gp);
+      EXPECT_EQ(cq, gq);
+      std::vector<form::PointXYZf> floats;
+      for (const auto& p : scan) floats.emplace_back(p.x, p.y, p.z);
+      auto [cfp, cfq] = cpu.extract(floats, repetition);
+      auto [gfp, gfq] = gpu.extract(floats, repetition);
+      sortFeatures(cfp); sortFeatures(gfp);
+      EXPECT_EQ(cfp, gfp);
+      EXPECT_EQ(cfq, gfq);
+    }
+  }
+}
+
+TEST(FeatureExtraction, CudaHandlesNoPlanesMissingRowsAndChangingShape) {
+  auto params = planarParams();
+  params.use_cuda = true;
+  form::FeatureExtractor gpu(params, 1);
+  for (int rows : {1, 3, 2}) {
+    gpu.params.num_rows = rows;
+    for (double threshold : {0., 1.}) {
+      gpu.params.planar_threshold = threshold;
+      auto scan = planarScan(gpu.params);
+      if (rows == 3)
+        for (int c=0; c<gpu.params.num_columns; ++c) scan[gpu.params.num_columns+c].vec3().setZero();
+      auto reference_params = gpu.params; reference_params.use_cuda = false;
+      auto [cp,cq] = form::FeatureExtractor(reference_params,1).extract(scan,5);
+      auto [gp,gq] = gpu.extract(scan,5);
+      sortFeatures(cp); sortFeatures(gp);
+      EXPECT_EQ(cp,gp); EXPECT_EQ(cq,gq);
+    }
+  }
+  EXPECT_THROW(gpu.extract(std::vector<ScanPoint>{},0), std::runtime_error);
+}
+#else
+TEST(FeatureExtraction, CudaRequestFailsExplicitlyInCpuBuild) {
+  auto params = planarParams(); params.use_cuda = true;
+  EXPECT_THROW(form::FeatureExtractor(params,1).extract(planarScan(params),0), std::runtime_error);
+}
+#endif
+
+TEST(FeatureExtraction, ParallelSelectionPreservesSectorSuppression) {
+  auto params=planarParams(); params.num_rows=7; params.num_columns=131;
+  params.num_sectors=6;
+  auto scan=planarScan(params);
+  scan[131+20].vec3().setZero();
+  for(size_t spacing: {size_t{1},size_t{2},size_t{5}}) {
+    params.feature_spacing=spacing; params.parallel_selection=false;
+    auto [cp,cq]=form::FeatureExtractor(params,1).extract(scan,7);
+    params.parallel_selection=true;
+    auto [gp,gq]=form::FeatureExtractor(params,1).extract(scan,7);
+    sortFeatures(cp); sortFeatures(gp);
+    EXPECT_EQ(cp,gp); EXPECT_EQ(cq,gq);
+  }
+}

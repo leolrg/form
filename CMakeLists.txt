@@ -56,6 +56,7 @@ target_sources(FORM
 		form/feature/batch_summary.hpp
 		form/feature/batch_factor.hpp
 		form/feature/cuda_qr.hpp
+		form/feature/cuda_extraction.hpp
 		form/feature/features.hpp
 		form/feature/extraction.hpp
 		# optimization
@@ -86,10 +87,10 @@ target_link_libraries(FORM
 if(FORM_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    target_sources(FORM PRIVATE form/feature/batch_summary_cuda.cu form/feature/cuda_qr.cu form/optimization/cuda_matcher.cu form/optimization/cuda_matching.cpp form/optimization/cuda_solver.cpp)
+    target_sources(FORM PRIVATE form/feature/cuda_extraction.cu form/feature/batch_summary_cuda.cu form/feature/cuda_qr.cu form/optimization/cuda_matcher.cu form/optimization/cuda_matching.cpp form/optimization/cuda_solver.cpp)
     target_link_libraries(FORM PUBLIC CUDA::cudart CUDA::cusolver)
     target_compile_definitions(FORM PUBLIC FORM_ENABLE_CUDA=1)
-    set_source_files_properties(form/optimization/cuda_matcher.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
+    set_source_files_properties(form/optimization/cuda_matcher.cu form/feature/cuda_extraction.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
     set_target_properties(FORM PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 endif()
 

@@ -164,12 +164,15 @@ int main(int argc, char** argv) {
         params.constraints.use_cuda_dense_solver = true;
       }
       else if (arg == "--backend") {
-        if (value != "reference" && value != "summary" && value != "cuda" && value != "summary-batch" && value != "cuda-batch" && value != "summary-resident" && value != "cuda-resident" && value != "cuda-resident-hybrid" && value != "cuda-matching") throw std::runtime_error("Unknown backend " + value);
+        if (value != "reference" && value != "summary" && value != "cuda" && value != "summary-batch" && value != "cuda-batch" && value != "summary-resident" && value != "cuda-resident" && value != "cuda-resident-hybrid" && value != "cuda-matching" && value != "cuda-extraction" && value != "cuda-selection" && value != "cpu-extraction") throw std::runtime_error("Unknown backend " + value);
+        const bool gpu_matching = value == "cuda-matching" || value == "cuda-selection" || value == "cuda-extraction";
         params.constraints.use_summary = value != "reference";
-        params.constraints.use_cuda_summaries = value == "cuda" || value == "cuda-batch" || value == "cuda-resident" || value == "cuda-resident-hybrid" || value == "cuda-matching";
-        params.constraints.use_resident_optimizer = value == "summary-resident" || value == "cuda-resident" || value == "cuda-resident-hybrid" || value == "cuda-matching";
-        params.matcher.use_cuda = value == "cuda-matching";
-        if(value == "cuda-resident-hybrid" || value == "cuda-matching") params.constraints.use_cuda_dense_solver = true;
+        params.constraints.use_cuda_summaries = value == "cuda" || value == "cuda-batch" || value == "cuda-resident" || value == "cuda-resident-hybrid" || gpu_matching;
+        params.constraints.use_resident_optimizer = value == "summary-resident" || value == "cpu-extraction" || value == "cuda-resident" || value == "cuda-resident-hybrid" || gpu_matching;
+        params.extraction.use_cuda = value == "cuda-extraction";
+        params.extraction.parallel_selection = value == "cpu-extraction" || value == "cuda-selection" || value == "cuda-extraction";
+        params.matcher.use_cuda = gpu_matching;
+        if(value == "cuda-resident-hybrid" || gpu_matching) params.constraints.use_cuda_dense_solver = true;
         if(value == "summary-batch" || value == "cuda-batch" || params.constraints.use_resident_optimizer) params.constraints.use_batch_summaries = true;
       }
       else throw std::runtime_error("Unknown argument " + arg);

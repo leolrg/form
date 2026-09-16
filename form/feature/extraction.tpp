@@ -33,6 +33,12 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
   if (params.feature_spacing > params.neighbor_points) {
     throw std::invalid_argument("feature_spacing must not exceed neighbor_points");
   }
+#ifndef FORM_ENABLE_CUDA
+  if (params.use_cuda) throw std::runtime_error("CUDA extraction requested without FORM_ENABLE_CUDA");
+#else
+  std::unique_lock<std::mutex> cuda_lock(*cuda_mutex_, std::defer_lock);
+  if (params.use_cuda) cuda_lock.lock();
+#endif
   using T = typename Point::Scalar;
   const size_t points_per_sector = params.num_columns / params.num_sectors;
 
@@ -43,37 +49,49 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
   profile::checkpoint(profile::extract_validate, profile_start);
 
   // ------------------------- Planar Features ------------------------- //
-  auto curvature = compute_curvature(scan, valid_mask, scan_idx);
+  std::vector<Curvature<T>> curvature;
+#ifdef FORM_ENABLE_CUDA
+  if (params.use_cuda) {
+    if (!cuda_) cuda_ = std::make_shared<CudaExtraction>();
+    std::vector<std::array<T,4>> packed(scan.size());
+    std::vector<unsigned char> mask(valid_mask.begin(), valid_mask.end());
+    for (size_t i=0; i<scan.size(); ++i)
+      for (int axis=0; axis<4; ++axis) packed[i][axis] = scan[i].vec4()[axis];
+    const auto values = cuda_->prepare(packed, mask, params.num_columns, params.neighbor_points);
+    curvature.reserve(values.size());
+    for (size_t i=0; i<values.size(); ++i) curvature.emplace_back(i, values[i]);
+  } else
+#endif
+    curvature = compute_curvature(scan, valid_mask, scan_idx);
   profile::checkpoint(profile::extract_curvature, profile_start);
 
   // Next get the planar features
   std::vector<size_t> planar_indices;
   std::vector<bool> used_points = valid_mask;
-  for (size_t scan_line_idx = 0; scan_line_idx < params.num_rows; scan_line_idx++) {
-    // Independently detect features in each sector of this scan_line
-    for (size_t sector_idx = 0; sector_idx < params.num_sectors; sector_idx++) {
-      // Get the point index of the sector start and sector end
-      const size_t sector_start_pt =
-          (scan_line_idx * params.num_columns) + (sector_idx * points_per_sector);
-      // Special case for end point as we add any reminder points to the last
-      // sector
-      const size_t sector_end_pt = (sector_idx == params.num_sectors - 1)
-                                       ? ((scan_line_idx + 1) * params.num_columns)
-                                       : sector_start_pt + points_per_sector;
-
-      // Sort the points within the sector based on curvature
-      std::sort(curvature.begin() + sector_start_pt,
-                curvature.begin() + sector_end_pt);
-
-      // Search smallest to largest [i.e. planar features]
-      // WARN: Mutates planar_indices + used_points
-      extract_planar(sector_start_pt, sector_end_pt, curvature, planar_indices,
-                     used_points);
-
-      // Make any left over "holes" into point features
-
-    } // end sector search
-  } // end scan line search
+  auto select_row = [&](size_t scan_line_idx, auto& mask, auto& selected) {
+    // Sectors on the same row share suppression state and remain ordered.
+    for (size_t sector_idx=0; sector_idx<params.num_sectors; ++sector_idx) {
+      const size_t first=scan_line_idx*params.num_columns+sector_idx*points_per_sector;
+      const size_t end=sector_idx+1==params.num_sectors
+          ? (scan_line_idx+1)*params.num_columns : first+points_per_sector;
+      std::sort(curvature.begin()+first,curvature.begin()+end);
+      extract_planar(first,end,curvature,selected,mask);
+    }
+  };
+  if (params.parallel_selection) {
+    // Byte masks avoid races between neighboring rows sharing a vector<bool> word.
+    std::vector<unsigned char> mask(valid_mask.begin(),valid_mask.end());
+    std::vector<std::vector<size_t>> row_features(params.num_rows);
+    tbb::parallel_for(size_t(0),size_t(params.num_rows),[&](size_t row) {
+      select_row(row,mask,row_features[row]);
+    });
+    for (size_t i=0;i<mask.size();++i) used_points[i]=mask[i];
+    for (const auto& row:row_features)
+      planar_indices.insert(planar_indices.end(),row.begin(),row.end());
+  } else {
+    for (size_t row=0;row<size_t(params.num_rows);++row)
+      select_row(row,used_points,planar_indices);
+  }
 
   profile::checkpoint(profile::extract_planar_select, profile_start);
 
@@ -109,6 +127,11 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
 
   profile::checkpoint(profile::extract_point_select, profile_start);
 
+  std::vector<std::array<int,2>> nearest_rows;
+#ifdef FORM_ENABLE_CUDA
+  if (params.use_cuda) nearest_rows = cuda_->nearestRows(planar_indices);
+#endif
+
   // Finally extract all normals
   tbb::concurrent_vector<PlanarFeat> result_planar_tbb;
   result_planar_tbb.reserve(planar_indices.size());
@@ -119,7 +142,7 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
       const size_t idx = *it;
       const Point &point = scan[idx];
       std::optional<Eigen::Matrix<T, 3, 1>> normal =
-          compute_normal(idx, scan, valid_mask);
+          compute_normal(idx, scan, valid_mask, params.use_cuda ? &nearest_rows[it-planar_indices.cbegin()] : nullptr);
       if (normal.has_value()) {
         result_planar_tbb.emplace_back(
             static_cast<double>(point.x), static_cast<double>(point.y),
@@ -280,7 +303,8 @@ template <typename Point>
 std::optional<Eigen::Matrix<typename Point::Scalar, 3, 1>>
 FeatureExtractor::compute_normal(
     const size_t &idx, const std::vector<Point> &scan,
-    const std::vector<bool> &valid_mask) const noexcept {
+    const std::vector<bool> &valid_mask,
+    const std::array<int,2>* nearest_rows) const noexcept {
   using T = typename Point::Scalar;
   const size_t scan_line_idx = idx / params.num_columns;
   const auto start = scan.cbegin();
@@ -300,9 +324,10 @@ FeatureExtractor::compute_normal(
   // Get the neighbors of the point on the previous scan line
   if (scan_line_idx > 0) {
     const size_t prev_scan_line_idx = scan_line_idx - 1;
-    const auto closest_idx = find_closest(
-        point, params.num_columns * prev_scan_line_idx,
-        params.num_columns * (prev_scan_line_idx + 1), scan, valid_mask);
+    const auto closest_idx = nearest_rows
+        ? ((*nearest_rows)[0] < 0 ? std::optional<size_t>{} : std::optional<size_t>{size_t((*nearest_rows)[0])})
+        : find_closest(point, params.num_columns * prev_scan_line_idx,
+                       params.num_columns * (prev_scan_line_idx + 1), scan, valid_mask);
     if (closest_idx.has_value()) {
       found_other_scanline = true;
       neighbors.push_back(scan[*closest_idx]);
@@ -314,9 +339,10 @@ FeatureExtractor::compute_normal(
   if (scan_line_idx < params.num_rows - 1) {
     // std::printf("---- Searching next scan line %zu\n", scan_line_idx + 1);
     const size_t next_scan_line_idx = scan_line_idx + 1;
-    const auto closest_idx = find_closest(
-        point, params.num_columns * next_scan_line_idx,
-        params.num_columns * (next_scan_line_idx + 1), scan, valid_mask);
+    const auto closest_idx = nearest_rows
+        ? ((*nearest_rows)[1] < 0 ? std::optional<size_t>{} : std::optional<size_t>{size_t((*nearest_rows)[1])})
+        : find_closest(point, params.num_columns * next_scan_line_idx,
+                       params.num_columns * (next_scan_line_idx + 1), scan, valid_mask);
     if (closest_idx.has_value()) {
       found_other_scanline = true;
       neighbors.push_back(scan[*closest_idx]);
@@ -355,12 +381,12 @@ FeatureExtractor::compute_normal(
 }
 
 // ------------------------- Extractors ------------------------- //
-template <typename T>
+template <typename T, typename Mask>
 void FeatureExtractor::extract_planar(const size_t &sector_start_point,
                                       const size_t &sector_end_point,
                                       const std::vector<Curvature<T>> &curvature,
                                       std::vector<size_t> &out_features,
-                                      std::vector<bool> &valid_mask) const noexcept {
+                                      Mask &valid_mask) const noexcept {
 
   size_t num_sector_planar_features = 0;
   const size_t feature_spacing = params.feature_spacing != 0

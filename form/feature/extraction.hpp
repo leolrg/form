@@ -33,7 +33,13 @@
 #include <tbb/concurrent_vector.h>
 #include <tbb/parallel_for.h>
 
+#include <array>
 #include <optional>
+#include <memory>
+#include <mutex>
+#ifdef FORM_ENABLE_CUDA
+#include "form/feature/cuda_extraction.hpp"
+#endif
 #include <stdexcept>
 
 namespace form {
@@ -90,6 +96,10 @@ public:
     /// @brief Suppress selected features within this many samples (exclusive).
     /// Zero inherits neighbor_points; explicit values must not exceed it.
     size_t feature_spacing = 0;
+    /// CUDA curvature and exact normal-neighborhood search; selection/eigenvectors stay on CPU.
+    bool use_cuda = false;
+    /// Parallelize independent rows, retaining ordered suppression within each row.
+    bool parallel_selection = false;
   };
 
   Params params;
@@ -106,6 +116,10 @@ public:
   extract(const std::vector<Point> &scan, size_t scan_idx) const;
 
 private:
+#ifdef FORM_ENABLE_CUDA
+  mutable std::shared_ptr<CudaExtraction> cuda_;
+  std::shared_ptr<std::mutex> cuda_mutex_ = std::make_shared<std::mutex>();
+#endif
   // ------------------------- Validators ------------------------- //
   /// @brief Compute a mask of valid points based on range and NaN checks, with
   /// neighbors also marked invalid for planar feature extraction
@@ -129,16 +143,17 @@ private:
   template <typename Point>
   std::optional<Eigen::Matrix<typename Point::Scalar, 3, 1>>
   compute_normal(const size_t &idx, const std::vector<Point> &scan,
-                 const std::vector<bool> &valid_mask) const noexcept;
+                 const std::vector<bool> &valid_mask,
+                 const std::array<int,2>* nearest_rows = nullptr) const noexcept;
 
   // ------------------------- Extractors ------------------------- //
   /// @brief Extract planar features from a sector of the scan based on curvature
-  template <typename T>
+  template <typename T, typename Mask>
   void extract_planar(const size_t &sector_start_point,
                       const size_t &sector_end_point,
                       const std::vector<Curvature<T>> &curvature,
                       std::vector<size_t> &out_features,
-                      std::vector<bool> &valid_mask) const noexcept;
+                      Mask &valid_mask) const noexcept;
 
   /// @brief Extract point features from a sector of the scan
   inline void extract_point(const size_t &sector_start_point,
