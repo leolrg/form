@@ -1,3 +1,4 @@
+#include <optional>
 // MIT License
 
 // Copyright (c) 2025 Easton Potokar, Taylor Pool, and Michael Kaess
@@ -49,6 +50,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
 #endif
   if (m_params.matcher.use_cuda && !m_params.constraints.use_cuda_summaries)
     throw std::invalid_argument("CUDA matching requires CUDA summaries");
+  std::optional<diagnostics::Range> phase; phase.emplace("stage/extraction");
   auto stage_start = profile::Clock::now();
 
   //
@@ -72,6 +74,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   //
   // ############################### Optimization ############################### //
   //
+  phase.emplace("stage/map");
   // ---------------------------- Generate World Map ---------------------------- //
   auto map_profile_start = profile::enabled ? profile::Clock::now() : profile::Clock::time_point{};
   const auto world_map = tuple::transform(m_keypoint_map, [&](auto &map) {
@@ -100,6 +103,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
     auto before = m_constraints.get_current_pose();
     stage_start = profile::Clock::now();
 
+    phase.emplace("stage/matching");
     // -------------------------------- Matching -------------------------------- //
     // Match each type of feature
 #ifdef FORM_ENABLE_CUDA
@@ -119,6 +123,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
     stage_start = profile::Clock::now();
 
     // ---------------------- Semi-Linearized Optimization ---------------------- //
+    phase.reset();
     new_values = m_constraints.optimize(true);
     last_timing.semi_ms += profile::milliseconds(stage_start);
     const auto after = new_values.at<Pose3>(X(scan_idx));
@@ -135,6 +140,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   if (m_params.matcher.use_cuda) {
     stage_start = profile::Clock::now();
     {
+      diagnostics::Range range("stage/materialize");
       profile::Scope timer(profile::match_materialize_wall);
       m_cuda_matching->materialize(std::get<0>(m_matcher).matches, std::get<1>(m_matcher).matches);
     }
@@ -152,6 +158,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   //
   // ################################## Mapping ################################## //
   //
+  phase.emplace("stage/maintenance");
   // ------------------------------ Map insertions ------------------------------ //
   tuple::for_seq(SEQ, [&](auto I) {
     std::get<I>(m_keypoint_map).insert_matches(std::get<I>(m_matcher).get_matches());
@@ -165,6 +172,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   last_timing.maintenance_ms = profile::milliseconds(stage_start);
   stage_start = profile::Clock::now();
 
+  phase.emplace("stage/marginalization");
   const auto workload = m_constraints.workload();
   last_timing.factors = workload.factors;
   last_timing.planar_correspondences = workload.planar_correspondences;
@@ -174,6 +182,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   m_constraints.marginalize(marg_scans);
   last_timing.marginalize_ms = profile::milliseconds(stage_start);
   stage_start = profile::Clock::now();
+  phase.emplace("stage/maintenance");
   tuple::for_each(m_keypoint_map, [&](auto &map) { map.remove(marg_scans); });
   last_timing.maintenance_ms += profile::milliseconds(stage_start);
 

@@ -1,3 +1,4 @@
+#include "form/optimization/diagnostics.hpp"
 // MIT License; see factor.hpp for copyright and license text.
 #include "form/feature/batch_summary.hpp"
 #ifdef FORM_ENABLE_CUDA
@@ -33,6 +34,7 @@ BatchSummary::BatchSummary(int pose_count,std::vector<SummaryEdge> edges,bool gp
   impl_->gpu=gpu;reset(pose_count,std::move(edges));
 }
 void BatchSummary::reset(int pose_count,std::vector<SummaryEdge> edges) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::batch_reset);
   if(pose_count<1 || pose_count>1000 || edges.size()>static_cast<size_t>(std::numeric_limits<int>::max()/169))
     throw std::invalid_argument("BatchSummary supports 1..1000 poses and int-indexed factors");
   auto& s=*impl_;
@@ -43,6 +45,7 @@ void BatchSummary::reset(int pose_count,std::vector<SummaryEdge> edges) {
   if(same) for(size_t e=0;e<edges.size();++e) if(edges[e].i!=s.edges[e].i || edges[e].j!=s.edges[e].j) {same=false;break;}
   s.poses=pose_count;s.n=pose_count*6+1;s.edges=std::move(edges);
   if(!same) {
+    diagnostics::Scope detail(diagnostics::Stage::batch_topology);
     s.offsets.assign(static_cast<size_t>(s.n)*s.n+1,0);
     auto entries=[&](auto consume) {
       for(size_t e=0;e<s.edges.size();++e) {
@@ -58,6 +61,7 @@ void BatchSummary::reset(int pose_count,std::vector<SummaryEdge> edges) {
     entries([&](int cell,int index){s.indices[cursor[cell]++]=index;});
   }
   if(s.gpu) {
+    diagnostics::Scope detail(diagnostics::Stage::batch_roots);
 #ifdef FORM_ENABLE_CUDA
     std::vector<BatchRoot> roots(s.edges.size());
     for(size_t e=0;e<roots.size();++e) {
@@ -75,19 +79,24 @@ void BatchSummary::reset(int pose_count,std::vector<SummaryEdge> edges) {
 }
 BatchSummary::~BatchSummary()=default;
 Eigen::MatrixXd BatchSummary::linearize(const std::vector<gtsam::Pose3>& poses) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::batch_linearize);
   auto& s=*impl_;s.check(poses);Eigen::MatrixXd h(s.n,s.n);
 #ifdef FORM_ENABLE_CUDA
   if(s.cuda) {s.cuda->evaluate(s.packed,h.data(),false);return h;}
 #endif
+  { diagnostics::Scope detail(diagnostics::Stage::cpu_summary_edges);
   tbb::parallel_for(size_t(0),s.edges.size(),[&](size_t k) {
     const auto& e=s.edges[k];s.partials[k]=e.weight*e.summary->augmentedHessian(poses[e.i],poses[e.j]);
   });
+  }
+  diagnostics::Scope detail(diagnostics::Stage::cpu_summary_assemble);
   for(int k=0;k<s.n*s.n;++k) {
     double sum=0.;for(int p=s.offsets[k];p<s.offsets[k+1];++p) {int index=s.indices[p];sum+=s.partials[index/169].data()[index%169];}h.data()[k]=sum;
   }
   return h;
 }
 double BatchSummary::error(const std::vector<gtsam::Pose3>& poses) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::batch_error);
   auto& s=*impl_;s.check(poses);
 #ifdef FORM_ENABLE_CUDA
   if(s.cuda) {double sum;s.cuda->evaluate(s.packed,&sum,true);return .5*sum;}

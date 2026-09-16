@@ -1,3 +1,5 @@
+#include <optional>
+#include "form/optimization/diagnostics.hpp"
 #include "form/optimization/cuda_matcher.hpp"
 #include "form/feature/cuda_qr.hpp"
 #include <cuda_runtime.h>
@@ -194,6 +196,7 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
                         const std::vector<Query>& queries,double width,
                         const std::vector<std::array<double,12>>& inverse_poses,
                         const std::vector<int>& point_pose_indices) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::matcher_reset);
   auto& s=*impl_;
   s.ready=false; s.searched=false; s.groups_ready=false; s.host_results_ready=false;
   if(!std::isfinite(width) || width<=0) throw std::invalid_argument("Invalid CUDA voxel width");
@@ -256,6 +259,7 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
   s.ready=true;
 }
 void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_search_launch);
   auto& s=*this;
   s.searched=false; s.host_results_ready=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before search");
@@ -275,6 +279,7 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::search(const std::array<dou
   return downloadResults();
 }
 const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_download);
   auto& s=*impl_;
   if(!s.searched) throw std::logic_error("CUDA results require a completed search");
   if(!s.host_results_ready) {
@@ -289,6 +294,7 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
   return s.host_results;
 }
 void CudaMatcher::setGroups(const std::vector<int>& target_groups,size_t group_count) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_group_setup);
   auto& s=*impl_;
   s.groups_ready=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before grouping");
@@ -313,11 +319,13 @@ void CudaMatcher::setGroups(const std::vector<int>& target_groups,size_t group_c
 }
 CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,12>& matrix,
                                                        double threshold_squared,bool plane) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_search_grouped);
   auto& s=*impl_;
   s.searched=false; s.host_results_ready=false;
   if(!s.groups_ready) throw std::logic_error("CUDA target groups must be configured before grouped search");
   if(!std::isfinite(threshold_squared) || threshold_squared<=0)
     throw std::invalid_argument("Invalid CUDA squared match threshold");
+  std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::match_classify_wait);
   s.launchSearch(matrix);
   check(cudaMemsetAsync(s.group_counts.data,0,s.host_counts.size()*sizeof(int),s.stream));
   if(s.count) {
@@ -327,6 +335,7 @@ CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,1
   }
   check(cudaMemcpyAsync(s.host_counts.data(),s.group_counts.data,s.host_counts.size()*sizeof(int),cudaMemcpyDeviceToHost,s.stream));
   check(cudaStreamSynchronize(s.stream));
+  phase.emplace(diagnostics::Stage::match_group_sort);
   if(s.host_counts.back()) throw std::invalid_argument("CUDA transformed query exceeds voxel coordinate range");
   s.searched=true;
   GroupedSummary result;
@@ -346,11 +355,13 @@ CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,1
     check(cub::DeviceRadixSort::SortPairs(s.sort_storage.data,s.sort_bytes,s.sort_keys.data,s.sorted_keys.data,
           s.sequence.data,s.indices.data,s.count,0,s.sort_bits,s.stream));
   }
+  phase.reset();
   result.roots=s.packSummaries(descriptors,shapes,total,max_rows,plane);
   return result;
 }
 std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packSummaries(const std::vector<Group>& descriptors,
     const std::vector<BatchedCudaQr::DeviceInput>& shapes,size_t total,int max_rows,bool plane) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_pack);
   auto& s=*this;
   s.groups.upload(descriptors,s.stream); s.packed.reserve(total);
   if(max_rows) {

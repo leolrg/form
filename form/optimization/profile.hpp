@@ -1,5 +1,6 @@
 #pragma once
 
+#include "form/optimization/diagnostics.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -49,6 +50,7 @@ inline void checkpoint(std::atomic<uint64_t>& counter, Clock::time_point& start)
   start = now;
 }
 inline void reset() {
+  diagnostics::reset();
   extract_validate = extract_curvature = extract_planar_select = 0;
   extract_point_mask = extract_point_select = extract_normals = extract_pack = 0;
   normal_search_sample_cpu = normal_eigen_sample_cpu = normal_samples = 0;

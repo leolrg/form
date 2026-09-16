@@ -1,3 +1,5 @@
+#include <optional>
+#include "form/optimization/diagnostics.hpp"
 #include "form/optimization/cuda_matching.hpp"
 #include "form/optimization/cuda_matcher.hpp"
 #include "form/feature/summary.hpp"
@@ -39,9 +41,11 @@ template<class Point> struct MatchBatch {
   std::vector<std::vector<int>> groups;
 
   void ensure() {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_ensure);
     std::lock_guard<std::mutex> lock(mutex);
     if(loaded) return;
     const auto& results=device->downloadResults();
+    std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::match_reconstruct);
     matches.resize(map->queries.size());
     tbb::parallel_for(size_t(0),matches.size(),[&](size_t i) {
       Match<Point> match{};
@@ -49,6 +53,7 @@ template<class Point> struct MatchBatch {
       if(results[i].index>=0) match.point=map->local(results[i].index);
       matches[i]=match;
     });
+    phase.emplace(diagnostics::Stage::match_host_group);
     groups.assign(group_count,{});
     for(size_t i=0;i<matches.size();++i) {
       const auto& result=results[i];
@@ -61,6 +66,7 @@ template<class Point> struct MatchBatch {
     device.reset();
   }
   template<class Rows> void load(const Rows& rows,size_t group) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_rows);
     ensure();
     const auto& indices=groups.at(group);
     rows.p_i.resize(3*indices.size()); rows.p_j.resize(3*indices.size());
@@ -75,6 +81,7 @@ template<class Point> struct MatchBatch {
     }
   }
   void materialize(tbb::concurrent_vector<Match<Point>>& output) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_output);
     // Preserve FORM's existing stale raw-match behavior for empty feature input.
     if(map->queries.empty()) return;
     ensure();
@@ -112,7 +119,9 @@ template<class Point> struct Snapshot {
   }
   void reset(const VoxelMap<Point>& world_map,const std::vector<Point>& query,
              const std::function<gtsam::Pose3(size_t)>& estimates,double width) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_snapshot);
     freezeSurvivors();
+    std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::match_snapshot_pack);
     // Leased maps remain immutable, including for callbacks copied from older
     // factors. The common unleased path reuses point and query allocations.
     if(!map || map.use_count()!=1) map=std::make_shared<HostMap<Point>>();
@@ -144,6 +153,7 @@ template<class Point> struct Snapshot {
     }
     packed.reserve(query.size());
     for(const auto& q:query) packed.push_back({{q.x,q.y,q.z,q._}});
+    phase.reset();
     device->reset(voxels,points,packed,width,inverse_matrices,map->pose_indices);
     scan_order.clear(); target_groups.reset();
   }

@@ -3,6 +3,7 @@ find_package(GTest REQUIRED)
 enable_testing() # enable ctest
 
 add_executable(form-tests
+    test_Diagnostics.cpp
     test_FeatureFactor.cpp
     test_BatchSummary.cpp
     test_Summary.cpp

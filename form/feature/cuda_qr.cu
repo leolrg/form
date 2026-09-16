@@ -1,3 +1,5 @@
+#include <optional>
+#include "form/optimization/diagnostics.hpp"
 #include "form/feature/cuda_qr.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -306,6 +308,8 @@ BatchedCudaQr::compute(const std::vector<Eigen::MatrixXd>& input) {
 std::vector<Eigen::MatrixXd>
 BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total,
                          const double* device_input,bool device) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::qr_total);
+  std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::qr_plan);
   auto& state=*this;
   std::vector<Task> first;
   std::vector<Layout> layout;
@@ -352,6 +356,7 @@ BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total,
   state.descriptors.reserve(all.size());
   state.host_tasks.reserve(all.size());
   std::memcpy(state.host_tasks.data, all.data(), all.size()*sizeof(Task));
+  phase.emplace(diagnostics::Stage::qr_execute);
   if(!device && total) check(cudaMemcpyAsync(state.a.data,state.host_input.data,total*sizeof(double),cudaMemcpyHostToDevice,state.stream));
   check(cudaMemcpyAsync(state.descriptors.data,state.host_tasks.data,all.size()*sizeof(Task),cudaMemcpyHostToDevice,state.stream));
   auto launch=[&] {
@@ -376,6 +381,7 @@ BatchedCudaQr::Impl::run(const std::vector<InputLayout>& input,size_t total,
   double* src=levels.size()%2?state.b.data:state.a.data;
   check(cudaMemcpyAsync(state.host_roots.data,src,final_size*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
   check(cudaStreamSynchronize(state.stream));
+  phase.emplace(diagnostics::Stage::qr_output);
   std::vector<Eigen::MatrixXd> result;
   result.reserve(input.size());
   for(auto l:layout)

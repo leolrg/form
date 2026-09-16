@@ -445,3 +445,49 @@ scans and calls sharing an extractor serialize access to its CUDA workspace.
 
 Measured full-sequence timings, matched scaling controls, and validation details
 are in [CUDA extraction results](../docs/cuda-extraction-results.md).
+
+### Detailed diagnostic campaign
+
+`benchmarks/run_diagnostics.py --binary <frozen-form-replay> --output <new-directory>`
+runs sequential clean controls, explicit profiles, and CPU/GPU optimizer-policy
+experiments on stairs. Use `--plan` to inspect commands. Run with the same Python
+environment as `run_suite.py`. The campaign uses three full-sequence clean repeats,
+two repeats elsewhere, 32 CPU threads, and excludes the first 20 scans in analysis.
+No algorithm parameters differ across controls within a workload.
+
+`form-replay --profile` additionally writes `<output>.optimizer.csv`, recording
+**each optimizer invocation including summary preparation and graph construction**,
+its semi/full phase, actual selected backend, dimension, inclusive host stage
+times and calls. Resident-engine records include LM attempts/acceptances/rejections;
+the original dense engine does not expose these decisions. Its optional CUDA-solve
+mode is labeled `cpu+gpu` (host assembly and a GPU-selected solve, which can fall
+back), not a fully GPU optimizer.
+
+`form-replay --trace` independently enables NVTX ranges (CUDA builds). Capture
+using `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none ...`, export with
+`nsys export --type=sqlite`, then run `benchmarks/analyze_cuda_trace.py <sqlite>
+--output <json>`. Scan ranges exclude input loading/output writing. Activity is
+attributed to the range issuing its CUDA API call, through correlation IDs;
+scan indices below 20 are excluded. The analyzer reports both summed activity
+durations and interval-union device busy time, plus unmatched activity counts.
+It does not insert CUDA synchronizations or claim hardware-counter measurements.
+
+All `diag_*_ms` counters are **inclusive host wall time**, not GPU kernel time.
+For example: CPU reset contains factor classification, batch reset, and frozen
+matrix setup; GPU reset contains classification, batch reset, and resident CUDA
+configuration. Batch reset contains topology and root preparation; CUDA
+configuration contains host matrix/CSR construction and uploads/workspace setup.
+Linearization/error contain pose packing, summary work, and auxiliary factors.
+CPU solve contains damping, Cholesky, backsolve, and model-error calculation.
+Matching snapshot contains host packing and device reset; grouped search contains
+nearest/classification/wait, sort submission, packing and QR. QR contains host
+planning, execution/wait and output reconstruction. Raw materialization contains
+nested row-loading, ensure, download, reconstruction, grouping, and output copies.
+**Do not add parents to children, or host API time to overlapping GPU time.**
+Asynchronous linearization may finish while solve waits; trace attribution follows
+the launch rather than charging that work to the later wait.
+
+`benchmarks/analyze_diagnostics.py <campaign-directory>` validates per-call event
+accounting and reference counts, reports per-run tails, repeated-run dispersion,
+slow scans, workload correlations, backend/phase groups, and timer residuals.
+Clean timings, profiled timings, and traced timings must be reported separately.

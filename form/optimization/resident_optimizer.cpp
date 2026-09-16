@@ -51,6 +51,7 @@ struct ResidentOptimizer::Impl {
   Eigen::LLT<Matrix, Eigen::Upper> llt;
 
   void pack(const gtsam::Values& values) {
+    diagnostics::Scope detail(diagnostics::Stage::pose_pack);
     if (!ready) throw std::logic_error("ResidentOptimizer requires reset");
     if (values.size() != keys.size()) throw std::invalid_argument("ResidentOptimizer value keys changed; reset required");
     poses.resize(keys.size());
@@ -75,6 +76,7 @@ ResidentOptimizer::~ResidentOptimizer() = default;
 const gtsam::KeyVector& ResidentOptimizer::keys() const { return impl_->keys; }
 
 void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gtsam::Values& values) {
+  diagnostics::Scope detail(impl_->gpu ? diagnostics::Stage::gpu_reset : diagnostics::Stage::cpu_reset);
   profile::Scope timer(profile::resident_reset_wall);
   auto& s = *impl_;
   s.ready = s.linearized = false;
@@ -89,6 +91,7 @@ void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gt
   }
   std::vector<SummaryEdge> edges;
   std::vector<std::vector<int>> auxiliary_poses;
+  { diagnostics::Scope detail(diagnostics::Stage::reset_classify);
   for (const auto& factor : graph) {
     if (!factor) continue;
     if (typeid(*factor) == typeid(FeatureFactor)) {
@@ -125,6 +128,7 @@ void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gt
     s.auxiliary.push_back({factor, indices});
     auxiliary_poses.push_back(std::move(indices));
   }
+  }
   if (s.keys.empty()) {
     s.batch.reset();
   } else {
@@ -135,6 +139,7 @@ void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gt
 #endif
   }
   if (!s.gpu) {
+    diagnostics::Scope detail(diagnostics::Stage::cpu_frozen_setup);
     s.frozen_information = Matrix::Zero(6*s.keys.size()+1, 6*s.keys.size()+1);
     for (const auto& frozen : s.frozen) {
       const int n = 6*frozen.pose_indices.size();
@@ -147,6 +152,7 @@ void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gt
 }
 
 void ResidentOptimizer::linearize(const gtsam::Values& values) {
+  diagnostics::Scope detail(impl_->gpu ? diagnostics::Stage::gpu_linearize : diagnostics::Stage::cpu_linearize);
   profile::Scope timer(profile::linearize_wall);
   profile::iterations.fetch_add(1, std::memory_order_relaxed);
   auto& s = *impl_;
@@ -154,6 +160,7 @@ void ResidentOptimizer::linearize(const gtsam::Values& values) {
   s.pack(values);
   s.auxiliary_values.clear();
   if (!s.gpu || !s.batch) s.hessian = s.batch ? s.batch->linearize(s.poses) : Matrix::Zero(1,1).eval();
+  { diagnostics::Scope detail(diagnostics::Stage::auxiliary_linearize);
   for (const auto& auxiliary : s.auxiliary) {
     const int dim = 6*auxiliary.poses.size()+1;
     Matrix augmented = Matrix::Zero(dim, dim);
@@ -175,11 +182,13 @@ void ResidentOptimizer::linearize(const gtsam::Values& values) {
     if (s.gpu && s.batch) s.auxiliary_values.insert(s.auxiliary_values.end(), augmented.data(), augmented.data()+augmented.size());
     else addBlock(s.hessian, augmented, auxiliary.poses);
   }
+  }
   if (s.gpu && s.batch) {
 #ifdef FORM_ENABLE_CUDA
     s.batch->residentLinearize(s.poses, s.displacements, s.auxiliary_values);
 #endif
   } else {
+    diagnostics::Scope detail(diagnostics::Stage::cpu_frozen_shift);
     if (!s.gpu) s.hessian += s.frozen_information;
     const int n = 6*s.keys.size();
     size_t offset = 0;
@@ -208,6 +217,7 @@ Matrix ResidentOptimizer::model() {
 }
 
 double ResidentOptimizer::error(const gtsam::Values& values) {
+  diagnostics::Scope detail(impl_->gpu ? diagnostics::Stage::gpu_error : diagnostics::Stage::cpu_error);
   profile::Scope timer(profile::resident_error_wall);
   auto& s = *impl_;
   s.pack(values);
@@ -229,12 +239,14 @@ double ResidentOptimizer::error(const gtsam::Values& values) {
       offset += m;
     }
   }
-  for (const auto& auxiliary : s.auxiliary) cost += auxiliary.factor->error(values);
+  { diagnostics::Scope detail(diagnostics::Stage::auxiliary_error);
+    for (const auto& auxiliary : s.auxiliary) cost += auxiliary.factor->error(values); }
   return cost;
 }
 
 bool ResidentOptimizer::solve(double lambda, bool diagonal, double min_diagonal, double max_diagonal,
                               Vector& delta, double& old_linear_error, double& new_linear_error) {
+  diagnostics::Scope detail(impl_->gpu ? diagnostics::Stage::gpu_solve : diagnostics::Stage::cpu_solve);
   auto& s = *impl_;
   if (!s.linearized) throw std::logic_error("ResidentOptimizer requires linearize before solve");
   if (!std::isfinite(lambda) || lambda < 0 ||
@@ -250,16 +262,20 @@ bool ResidentOptimizer::solve(double lambda, bool diagonal, double min_diagonal,
   }
 #endif
   const int n = s.hessian.rows()-1;
+  { diagnostics::Scope detail(diagnostics::Stage::cpu_damping);
   s.damped = s.hessian.topLeftCorner(n,n);
   const double inverse_sigma = 1.0/(1.0/std::sqrt(lambda));
   for (int k = 0; k < n; ++k) {
     const double a = diagonal ? inverse_sigma*std::sqrt(std::clamp(s.hessian(k,k), min_diagonal, max_diagonal)) : inverse_sigma;
     s.damped(k,k) += a*a;
   }
-  s.llt.compute(s.damped);
+  }
+  { diagnostics::Scope detail(diagnostics::Stage::cpu_cholesky); s.llt.compute(s.damped); }
   if (s.llt.info() != Eigen::Success) return false;
-  s.candidate = s.llt.solve(s.hessian.col(n).head(n));
+  { diagnostics::Scope detail(diagnostics::Stage::cpu_backsolve);
+    s.candidate = s.llt.solve(s.hessian.col(n).head(n)); }
   if (!s.candidate.allFinite()) return false;
+  diagnostics::Scope model_detail(diagnostics::Stage::cpu_model_error);
   const double old_error = .5*s.hessian(n,n);
   const double new_error = old_error+.5*(s.candidate.dot(s.hessian.topLeftCorner(n,n)*s.candidate)-2*s.candidate.dot(s.hessian.col(n).head(n)));
   if (!std::isfinite(old_error) || !std::isfinite(new_error)) return false;
@@ -305,9 +321,10 @@ ResidentResult ResidentOptimizer::optimize(const gtsam::Values& initial,
                   step, old_linear, new_linear)) {
           const double linear_change = old_linear-new_linear;
           if (linear_change >= 0) {
+            { diagnostics::Scope detail(diagnostics::Stage::retraction);
             gtsam::VectorValues delta;
             for (size_t k = 0; k < impl_->keys.size(); ++k) delta.insert(impl_->keys[k], step.segment<6>(6*k));
-            trial = state->values.retract(delta);
+            trial = state->values.retract(delta); }
             new_error = error(trial);
             const double cost_change = state->error-new_error;
             if (linear_change > std::numeric_limits<double>::epsilon()*old_linear) {
@@ -317,6 +334,8 @@ ResidentResult ResidentOptimizer::optimize(const gtsam::Values& initial,
             stop = std::abs(cost_change) < params.relativeErrorTol*state->error;
           }
         }
+        else diagnostics::tick(diagnostics::Stage::lm_solve_failed);
+        diagnostics::tick(accepted ? diagnostics::Stage::lm_accepted : diagnostics::Stage::lm_rejected);
         if (accepted) {
           state = state->decreaseLambda(params, fidelity, std::move(trial), new_error);
           stop = true;

@@ -1,3 +1,4 @@
+#include "form/optimization/diagnostics.hpp"
 #include "form/feature/cuda_extraction.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -95,6 +96,7 @@ struct CudaExtraction::Impl {
   template<class T> std::vector<double> prepare(
       const std::vector<std::array<T,4>>& input,
       const std::vector<unsigned char>& mask, int cols, int neighbors, CudaExtraction::Reduction policy) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::extraction_prepare);
     ready=false;
     if (cols <= 0 || neighbors < 0 || neighbors > cols/2 ||
         input.empty() || input.size() > size_t(INT_MAX)/2 ||
@@ -125,6 +127,7 @@ std::vector<double> CudaExtraction::prepare(const std::vector<std::array<double,
   return impl_->prepare(scan,valid,columns,neighbors,reduction);
 }
 std::vector<std::array<int,2>> CudaExtraction::nearestRows(const std::vector<size_t>& indices) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::extraction_search);
   auto& s=*impl_;
   if (!s.ready) throw std::logic_error("Prepare CUDA extraction before normal search");
   if (indices.size()>size_t(INT_MAX)/2) throw std::invalid_argument("Too many CUDA normal queries");

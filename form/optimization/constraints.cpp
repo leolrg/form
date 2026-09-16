@@ -179,6 +179,8 @@ void ConstraintManager::prepare_cuda_summaries() {
 }
 
 gtsam::Values ConstraintManager::optimize(bool fast) {
+  diagnostics::Range range(fast ? "optimization/semi" : "optimization/full");
+  diagnostics::OptimizerCall diagnostic(false,fast,0,m_params.use_resident_optimizer);
   if (m_params.use_cuda_dense_solver && m_params.cuda_solve_min_dimension < 1)
     throw std::invalid_argument("cuda_solve_min_dimension must be positive");
   if (m_params.use_cuda_dense_solver && !m_params.use_resident_optimizer) {
@@ -188,21 +190,26 @@ gtsam::Values ConstraintManager::optimize(bool fast) {
     throw std::runtime_error("CUDA dense solver requested in a build without FORM_ENABLE_CUDA");
 #endif
   }
-  if (m_params.use_cuda_summaries) prepare_cuda_summaries();
-  else if (m_params.use_summary) prepare_cpu_summaries();
+  { diagnostics::Scope detail(diagnostics::Stage::optimizer_summary);
+    if (m_params.use_cuda_summaries) prepare_cuda_summaries();
+    else if (m_params.use_summary) prepare_cpu_summaries(); }
   auto graph = [&] {
+    diagnostics::Scope detail(diagnostics::Stage::optimizer_graph);
     profile::Scope timer(profile::graph_build_wall);
     return m_params.disable_smoothing ? get_single_graph() : get_graph(fast);
   }();
   gtsam::Values values;
-  if (m_params.disable_smoothing) values.insert(X(m_scan), get_pose(m_scan));
-  else values = m_values;
+  { diagnostics::Scope detail(diagnostics::Stage::optimizer_values);
+    if (m_params.disable_smoothing) values.insert(X(m_scan), get_pose(m_scan));
+    else values = m_values; }
+  diagnostic.record.dimension=6*values.size();
   if (m_params.use_resident_optimizer) {
     // Choose before assembly so a small CPU solve never requires a dense
     // device-to-host model transfer. Keep both workspaces across size changes.
     const bool gpu = m_params.use_cuda_dense_solver
         ? 6 * values.size() >= static_cast<size_t>(m_params.cuda_solve_min_dimension)
         : m_params.use_cuda_summaries;
+    diagnostic.record.gpu=gpu;
     auto& workspace = gpu ? m_resident_cuda_optimizer : m_resident_cpu_optimizer;
     if (!workspace) workspace = std::make_shared<ResidentOptimizer>(gpu);
     workspace->reset(graph, values);
@@ -211,6 +218,8 @@ gtsam::Values ConstraintManager::optimize(bool fast) {
     profile::last_final_error.store(result.final_error, std::memory_order_relaxed);
     return std::move(result.values);
   }
+  diagnostic.record.gpu=m_params.use_cuda_dense_solver &&
+      6*values.size()>=static_cast<size_t>(m_params.cuda_solve_min_dimension);
   DenseLMOptimizer optimizer(graph, values, m_params.opt_params,
                              m_cuda_solver, m_params.cuda_solve_min_dimension);
   profile::last_initial_error.store(optimizer.error(), std::memory_order_relaxed);

@@ -132,7 +132,14 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--batch-summaries") { params.constraints.use_batch_summaries = true; continue; }
-      if (arg == "--profile") { form::profile::enabled = true; continue; }
+      if (arg == "--profile") { form::profile::enabled = true; form::diagnostics::enabled = true; continue; }
+      if (arg == "--trace") {
+#ifdef FORM_ENABLE_CUDA
+        form::diagnostics::trace_enabled = true; continue;
+#else
+        throw std::runtime_error("NVTX tracing requires a CUDA build");
+#endif
+      }
       if (i + 1 == argc) throw std::runtime_error("Missing value for " + arg);
       const std::string value = argv[++i];
       if (arg == "--input") input = value;
@@ -208,9 +215,16 @@ int main(int argc, char** argv) {
         static_cast<uint64_t>(rows) * cols > 2000000)
       throw std::runtime_error("Invalid FORMPC01 input header");
     params.extraction.num_rows = rows; params.extraction.num_columns = cols;
-    std::ofstream timing(output + ".csv"), poses(output + ".tum");
+    std::ofstream timing(output + ".csv"), poses(output + ".tum"), optimizer_timing;
+    if(form::diagnostics::enabled) {
+      optimizer_timing.open(output + ".optimizer.csv");
+      if(!optimizer_timing) throw std::runtime_error("Cannot open optimizer diagnostic output");
+      optimizer_timing << std::setprecision(12) << "scan,call,phase,backend,dimension,wall_ms,engine";
+      form::diagnostics::writeHeader(optimizer_timing); optimizer_timing << '\n';
+    }
     if (!timing || !poses) throw std::runtime_error("Cannot open output prefix");
-    timing << "scan,stamp_ns,total_ms,extract_ms,map_ms,match_ms,semi_ms,full_ms,marginalize_ms,maintenance_ms,poses,planar_features,point_features,rematches,lm_iterations,factor_linearize_cpu_ms,factor_eval_cpu_ms,factor_error_cpu_ms,linearize_wall_ms,assemble_ms,solve_ms,factors,planar_correspondences,point_correspondences,summary_build_cpu_ms,summary_prepare_wall_ms,full_initial_error,full_final_error,cuda_solve_calls,cuda_solve_fallbacks,extract_validate_ms,extract_curvature_ms,extract_planar_select_ms,extract_point_mask_ms,extract_point_select_ms,extract_normals_ms,extract_pack_ms,normal_search_sample_cpu_ms,normal_eigen_sample_cpu_ms,normal_samples,resident_reset_wall_ms,resident_error_wall_ms,graph_build_wall_ms,map_world_wall_ms,map_snapshot_wall_ms,match_materialize_wall_ms\n";
+    timing << "scan,stamp_ns,total_ms,extract_ms,map_ms,match_ms,semi_ms,full_ms,marginalize_ms,maintenance_ms,poses,planar_features,point_features,rematches,lm_iterations,factor_linearize_cpu_ms,factor_eval_cpu_ms,factor_error_cpu_ms,linearize_wall_ms,assemble_ms,solve_ms,factors,planar_correspondences,point_correspondences,summary_build_cpu_ms,summary_prepare_wall_ms,full_initial_error,full_final_error,cuda_solve_calls,cuda_solve_fallbacks,extract_validate_ms,extract_curvature_ms,extract_planar_select_ms,extract_point_mask_ms,extract_point_select_ms,extract_normals_ms,extract_pack_ms,normal_search_sample_cpu_ms,normal_eigen_sample_cpu_ms,normal_samples,resident_reset_wall_ms,resident_error_wall_ms,graph_build_wall_ms,map_world_wall_ms,map_snapshot_wall_ms,match_materialize_wall_ms";
+    form::diagnostics::writeHeader(timing); timing << '\n';
     timing << std::setprecision(12); poses << std::setprecision(17);
     form::Estimator estimator(params);
     std::vector<form::PointXYZf> scan;
@@ -237,7 +251,11 @@ int main(int argc, char** argv) {
         solve_capture=std::make_unique<SolveCapture>(std::filesystem::path(system_capture_directory)/("scan-"+std::to_string(index)),index,stamp);
       form::profile::reset();
       const auto start = form::profile::Clock::now();
-      estimator.register_scan(scan);
+      {
+        const auto scan_range=form::diagnostics::trace_enabled ? "scan/"+std::to_string(index) : std::string{};
+        form::diagnostics::Range range(scan_range.c_str());
+        estimator.register_scan(scan);
+      }
       const double total = form::profile::milliseconds(start);
 #ifdef FORM_ENABLE_CUDA
       if(capture) { capture->finish();capture.reset();did_capture=true; }
@@ -274,8 +292,9 @@ int main(int argc, char** argv) {
              << ',' << form::profile::ms(form::profile::graph_build_wall)
              << ',' << form::profile::ms(form::profile::map_world_wall)
              << ',' << form::profile::ms(form::profile::map_snapshot_wall)
-             << ',' << form::profile::ms(form::profile::match_materialize_wall)
-             << '\n';
+             << ',' << form::profile::ms(form::profile::match_materialize_wall);
+      form::diagnostics::writeRow(timing); timing << '\n';
+      if(form::diagnostics::enabled) form::diagnostics::writeOptimizers(optimizer_timing,index);
       const auto pose = estimator.current_lidar_estimate();
       const auto q = pose.rotation().toQuaternion();
       poses << stamp / 1000000000 << '.' << std::setfill('0') << std::setw(9)
