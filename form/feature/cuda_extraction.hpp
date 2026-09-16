@@ -10,14 +10,17 @@ namespace form {
 /// The CPU retains ordered selection and Eigen covariance/eigenvector arithmetic.
 class CudaExtraction {
 public:
+  enum class Reduction { Cross, Adjacent, Sequential };
   CudaExtraction();
   ~CudaExtraction();
   CudaExtraction(const CudaExtraction&) = delete;
   CudaExtraction& operator=(const CudaExtraction&) = delete;
   std::vector<double> prepare(const std::vector<std::array<float,4>>& scan,
-      const std::vector<unsigned char>& valid, int columns, int neighbors);
+      const std::vector<unsigned char>& valid, int columns, int neighbors,
+      Reduction reduction = Reduction::Cross);
   std::vector<double> prepare(const std::vector<std::array<double,4>>& scan,
-      const std::vector<unsigned char>& valid, int columns, int neighbors);
+      const std::vector<unsigned char>& valid, int columns, int neighbors,
+      Reduction reduction = Reduction::Cross);
   /// For each selected index, exact nearest valid index on preceding/following
   /// rows, or -1. Ties use the first scanline index, as in the CPU search.
   std::vector<std::array<int,2>> nearestRows(const std::vector<size_t>& indices);

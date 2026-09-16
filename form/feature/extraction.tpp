@@ -57,7 +57,16 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
     std::vector<unsigned char> mask(valid_mask.begin(), valid_mask.end());
     for (size_t i=0; i<scan.size(); ++i)
       for (int axis=0; axis<4; ++axis) packed[i][axis] = scan[i].vec4()[axis];
-    const auto values = cuda_->prepare(packed, mask, params.num_columns, params.neighbor_points);
+    // Ask Eigen which reduction the actual four-coordinate expression uses.
+    using Squared = std::decay_t<decltype((scan.front().vec4()-scan.front().vec4()).cwiseAbs2())>;
+    using Redux = Eigen::internal::redux_traits<Eigen::internal::scalar_sum_op<T>,
+        Eigen::internal::redux_evaluator<Squared>>;
+    constexpr auto reduction = int(Redux::Traversal) != int(Eigen::DefaultTraversal)
+        ? CudaExtraction::Reduction::Cross
+        : (int(Redux::Unrolling) == int(Eigen::CompleteUnrolling)
+            ? CudaExtraction::Reduction::Adjacent : CudaExtraction::Reduction::Sequential);
+    const auto values = cuda_->prepare(packed, mask, params.num_columns,
+                                      params.neighbor_points, reduction);
     curvature.reserve(values.size());
     for (size_t i=0; i<values.size(); ++i) curvature.emplace_back(i, values[i]);
   } else

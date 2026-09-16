@@ -73,3 +73,17 @@ TEST(CudaExtraction, InvalidPreparationBlocksSearchAndCanRecover) {
   nearest=gpu.nearestRows({8,24});
   for(auto pair:nearest) EXPECT_EQ(pair,(std::array<int,2>{-1,-1}));
 }
+
+TEST(CudaExtraction, ReductionPolicyPreservesRoundingSensitiveTie) {
+  form::CudaExtraction gpu;
+  std::vector<std::array<float,4>> points(8,{0,0,0,0});
+  std::vector<unsigned char> mask(8,0);
+  points[4]={1,1,4096,0}; points[5]={0,0,4096,0};
+  mask[4]=mask[5]=1;
+  gpu.prepare(points,mask,4,0,form::CudaExtraction::Reduction::Cross);
+  EXPECT_EQ(gpu.nearestRows({0})[0][1],4);
+  gpu.prepare(points,mask,4,0,form::CudaExtraction::Reduction::Adjacent);
+  EXPECT_EQ(gpu.nearestRows({0})[0][1],5);
+  gpu.prepare(points,mask,4,0,form::CudaExtraction::Reduction::Sequential);
+  EXPECT_EQ(gpu.nearestRows({0})[0][1],5);
+}

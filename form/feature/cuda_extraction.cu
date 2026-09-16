@@ -49,7 +49,7 @@ __global__ void curvature(const Point<T>* scan, const unsigned char* valid,
 
 template<class T>
 __global__ void nearestRowsKernel(const Point<T>* scan, const unsigned char* valid,
-    const int* queries, int count, int columns, int rows, int* out) {
+    const int* queries, int count, int columns, int rows, CudaExtraction::Reduction reduction, int* out) {
   const int lane = threadIdx.x%32;
   const int job = blockIdx.x*(blockDim.x/32) + threadIdx.x/32;
   if (job >= count*2) return;
@@ -64,8 +64,11 @@ __global__ void nearestRowsKernel(const Point<T>* scan, const unsigned char* val
     if (!valid[i]) continue;
     const auto p = scan[i];
     const T x=p.x-q.x, y=p.y-q.y, z=p.z-q.z, w=p.w-q.w;
-    // Match Eigen's four-lane squaredNorm reduction, retaining input precision.
-    const T d = (x*x+z*z)+(y*y+w*w);
+    // Match the calling CPU's Eigen reduction, including scalar builds.
+    T d;
+    if (reduction == CudaExtraction::Reduction::Cross) d=(x*x+z*z)+(y*y+w*w);
+    else if (reduction == CudaExtraction::Reduction::Adjacent) d=(x*x+y*y)+(z*z+w*w);
+    else d=((x*x+y*y)+z*z)+w*w;
     if (double(d) < best) { best=double(d); winner=i; }
   }
   for (int offset=16; offset; offset/=2) {
@@ -86,18 +89,19 @@ struct CudaExtraction::Impl {
   Buffer<int> queries, nearest;
   int columns=0, rows=0, count=0;
   bool single=false, ready=false;
+  CudaExtraction::Reduction reduction=CudaExtraction::Reduction::Cross;
   Impl() { check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)); }
   ~Impl() { if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
   template<class T> std::vector<double> prepare(
       const std::vector<std::array<T,4>>& input,
-      const std::vector<unsigned char>& mask, int cols, int neighbors) {
+      const std::vector<unsigned char>& mask, int cols, int neighbors, CudaExtraction::Reduction policy) {
     ready=false;
     if (cols <= 0 || neighbors < 0 || neighbors > cols/2 ||
         input.empty() || input.size() > size_t(INT_MAX)/2 ||
         input.size()%cols || mask.size()!=input.size())
       throw std::invalid_argument("Invalid CUDA extraction shape");
     columns=cols; rows=int(input.size()/cols); count=int(input.size());
-    single=sizeof(T)==sizeof(float);
+    single=sizeof(T)==sizeof(float); reduction=policy;
     scan.reserve(input.size()*sizeof(Point<T>)); valid.reserve(mask.size()); curvatures.reserve(input.size());
     check(cudaMemcpyAsync(scan.data,input.data(),input.size()*sizeof(Point<T>),cudaMemcpyHostToDevice,stream));
     check(cudaMemcpyAsync(valid.data,mask.data(),mask.size(),cudaMemcpyHostToDevice,stream));
@@ -113,12 +117,12 @@ struct CudaExtraction::Impl {
 CudaExtraction::CudaExtraction(): impl_(std::make_unique<Impl>()) {}
 CudaExtraction::~CudaExtraction() = default;
 std::vector<double> CudaExtraction::prepare(const std::vector<std::array<float,4>>& scan,
-    const std::vector<unsigned char>& valid,int columns,int neighbors) {
-  return impl_->prepare(scan,valid,columns,neighbors);
+    const std::vector<unsigned char>& valid,int columns,int neighbors, Reduction reduction) {
+  return impl_->prepare(scan,valid,columns,neighbors,reduction);
 }
 std::vector<double> CudaExtraction::prepare(const std::vector<std::array<double,4>>& scan,
-    const std::vector<unsigned char>& valid,int columns,int neighbors) {
-  return impl_->prepare(scan,valid,columns,neighbors);
+    const std::vector<unsigned char>& valid,int columns,int neighbors, Reduction reduction) {
+  return impl_->prepare(scan,valid,columns,neighbors,reduction);
 }
 std::vector<std::array<int,2>> CudaExtraction::nearestRows(const std::vector<size_t>& indices) {
   auto& s=*impl_;
@@ -135,9 +139,9 @@ std::vector<std::array<int,2>> CudaExtraction::nearestRows(const std::vector<siz
   check(cudaMemcpyAsync(s.queries.data,queries.data(),queries.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));
   const int blocks=int((indices.size()*2+3)/4);
   if (s.single)
-    nearestRowsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<float>*>(s.scan.data),s.valid.data,s.queries.data,int(indices.size()),s.columns,s.rows,s.nearest.data);
+    nearestRowsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<float>*>(s.scan.data),s.valid.data,s.queries.data,int(indices.size()),s.columns,s.rows,s.reduction,s.nearest.data);
   else
-    nearestRowsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<double>*>(s.scan.data),s.valid.data,s.queries.data,int(indices.size()),s.columns,s.rows,s.nearest.data);
+    nearestRowsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<double>*>(s.scan.data),s.valid.data,s.queries.data,int(indices.size()),s.columns,s.rows,s.reduction,s.nearest.data);
   check(cudaGetLastError());
   check(cudaMemcpyAsync(output.data(),s.nearest.data,output.size()*2*sizeof(int),cudaMemcpyDeviceToHost,s.stream));
   check(cudaStreamSynchronize(s.stream));
