@@ -10,6 +10,8 @@
 - [x] Implement exact FrozenSystem equality in `form/optimization/resident_system.hpp`; retain CPU constant matrix in `resident_optimizer.cpp` when `previous_ready && old_keys == new_keys && old_frozen == new_frozen`. Always refresh anchors/auxiliary references and invalidate `linearized`.
 - [x] In `batch_summary_cuda.cu`, retain successfully uploaded CSR snapshots and resident constant snapshots. Always upload roots and invalidate model readiness on reset. Skip assembly CSR uploads on exact equality. Skip resident configuration on `dimension == 6 * poses && frozen == cached_frozen && auxiliary_poses == cached_auxiliary`. Invalidate configuration before fallible replacement and publish cache contents after successful synchronization.
 - [x] Add reuse counters in `diagnostics.hpp`, run targeted tests and independent code review, then fix any issues and commit.
-- [ ] Run `cmake --build build-accel --target check -j 4`, CPU-only equivalent, Python benchmark tests, and Compute Sanitizer on the new CUDA cases. Freeze the verified executable/provenance.
-- [ ] Run sequential repeated matched baseline/new benchmarks using `run_suite.py` infrastructure: full stairs CPU/CUDA, same-prefix current/dense/window CPU/CUDA, plus separate profiles. Compare workload/pose/LM traces, ground-truth gates and phase timings. Do not overlap builds or other benchmarks with timing.
-- [ ] Write `docs/rematch-reuse-results.md`, update benchmark documentation/plan, review measurements, commit and push; verify remote HEAD.
+- [x] Run `cmake --build build-accel --target check -j 4`, CPU-only equivalent, Python benchmark tests, and Compute Sanitizer on the new CUDA cases. Freeze the verified executable/provenance.
+- [x] Run sequential repeated matched baseline/new benchmarks using `run_suite.py` infrastructure: full stairs CPU/CUDA, same-prefix current/dense/window CPU/CUDA, plus separate profiles. Compare workload/pose/LM traces, ground-truth gates and phase timings. Do not overlap builds or other benchmarks with timing.
+- [x] Write `docs/rematch-reuse-results.md`, update benchmark documentation/plan and review measurements.
+
+Delivery: commit the reviewed report, push the branch, and verify the remote HEAD as the final repository checks.

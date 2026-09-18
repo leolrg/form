@@ -513,3 +513,31 @@ matching enabled while changing only the resident optimizer policy.
 full runs in old/disabled/enabled/enabled/disabled/old order. Run calibration before
 creating the optimizer artifact snapshot. The enabled setting includes existing
 profile counters as well as new diagnostics; it does not enable NVTX tracing.
+
+### Reuse between rematching iterations
+
+The resident optimizer now content-checks frozen constants and assembly layouts
+before rebuilding them. New correspondence summaries and all pose-dependent work
+still refresh. See [implementation and measurements](../docs/rematch-reuse-results.md).
+
+To compare frozen old/new executables on matched CPU and CUDA workloads:
+
+```bash
+python benchmarks/run_reuse_benchmark.py \
+  --previous <old-form-replay> --previous-revision <old-source-revision> \
+  --binary <new-form-replay> --revision <new-source-revision> \
+  --output <new-campaign-directory>
+python benchmarks/analyze_reuse_benchmark.py <new-campaign-directory>
+```
+
+Use the evalio Python environment. The 30-run schedule is sequential, reverses
+control order on the second repeat, and retains separate profiles. It includes
+all 1190 stairs scans, denser/larger-window 250-scan controls, and current-prefix
+statistics from the full runs. `--plan` prints commands without executing them.
+Both binaries must remain unchanged. Completion records hash CSV/TUM and profiled
+optimizer output; resumes also check environment and CPU affinity. The analyzer
+requires matched old/new counts, poses, objectives and profile LM decisions.
+
+Reuse diagnostics are `diag_cpu_frozen_reuse_calls`,
+`diag_cuda_topology_reuse_calls`, and `diag_cuda_configure_reuse_calls`.
+These count avoided rebuilds/uploads; their `_ms` columns are intentionally zero.
