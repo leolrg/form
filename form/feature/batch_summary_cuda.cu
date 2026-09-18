@@ -88,8 +88,6 @@ struct FrozenDescriptor {int matrix, n, delta; bool anchor;};
 struct ResidentData {
   int dimension=0, frozen_count=0, delta_count=0, auxiliary_count=0, workspace_count=0;
   bool ready=false;
-  std::vector<FrozenSystem> frozen_snapshot;
-  std::vector<std::vector<int>> auxiliary_snapshot;
   cusolverDnHandle_t solver=nullptr;
   Buffer<FrozenDescriptor> frozen{0};
   Buffer<double> matrices{0},constant{0},displacements{0},shifted{0},products{0},costs{0},auxiliary{0};
@@ -153,8 +151,6 @@ void buildCsr(const std::vector<std::pair<int,int>>& entries,int size,std::vecto
 }
 struct CudaSummaryBatch::Impl {
   int poses,edges,entries;cudaStream_t stream=nullptr;
-  bool valid=false, csr_valid=false;
-  std::vector<int> cached_offsets,cached_indices;
   std::unique_ptr<ResidentData> resident;
   Buffer<BatchRoot> roots;Buffer<BatchPose> pose_data;Buffer<int> offsets,indices;
   Buffer<double> partial,output;Buffer<BatchPose,true> host_poses;Buffer<double,true> host_output;
@@ -166,31 +162,17 @@ CudaSummaryBatch::CudaSummaryBatch(int poses,const std::vector<BatchRoot>& roots
 }
 void CudaSummaryBatch::reset(int poses,const std::vector<BatchRoot>& roots,const std::vector<int>& offsets,const std::vector<int>& indices) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::cuda_batch_reset);
-  auto& s=*impl_;
-  const bool same_layout=s.csr_valid && poses==s.poses &&
-      offsets==s.cached_offsets && indices==s.cached_indices;
-  // Invalidate before any fallible operation, including synchronization. A
-  // failed upload may have partially overwritten the old device arrays.
-  s.valid=false;s.csr_valid=false;
-  if(s.resident){s.resident->ready=false;if(poses!=s.poses)s.resident->dimension=0;}
-  check(cudaStreamSynchronize(s.stream));
-  s.poses=poses;s.edges=roots.size();s.entries=(6*poses+1)*(6*poses+1);
+  auto& s=*impl_;check(cudaStreamSynchronize(s.stream));if(s.resident){s.resident->ready=false;s.resident->dimension=0;}s.poses=poses;s.edges=roots.size();s.entries=(6*poses+1)*(6*poses+1);
   s.roots.reserve(roots.size());s.pose_data.reserve(poses);s.offsets.reserve(offsets.size());s.indices.reserve(indices.size());
   s.partial.reserve(roots.size()*169);s.output.reserve(s.entries);s.host_poses.reserve(poses);s.host_output.reserve(s.entries);
   if(!roots.empty())check(cudaMemcpyAsync(s.roots.data,roots.data(),roots.size()*sizeof(BatchRoot),cudaMemcpyHostToDevice,s.stream));
-  if(!same_layout) {
-    check(cudaMemcpyAsync(s.offsets.data,offsets.data(),offsets.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));
-    if(!indices.empty())check(cudaMemcpyAsync(s.indices.data,indices.data(),indices.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));
-  }
+  check(cudaMemcpyAsync(s.offsets.data,offsets.data(),offsets.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));
+  if(!indices.empty())check(cudaMemcpyAsync(s.indices.data,indices.data(),indices.size()*sizeof(int),cudaMemcpyHostToDevice,s.stream));
   check(cudaStreamSynchronize(s.stream));
-  if(!same_layout){s.cached_offsets=offsets;s.cached_indices=indices;}
-  else diagnostics::tick(diagnostics::Stage::cuda_topology_reuse);
-  s.csr_valid=s.valid=true;
 }
 CudaSummaryBatch::~CudaSummaryBatch()=default;
 void CudaSummaryBatch::evaluate(const std::vector<BatchPose>& poses,double* output,bool cost) {
-  auto& s=*impl_;if(!s.valid)throw std::logic_error("CUDA batch requires a successful reset");
-  if(s.resident)s.resident->ready=false;check(cudaStreamSynchronize(s.stream));std::copy(poses.begin(),poses.end(),s.host_poses.data);
+  auto& s=*impl_;check(cudaStreamSynchronize(s.stream));if(s.resident)s.resident->ready=false;std::copy(poses.begin(),poses.end(),s.host_poses.data);
   check(cudaMemcpyAsync(s.pose_data.data,s.host_poses.data,poses.size()*sizeof(BatchPose),cudaMemcpyHostToDevice,s.stream));
   if(s.edges) {
     if(cost)evaluateEdges<true><<<s.edges,128,0,s.stream>>>(s.roots.data,s.pose_data.data,s.partial.data);
@@ -205,16 +187,7 @@ void CudaSummaryBatch::evaluate(const std::vector<BatchPose>& poses,double* outp
 }
 void CudaSummaryBatch::configureResident(const std::vector<FrozenSystem>& frozen,const std::vector<std::vector<int>>& auxiliary_poses) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::cuda_configure);
-  auto& s=*impl_;
-  if(s.resident)s.resident->ready=false;
-  if(!s.valid)throw std::logic_error("CUDA batch requires a successful reset");
-  if(s.resident && s.resident->dimension==6*s.poses &&
-      s.resident->frozen_snapshot==frozen && s.resident->auxiliary_snapshot==auxiliary_poses) {
-    diagnostics::tick(diagnostics::Stage::cuda_configure_reuse);
-    return;
-  }
-  if(s.resident)s.resident->dimension=0;
-  check(cudaStreamSynchronize(s.stream));
+  auto& s=*impl_;check(cudaStreamSynchronize(s.stream));
   if(!s.resident)s.resident=std::make_unique<ResidentData>(s.stream);
   auto& w=*s.resident;w.ready=false;w.dimension=0;
   std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::cuda_configure_host);
@@ -261,15 +234,14 @@ void CudaSummaryBatch::configureResident(const std::vector<FrozenSystem>& frozen
   solverCheck(cusolverDnDpotrf_bufferSize(w.solver,CUBLAS_FILL_MODE_LOWER,n,w.damped.data,n,&w.workspace_count));
   w.workspace.reserve(w.workspace_count);
   check(cudaStreamSynchronize(s.stream));
-  w.frozen_snapshot=frozen;w.auxiliary_snapshot=auxiliary_poses;
   w.dimension=n;w.delta_count=displacement_count;w.auxiliary_count=auxiliary_count;w.frozen_count=terms.size();
 }
 void CudaSummaryBatch::residentLinearize(const std::vector<BatchPose>& poses,const std::vector<double>& deltas,const std::vector<double>& auxiliary) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::cuda_linearize);
   auto& s=*impl_;
-  if(!s.valid || !s.resident || !s.resident->dimension)throw std::logic_error("Resident system is not configured");auto& w=*s.resident;
+  if(!s.resident || !s.resident->dimension)throw std::logic_error("Resident system is not configured");auto& w=*s.resident;
   if(poses.size()!=static_cast<size_t>(s.poses) || deltas.size()!=static_cast<size_t>(w.delta_count) || auxiliary.size()!=static_cast<size_t>(w.auxiliary_count))throw std::invalid_argument("Resident linearize input size mismatch");
-  w.ready=false;check(cudaStreamSynchronize(s.stream));
+  check(cudaStreamSynchronize(s.stream));w.ready=false;
   std::copy(poses.begin(),poses.end(),s.host_poses.data);std::copy(deltas.begin(),deltas.end(),w.host_displacements.data);std::copy(auxiliary.begin(),auxiliary.end(),w.host_auxiliary.data);
   check(cudaMemcpyAsync(s.pose_data.data,s.host_poses.data,poses.size()*sizeof(BatchPose),cudaMemcpyHostToDevice,s.stream));
   if(!deltas.empty())check(cudaMemcpyAsync(w.displacements.data,w.host_displacements.data,deltas.size()*sizeof(double),cudaMemcpyHostToDevice,s.stream));
@@ -283,7 +255,7 @@ void CudaSummaryBatch::residentLinearize(const std::vector<BatchPose>& poses,con
 double CudaSummaryBatch::residentError(const std::vector<BatchPose>& poses,const std::vector<double>& deltas) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::cuda_error);
   auto& s=*impl_;
-  if(!s.valid || !s.resident || !s.resident->dimension)throw std::logic_error("Resident system is not configured");auto& w=*s.resident;
+  if(!s.resident || !s.resident->dimension)throw std::logic_error("Resident system is not configured");auto& w=*s.resident;
   if(poses.size()!=static_cast<size_t>(s.poses) || deltas.size()!=static_cast<size_t>(w.delta_count))throw std::invalid_argument("Resident error input size mismatch");
   check(cudaStreamSynchronize(s.stream));
   std::copy(poses.begin(),poses.end(),s.host_poses.data);std::copy(deltas.begin(),deltas.end(),w.host_displacements.data);
@@ -299,7 +271,7 @@ double CudaSummaryBatch::residentError(const std::vector<BatchPose>& poses,const
 bool CudaSummaryBatch::residentSolve(double lambda,bool diagonal,double minimum,double maximum,std::vector<double>& delta,double& old_error,double& new_error) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::cuda_solve);
   auto& s=*impl_;
-  if(!s.valid || !s.resident || !s.resident->ready)throw std::logic_error("Resident solve requires a linear model");auto& w=*s.resident;const int n=w.dimension;
+  if(!s.resident || !s.resident->ready)throw std::logic_error("Resident solve requires a linear model");auto& w=*s.resident;const int n=w.dimension;
   if(!std::isfinite(lambda) || lambda<0 || (diagonal && (!std::isfinite(minimum) || !std::isfinite(maximum) || minimum<=0 || maximum<minimum)))throw std::invalid_argument("Invalid resident damping parameters");
   prepareDamped<<<(n*n+255)/256,256,0,s.stream>>>(s.output.data,n,lambda,diagonal,minimum,maximum,w.damped.data,w.solution.data);
   check(cudaGetLastError());
@@ -316,7 +288,7 @@ bool CudaSummaryBatch::residentSolve(double lambda,bool diagonal,double minimum,
   delta.assign(w.host_solution.data,w.host_solution.data+n);old_error=w.host_scalars.data[0];new_error=w.host_scalars.data[1];return true;
 }
 void CudaSummaryBatch::residentHessian(double* output) {
-  auto& s=*impl_;if(!s.valid || !s.resident || !s.resident->ready)throw std::logic_error("Resident model is not linearized");
+  auto& s=*impl_;if(!s.resident || !s.resident->ready)throw std::logic_error("Resident model is not linearized");
   check(cudaMemcpyAsync(s.host_output.data,s.output.data,s.entries*sizeof(double),cudaMemcpyDeviceToHost,s.stream));
   check(cudaStreamSynchronize(s.stream));std::copy_n(s.host_output.data,s.entries,output);
 }

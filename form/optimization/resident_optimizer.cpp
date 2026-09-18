@@ -79,14 +79,10 @@ void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gt
   diagnostics::Scope detail(impl_->gpu ? diagnostics::Stage::gpu_reset : diagnostics::Stage::cpu_reset);
   profile::Scope timer(profile::resident_reset_wall);
   auto& s = *impl_;
-  const bool previously_ready = s.ready;
   s.ready = s.linearized = false;
-  auto next_keys = values.keys();
-  std::sort(next_keys.begin(), next_keys.end());
-  const bool same_keys = previously_ready && s.keys == next_keys;
-  auto previous_frozen = std::move(s.frozen);
-  s.keys = std::move(next_keys);
+  s.keys = values.keys();
   if (s.keys.size() > 1000) throw std::invalid_argument("ResidentOptimizer supports at most 1000 poses");
+  std::sort(s.keys.begin(), s.keys.end());
   s.index.clear(); s.frozen.clear(); s.anchors.clear(); s.auxiliary.clear();
   for (size_t i = 0; i < s.keys.size(); ++i) {
     if (!dynamic_cast<const gtsam::GenericValue<gtsam::Pose3>*>(&values.at(s.keys[i])))
@@ -142,11 +138,7 @@ void ResidentOptimizer::reset(const gtsam::NonlinearFactorGraph& graph, const gt
     if (s.gpu) s.batch->configureResident(s.frozen, auxiliary_poses);
 #endif
   }
-  if (!s.gpu && same_keys && s.frozen == previous_frozen) {
-    // Anchors and auxiliary factors above still refresh. Only the constant
-    // information matrix is reused; b/f shifts are recomputed at every pose.
-    diagnostics::tick(diagnostics::Stage::cpu_frozen_reuse);
-  } else if (!s.gpu) {
+  if (!s.gpu) {
     diagnostics::Scope detail(diagnostics::Stage::cpu_frozen_setup);
     s.frozen_information = Matrix::Zero(6*s.keys.size()+1, 6*s.keys.size()+1);
     for (const auto& frozen : s.frozen) {

@@ -15,8 +15,6 @@ class BatchSummary {
  public:
   BatchSummary(int pose_count, std::vector<SummaryEdge> edges, bool cuda);
   ~BatchSummary();
-  // Replaces roots and invalidates the linear model. Dimension-compatible
-  // resident constants survive; configureResident checks contents/layouts anew.
   void reset(int pose_count, std::vector<SummaryEdge> edges);
   Eigen::MatrixXd linearize(const std::vector<gtsam::Pose3>& poses);
   double error(const std::vector<gtsam::Pose3>& poses);
