@@ -417,3 +417,45 @@ The 250-scan `audit-v6` run checks 45,285,082 queries with zero mismatches and
 32,967,529 successful certificates equal the earlier norm-predicate count on
 this replay. All 4,834 summary calls report the bounded tree path. Audit timing
 is excluded from performance claims.
+
+Clean V6 (`clean-v6-current`), two reversed-order repeats, same 250/20 protocol:
+
+| Variant | Total ms/scan | Matching ms/scan |
+| --- | ---: | ---: |
+| Off | 26.863 | 8.496 |
+| Tree32 | 28.751 | 9.836 |
+| Tree128 | 27.219 | 9.054 |
+| Tree256 | 29.446 | 9.753 |
+| Bounded tree32 | 28.346 | 9.427 |
+| Bounded tree128 | 27.020 | 8.990 |
+| Bounded tree256 | 28.518 | 9.442 |
+| Fused norm/occurrences | 27.619 | 8.451 |
+| Fused squared/occurrences | 27.293 | 8.506 |
+| Split squared/occurrences | 25.560 | 7.792 |
+| Bounded tree128 + fused squared/occurrences | 26.049 | 8.134 |
+
+All workload counts agree; maximum translation difference is 3.02e-13 m.
+Some repeats vary materially (for example tree32 total is 30.706 and 26.796 ms),
+so these means select follow-up variants rather than establishing a final gain.
+The split squared repeats are 25.535/25.585 ms total and 7.721/7.863 ms matching.
+The best tree-only variant still loses in matching; larger grids are not uniformly
+better. Final selected variants need broader, repeated validation.
+
+Two separate V6 traces have zero unattributed timed events. The split squared
+search uses 1.1180 ms/scan in `nearestReuse` plus 0.0823 ms in `certifyQueries`,
+versus about 1.92 ms in original nearest search. This is a 37% kernel-time
+reduction for the **combined schedule/bound configuration**, not proof that
+eliminating square roots alone accounts for it. Its ordinary full QR is
+1.4172 ms/scan.
+
+For bounded tree128, leaf kernels fall to 0.4000 ms and ancestor kernels to
+0.9775 ms, versus V5's 0.7124/1.0635 ms. Extent preparation and final-root kernels
+add 0.0400/0.0716 ms. Total tree QR remains about 1.489 ms, slightly above full
+QR, before stable-row bookkeeping. Sorting consumes 0.2224 ms of kernels and
+0.3433 ms of issuing CUDA API time in the V5 trace; these overlap. Queuing only
+new rows is a bounded follow-up for that bookkeeping cost. Compact cached task
+plans are another follow-up for overlaunching small groups under a global cap.
+
+Only 61 of 4,486 post-warmup V6 audit summary calls have zero dirty leaves,
+representing 83,471 of roughly42 million queries. An all-unchanged fast path has
+few opportunities in this trace; it is not a substitute for partial updates.
