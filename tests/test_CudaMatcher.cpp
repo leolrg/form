@@ -12,12 +12,13 @@ using form::CudaMatcher;
 TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRejection) {
   const std::array<double,12> identity={1,0,0,0,0,1,0,0,0,0,1,0};
   auto shifted=identity; shifted[3]=.2;
-  for(bool plane:{false,true}) for(int extra_group:{0,1}) {
+  for(bool plane:{false,true}) for(int extra_group:{0,1}) for(bool tree:{false,true}) {
     CudaMatcher full,partial;
     full.setIncrementalSummaries(false);
     full.setReuseMode(CudaMatcher::ReuseMode::Disabled);
     partial.setReuseMode(CudaMatcher::ReuseMode::Certified);
     partial.setIncrementalSummaries(true);
+    partial.setSummaryTree(tree);
     std::vector<CudaMatcher::MapPoint> points;
     std::vector<CudaMatcher::Query> queries;
     for(int i=0;i<192;++i) {
@@ -54,6 +55,7 @@ TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRej
     };
     compare(identity,1.);
     EXPECT_EQ(partial.summaryStats().active_leaves,3u);
+    EXPECT_EQ(partial.summaryStats().tree,tree);
     EXPECT_EQ(partial.summaryStats().dirty_leaves,3u);
     compare(shifted,1.);
     EXPECT_EQ(partial.summaryStats().dirty_leaves,size_t(extra_group?2:1));
@@ -80,10 +82,11 @@ TEST(CudaMatcher, IncrementalSlotsCrossBlockScanChunksAndRefillScatteredHoles) {
     points.push_back({{x,.1,.1,0},{x-.01,.1,.1},{.3,.4,.5}}); groups.push_back(0);
     if(i%17==0) { points.push_back({{x+.3,.1,.1,0},{x+.29,.1,.1},{.5,.4,.3}}); groups.push_back(1); }
   }
-  for(bool plane:{false,true}) {
+  for(bool plane:{false,true}) for(bool tree:{false,true}) {
     CudaMatcher full,partial;
     full.setIncrementalSummaries(false);
     partial.setIncrementalSummaries(true);
+    partial.setSummaryTree(tree);
     for(auto* matcher:{&full,&partial}) {
       matcher->reset({{{0,0,0},0,int(points.size())}},points,queries,2000.);
       matcher->setGroups(groups,3);

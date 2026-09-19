@@ -190,6 +190,112 @@ __global__ void retainGroupRoots(const double* input,double* roots,const size_t*
   for(int element=threadIdx.x;element<width*width;element+=blockDim.x)
     roots[group*width*width+element]=active[group]?input[offsets[group]+element]:0.;
 }
+
+struct TreeHistory { int active,initialized; };
+struct TreeExtent { int previous,current,initialized,valid,changed; };
+struct TreeLevel { size_t offset,count,span; };
+enum TreeWork : unsigned char { TreeChanged=1,TreeLeafQr=2,TreeMergeQr=4 };
+
+__global__ void prepareTreeExtents(const int* highwater,const TreeHistory* history,
+                                   TreeExtent* extents,int groups,int maximum) {
+  const size_t group=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(group>=size_t(groups)) return;
+  const int high=highwater[group];
+  if(high<0 || high>maximum) { extents[group]={0,0,0,0,0}; return; }
+  const int current=high/64+(high%64!=0);
+  extents[group]={history[group].active,current,history[group].initialized,1,0};
+}
+
+__device__ void zeroTreeRoot(double* roots,size_t offset,int width) {
+  for(int element=threadIdx.x%32;element<width*width;element+=32) roots[offset+element]=0.;
+}
+
+__global__ void updateTreeLeaves(const double* packed,const unsigned char* dirty,
+                                 double* roots,unsigned char* flags,const TreeExtent* extents,
+                                 size_t capacity,size_t nodes_per_group,int blocks_per_group,int width) {
+  const int group=blockIdx.x/blocks_per_group;
+  const int warp=(blockIdx.x%blocks_per_group)*(blockDim.x/32)+threadIdx.x/32;
+  const int warps=blocks_per_group*(blockDim.x/32),lane=threadIdx.x%32;
+  const TreeExtent extent=extents[group];
+  if(!extent.valid) return;
+  const int count=max(extent.previous,extent.current);
+  const size_t square=size_t(width)*width;
+  for(int leaf=warp;leaf<count;leaf+=warps) {
+    const bool active=leaf<extent.current;
+    const bool recompute=active && dirty[size_t(group)*capacity+leaf];
+    const bool initialize=active && leaf>=extent.initialized;
+    const bool changed=(leaf<extent.previous)!=active || recompute || initialize;
+    const size_t node=size_t(group)*nodes_per_group+leaf;
+    if(lane==0) flags[node]=(changed?TreeChanged:0)|(recompute?TreeLeafQr:0);
+    if(recompute) {
+      const Task task{(size_t(group)*capacity+leaf)*64*7,node*square,64,width,64,width==13?2:0};
+      if(width==7) qrWarp<7,64>(packed,roots,task);
+      else qrWarp<13,64>(packed,roots,task);
+    } else if(initialize) zeroTreeRoot(roots,node*square,width);
+    // Deactivation leaves the cached leaf intact; membership changes propagate.
+  }
+}
+
+__global__ void updateTreeAncestors(double* roots,unsigned char* flags,const TreeExtent* extents,
+                                    size_t nodes_per_group,size_t previous_offset,size_t offset,
+                                    size_t span,int blocks_per_group,int width) {
+  const int group=blockIdx.x/blocks_per_group;
+  const int warp=(blockIdx.x%blocks_per_group)*(blockDim.x/32)+threadIdx.x/32;
+  const int warps=blocks_per_group*(blockDim.x/32),lane=threadIdx.x%32;
+  const TreeExtent extent=extents[group];
+  const int fanin=64/width;
+  const size_t child_span=span/fanin;
+  if(!extent.valid || size_t(max(extent.previous,extent.current))<=child_span) return;
+  const int old_children=int((size_t(extent.previous)+child_span-1)/child_span);
+  const int new_children=int((size_t(extent.current)+child_span-1)/child_span);
+  const int count=(max(old_children,new_children)+fanin-1)/fanin;
+  const size_t base=size_t(group)*nodes_per_group,square=size_t(width)*width;
+  for(int node=warp;node<count;node+=warps) {
+    const int old_count=max(0,min(fanin,old_children-node*fanin));
+    const int new_count=max(0,min(fanin,new_children-node*fanin));
+    const size_t child=base+previous_offset+size_t(node)*fanin;
+    const bool child_changed=lane<max(old_count,new_count) && (flags[child+lane]&TreeChanged);
+    const unsigned changes=__ballot_sync(0xffffffff,child_changed);
+    const bool changed=old_count!=new_count || changes!=0;
+    const size_t parent=base+offset+node;
+    if(lane==0) flags[parent]=(changed?TreeChanged:0)|((changed && new_count>1)?TreeMergeQr:0);
+    if(!changed) continue;
+    if(new_count==0) zeroTreeRoot(roots,parent*square,width);
+    else if(new_count==1) {
+      for(int element=lane;element<width*width;element+=32)
+        roots[parent*square+element]=roots[child*square+element];
+    } else {
+      const Task task{child*square,parent*square,new_count*width,width,width,1};
+      if(width==7) qrWarp<7,64>(roots,roots,task);
+      else qrWarp<13,64>(roots,roots,task);
+    }
+  }
+}
+
+__global__ void finishTreeRoots(const double* roots,const unsigned char* flags,
+                                TreeExtent* extents,TreeHistory* history,double* output,
+                                size_t capacity,size_t nodes_per_group,int width) {
+  const int group=blockIdx.x,lane=threadIdx.x;
+  const TreeExtent extent=extents[group];
+  const int fanin=64/width;
+  int count=extent.current;
+  size_t offset=0,level_capacity=capacity?capacity:1;
+  while(count>1) {
+    offset+=level_capacity;
+    level_capacity=(level_capacity+fanin-1)/fanin;
+    count=(count+fanin-1)/fanin;
+  }
+  const size_t node=size_t(group)*nodes_per_group+offset,square=size_t(width)*width;
+  const size_t destination=size_t(group)*(square+1);
+  for(int element=lane;element<width*width;element+=32)
+    output[destination+element]=extent.valid && extent.current?roots[node*square+element]:0.;
+  if(lane==0) {
+    output[destination+square]=extent.valid?0.:1.; // Validation travels with the root download.
+    extents[group].changed=extent.previous!=extent.current ||
+      (extent.current && (flags[node]&TreeChanged));
+    if(extent.valid) history[group]={extent.current,max(extent.initialized,extent.current)};
+  }
+}
 } // namespace
 
 struct BatchedCudaQr::Impl {
@@ -209,6 +315,13 @@ struct BatchedCudaQr::Impl {
   bool incremental_plane=false,incremental_ready=false,incremental_stats_ready=false;
   std::vector<size_t> incremental_previous_active;
   size_t incremental_total_active=0;
+  Buffer<double> tree_roots,tree_output;
+  Buffer<unsigned char> tree_flags;
+  Buffer<TreeHistory> tree_history;
+  Buffer<TreeExtent> tree_extents;
+  std::vector<TreeLevel> tree_levels;
+  size_t tree_capacity=0,tree_groups=0,tree_nodes_per_group=0;
+  bool tree_plane=false,tree_ready=false,tree_stats_ready=false;
   std::vector<Eigen::MatrixXd> run(const std::vector<InputLayout>& input, size_t total,
                                    const double* device_input = nullptr, bool device = false);
   explicit Impl(bool pinned,int first,int reduction,int threads)
@@ -231,6 +344,7 @@ bool BatchedCudaQr::hasInputObserver() { return input_observer!=nullptr; }
 BatchedCudaQr::~BatchedCudaQr() = default;
 void BatchedCudaQr::resetIncremental() {
   impl_->incremental_ready=false; impl_->incremental_stats_ready=false;
+  impl_->tree_ready=false; impl_->tree_stats_ready=false;
 }
 BatchedCudaQr::IncrementalStats BatchedCudaQr::incrementalStats() {
   auto& state=*impl_;
@@ -241,6 +355,160 @@ BatchedCudaQr::IncrementalStats BatchedCudaQr::incrementalStats() {
   check(cudaMemcpyAsync(work,state.incremental_work.data,sizeof(work),cudaMemcpyDeviceToHost,state.stream));
   check(cudaStreamSynchronize(state.stream));
   result.dirty_leaves=work[0]; result.merge_tiles=work[1]; result.changed_groups=work[2];
+  return result;
+}
+
+BatchedCudaQr::IncrementalStats BatchedCudaQr::incrementalTreeStats() {
+  auto& state=*impl_;
+  IncrementalStats result;
+  if(!state.tree_stats_ready || !state.tree_groups) return result;
+  std::vector<TreeExtent> extents(state.tree_groups);
+  std::vector<unsigned char> flags(state.tree_groups*state.tree_nodes_per_group);
+  check(cudaMemcpyAsync(extents.data(),state.tree_extents.data,extents.size()*sizeof(TreeExtent),cudaMemcpyDeviceToHost,state.stream));
+  check(cudaMemcpyAsync(flags.data(),state.tree_flags.data,flags.size(),cudaMemcpyDeviceToHost,state.stream));
+  check(cudaStreamSynchronize(state.stream));
+  const int fanin=64/(state.tree_plane?13:7);
+  for(size_t group=0;group<state.tree_groups;++group) {
+    const auto extent=extents[group];
+    result.active_leaves+=extent.current;
+    result.changed_groups+=extent.changed!=0;
+    const size_t base=group*state.tree_nodes_per_group;
+    const size_t maximum=std::max(extent.previous,extent.current);
+    for(size_t leaf=0;leaf<maximum;++leaf) result.dirty_leaves+=(flags[base+leaf]&TreeLeafQr)!=0;
+    for(size_t level=1;level<state.tree_levels.size();++level) {
+      const auto layout=state.tree_levels[level];
+      if(maximum<=layout.span/fanin) break;
+      const size_t count=(maximum+layout.span-1)/layout.span;
+      for(size_t node=0;node<count;++node)
+        result.merge_tiles+=(flags[base+layout.offset+node]&TreeMergeQr)!=0;
+    }
+  }
+  return result;
+}
+
+std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncrementalTree(
+    const double* packed,const unsigned char* dirty,size_t capacity,size_t groups,
+    const int* highwater,bool plane,void* producer_stream) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::qr_total);
+  auto& state=*impl_;
+  const bool configured=state.tree_capacity==capacity && state.tree_groups==groups &&
+    state.tree_plane==plane && !state.tree_levels.empty();
+  const bool retained=configured && state.tree_ready;
+  state.tree_ready=false; state.tree_stats_ready=false;
+  constexpr size_t limit=std::numeric_limits<int>::max();
+  if(capacity>limit/64 || groups>limit/32 || (groups && capacity>std::numeric_limits<size_t>::max()/groups))
+    throw std::invalid_argument("CUDA incremental tree layout exceeds supported dimensions");
+  if(groups && !highwater) throw std::invalid_argument("CUDA incremental tree extent pointer is null");
+  if(groups && capacity && (!packed || !dirty))
+    throw std::invalid_argument("CUDA incremental tree row or dirty pointer is null");
+  const int width=plane?13:7,fanin=64/width;
+  const size_t square=size_t(width)*width;
+  const size_t allocated=groups*capacity;
+  if(allocated>std::numeric_limits<size_t>::max()/(64*7))
+    throw std::invalid_argument("CUDA incremental tree input layout overflows");
+  addElements(0,allocated*64*7);
+  if(!configured) {
+    std::vector<TreeLevel> levels;
+    size_t count=std::max<size_t>(1,capacity),offset=0,span=1;
+    while(true) {
+      levels.push_back({offset,count,span});
+      offset+=count;
+      if(count==1) break;
+      count=(count+fanin-1)/fanin; span*=fanin;
+    }
+    state.tree_levels=std::move(levels);
+    state.tree_nodes_per_group=offset;
+    // Keep plan identity consistent even if allocation/device validation later
+    // throws. A failed call must never pair an old identity with this new plan.
+    state.tree_capacity=capacity; state.tree_groups=groups; state.tree_plane=plane;
+  }
+  if(groups && state.tree_nodes_per_group>std::numeric_limits<size_t>::max()/groups)
+    throw std::invalid_argument("CUDA incremental tree node layout overflows");
+  const size_t nodes=groups*state.tree_nodes_per_group;
+  if(nodes>std::numeric_limits<size_t>::max()/square || groups>std::numeric_limits<size_t>::max()/(square+1))
+    throw std::invalid_argument("CUDA incremental tree root layout overflows");
+  const size_t root_elements=addElements(0,nodes*square);
+  const size_t output_elements=addElements(0,groups*(square+1));
+  check(cudaEventRecord(state.producer_ready.value,static_cast<cudaStream_t>(producer_stream)));
+  check(cudaStreamWaitEvent(state.stream,state.producer_ready.value,0));
+  state.tree_roots.reserve(std::max<size_t>(1,root_elements));
+  state.tree_output.reserve(std::max<size_t>(1,output_elements));
+  state.tree_flags.reserve(nodes);
+  state.tree_history.reserve(groups); state.tree_extents.reserve(groups);
+  state.host_roots.reserve(std::max<size_t>(1,output_elements));
+  if(!retained) {
+    if(groups) check(cudaMemsetAsync(state.tree_history.data,0,groups*sizeof(TreeHistory),state.stream));
+    if(nodes) check(cudaMemsetAsync(state.tree_flags.data,0,nodes,state.stream));
+    // Roots initialize lazily when a leaf is first activated; no capacity-sized
+    // root clearing or QR launch is needed for empty per-group tails.
+  }
+  if(groups) {
+    prepareTreeExtents<<<1+(groups-1)/256,256,0,state.stream>>>(highwater,state.tree_history.data,
+      state.tree_extents.data,int(groups),int(capacity*64));
+    check(cudaGetLastError());
+    const int threads=state.block_threads,warps=threads/32;
+    auto blocks=[&](size_t count) { return int((std::min<size_t>(32,std::max<size_t>(1,count))+warps-1)/warps); };
+    const int leaf_blocks=blocks(capacity);
+    updateTreeLeaves<<<groups*leaf_blocks,threads,0,state.stream>>>(packed,dirty,state.tree_roots.data,
+      state.tree_flags.data,state.tree_extents.data,capacity,state.tree_nodes_per_group,leaf_blocks,width);
+    check(cudaGetLastError());
+    for(size_t level=1;level<state.tree_levels.size();++level) {
+      const auto layout=state.tree_levels[level];
+      const int level_blocks=blocks(layout.count);
+      updateTreeAncestors<<<groups*level_blocks,threads,0,state.stream>>>(state.tree_roots.data,state.tree_flags.data,
+        state.tree_extents.data,state.tree_nodes_per_group,state.tree_levels[level-1].offset,layout.offset,
+        layout.span,level_blocks,width);
+      check(cudaGetLastError());
+    }
+    finishTreeRoots<<<groups,32,0,state.stream>>>(state.tree_roots.data,state.tree_flags.data,state.tree_extents.data,
+      state.tree_history.data,state.tree_output.data,capacity,state.tree_nodes_per_group,width);
+    check(cudaGetLastError());
+    check(cudaMemcpyAsync(state.host_roots.data,state.tree_output.data,output_elements*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
+  }
+  check(cudaStreamSynchronize(state.stream));
+  for(size_t group=0;group<groups;++group)
+    if(state.host_roots.data[group*(square+1)+square]!=0.)
+      throw std::invalid_argument("CUDA incremental tree highwater exceeds leaf capacity");
+  if(input_observer) {
+    // Explicit diagnostics may inspect producer rows, including clean leaves.
+    std::vector<TreeExtent> extents(groups);
+    if(groups) check(cudaMemcpyAsync(extents.data(),state.tree_extents.data,groups*sizeof(TreeExtent),cudaMemcpyDeviceToHost,state.stream));
+    check(cudaStreamSynchronize(state.stream));
+    size_t rows=0;
+    for(const auto& extent:extents) rows+=size_t(extent.current)*64;
+    state.host_input.reserve(std::max<size_t>(1,rows*7));
+    size_t cursor=0;
+    for(size_t group=0;group<groups;++group) {
+      const size_t count=size_t(extents[group].current)*64*7;
+      if(count) check(cudaMemcpyAsync(state.host_input.data+cursor,packed+group*capacity*64*7,count*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
+      cursor+=count;
+    }
+    check(cudaStreamSynchronize(state.stream));
+    std::vector<Eigen::MatrixXd> observed;
+    cursor=0;
+    for(const auto& extent:extents) {
+      Eigen::MatrixXd expanded(size_t(extent.current)*64,width);
+      for(int leaf=0;leaf<extent.current;++leaf) {
+        const Eigen::Map<const Eigen::Matrix<double,64,7>> compact(state.host_input.data+cursor);
+        if(!plane) expanded.middleRows(leaf*64,64)=compact;
+        else {
+          for(int a=0;a<3;++a) for(int b=0;b<3;++b)
+            expanded.block(leaf*64,3*a+b,64,1)=compact.col(3+a).cwiseProduct(compact.col(b));
+          expanded.block(leaf*64,9,64,3)=compact.middleCols(3,3);
+          expanded.block(leaf*64,12,64,1)=compact.col(6);
+        }
+        cursor+=64*7;
+      }
+      observed.emplace_back(std::move(expanded));
+    }
+    input_observer(observed);
+  }
+  std::vector<Eigen::MatrixXd> result;
+  result.reserve(groups);
+  for(size_t group=0;group<groups;++group)
+    result.emplace_back(Eigen::Map<const Eigen::MatrixXd>(state.host_roots.data+group*(square+1),width,width));
+  state.tree_capacity=capacity; state.tree_groups=groups; state.tree_plane=plane;
+  state.tree_ready=true; state.tree_stats_ready=true;
   return result;
 }
 std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncremental(

@@ -19,15 +19,18 @@ def main():
     parser.add_argument('--config', choices=CONFIGS, default='current')
     parser.add_argument('--limit', type=int, default=250)
     parser.add_argument('--repeats', type=int, default=2)
-    parser.add_argument('--modes', nargs='+', choices=('baseline', 'off', 'audit', 'certified', 'cpu', 'reference', 'blocks', 'combined', 'summary-audit', 'fast', 'split', 'split-fast', 'combined-fast', 'audit-fast'), default=['off', 'certified'])
+    parser.add_argument('--modes', nargs='+', choices=('baseline', 'off', 'audit', 'certified', 'cpu', 'reference', 'blocks', 'combined', 'summary-audit', 'fast', 'split', 'split-fast', 'combined-fast', 'audit-fast', 'tree', 'tree-combined', 'tree-audit'), default=['off', 'certified'])
     parser.add_argument('--diagnostic', action='store_true')
+    parser.add_argument('--stats-only', action='store_true', help='Diagnostic counters/oracles without raw correspondence capture')
     parser.add_argument('--threads', type=int, default=32)
     args = parser.parse_args()
+    if args.stats_only and not args.diagnostic:
+        parser.error('--stats-only requires --diagnostic')
     if args.limit <= 20 or args.repeats < 1 or args.threads < 1:
         parser.error('limit > 20, repeats >= 1, threads >= 1 required')
     if 'baseline' in args.modes and args.baseline is None:
         parser.error('baseline mode requires --baseline')
-    if any(m in args.modes for m in ('audit', 'summary-audit', 'audit-fast')) and not args.diagnostic:
+    if any(m in args.modes for m in ('audit', 'summary-audit', 'audit-fast', 'tree-audit')) and not args.diagnostic:
         parser.error('audit mode is diagnostic, never clean timing')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -42,7 +45,7 @@ def main():
         input_dir = Path('/home/ubuntu/datasets/form-input')
         input_path = input_dir/(args.sequence+'.formpc')
         identity = {'binary': digest(binary), 'input': digest(input_path), 'config': CONFIGS[args.config],
-                    'threads': args.threads, 'limit': args.limit, 'diagnostic': args.diagnostic,
+                    'threads': args.threads, 'limit': args.limit, 'diagnostic': args.diagnostic, 'stats_only': args.stats_only,
                     'runtime_environment': prov['environment'], 'cpu_affinity': prov['cpu_affinity']}
         if args.baseline:
             identity['baseline'] = digest(args.baseline)
@@ -50,13 +53,17 @@ def main():
             modes = args.modes if repeat % 2 == 0 else list(reversed(args.modes))
             for mode in modes:
                 name = f'{args.sequence}-{args.config}-{mode}-r{repeat+1}'
-                os.environ['FORM_CUDA_MATCH_REUSE'] = 'audit' if mode in ('audit', 'summary-audit', 'audit-fast') else ('certified' if mode in ('certified', 'combined', 'fast', 'split', 'split-fast', 'combined-fast') else 'off')
-                os.environ['FORM_CUDA_SUMMARY_REUSE'] = 'audit64' if mode == 'summary-audit' else ('blocks64' if mode in ('blocks', 'combined', 'combined-fast') else 'off')
-                os.environ['FORM_CUDA_MATCH_KERNEL'] = 'split' if mode in ('split', 'split-fast', 'combined-fast', 'audit-fast') else 'fused'
-                os.environ['FORM_CUDA_MATCH_TOP2'] = 'occurrences' if mode in ('fast', 'split-fast', 'combined-fast', 'audit-fast') else 'distinct'
+                os.environ['FORM_CUDA_MATCH_REUSE'] = 'audit' if mode in ('audit', 'summary-audit', 'audit-fast', 'tree-audit') else ('certified' if mode in ('certified', 'combined', 'fast', 'split', 'split-fast', 'combined-fast', 'tree-combined') else 'off')
+                summary_modes = {'summary-audit': 'audit64', 'blocks': 'blocks64', 'combined': 'blocks64', 'combined-fast': 'blocks64', 'tree': 'tree64', 'tree-combined': 'tree64', 'tree-audit': 'audit-tree64'}
+                os.environ['FORM_CUDA_SUMMARY_REUSE'] = summary_modes.get(mode, 'off')
+                os.environ['FORM_CUDA_MATCH_KERNEL'] = 'split' if mode in ('split', 'split-fast', 'combined-fast', 'audit-fast', 'tree-combined', 'tree-audit') else 'fused'
+                os.environ['FORM_CUDA_MATCH_TOP2'] = 'occurrences' if mode in ('fast', 'split-fast', 'combined-fast', 'audit-fast', 'tree-combined', 'tree-audit') else 'distinct'
                 if args.diagnostic and mode not in ('baseline', 'cpu', 'reference'):
                     os.environ['FORM_MATCH_STATS_PATH'] = str(output/(name+'.match-stats.csv'))
-                    os.environ['FORM_MATCH_AUDIT_PATH'] = str(output/(name+'.matches.bin'))
+                    if args.stats_only:
+                        os.environ.pop('FORM_MATCH_AUDIT_PATH', None)
+                    else:
+                        os.environ['FORM_MATCH_AUDIT_PATH'] = str(output/(name+'.matches.bin'))
                 else:
                     os.environ.pop('FORM_MATCH_STATS_PATH', None)
                     os.environ.pop('FORM_MATCH_AUDIT_PATH', None)
@@ -78,17 +85,19 @@ def main():
                 if record['status'] != 'complete':
                     raise RuntimeError(f'failed experiment: {name}')
                 if args.diagnostic and mode not in ('baseline', 'cpu', 'reference'):
-                    audit_path = Path(environment['FORM_MATCH_AUDIT_PATH'])
+                    audit_path = None if args.stats_only else Path(environment['FORM_MATCH_AUDIT_PATH'])
                     stats_path = Path(environment['FORM_MATCH_STATS_PATH'])
-                    if not audit_path.is_file() or audit_path.stat().st_size <= 8 or not stats_path.is_file():
+                    if (audit_path is not None and (not audit_path.is_file() or audit_path.stat().st_size <= 8)) or not stats_path.is_file():
                         raise RuntimeError(f'missing diagnostic capture: {name}; verify executable build')
                     with stats_path.open() as stream:
                         stats = list(csv.DictReader(stream))
                     if not stats or any(int(row['mismatches']) for row in stats):
                         raise RuntimeError(f'empty or failing match audit: {name}')
-                    if mode in ('audit', 'summary-audit', 'audit-fast') and any(int(row['oracle_searched']) != int(row['total']) for row in stats):
+                    if mode in ('audit', 'summary-audit', 'audit-fast', 'tree-audit') and any(int(row['oracle_searched']) != int(row['total']) for row in stats):
                         raise RuntimeError(f'incomplete original-kernel oracle: {name}')
-                    if mode == 'summary-audit' and not sum(int(row['summary_checks']) for row in stats):
+                    if mode == 'tree-audit' and not any(int(row.get('summary_tree', 0)) for row in stats):
+                        raise RuntimeError(f'missing cached-tree path: {name}')
+                    if mode in ('summary-audit', 'tree-audit') and not sum(int(row['summary_checks']) for row in stats):
                         raise RuntimeError(f'missing full summary reconstruction checks: {name}')
         save(output/'experiment.json', {'identity': identity, 'modes': args.modes, 'repeats': args.repeats})
 

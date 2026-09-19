@@ -23,8 +23,11 @@ public:
   struct SummaryStats {
     size_t active_leaves=0, dirty_leaves=0, full_rebuild_checks=0;
     double relative_gram_error=0.;
+    bool tree=false;
   };
   void setIncrementalSummaries(bool enabled);
+  // Select cached ancestor maintenance; enabling this also enables summaries.
+  void setSummaryTree(bool enabled);
   SummaryStats summaryStats();
   struct Voxel { int coords[3]; int begin, count; };
   struct MapPoint { double world[4], local[3], normal[3]; };

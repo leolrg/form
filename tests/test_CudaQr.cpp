@@ -335,3 +335,158 @@ TEST(CudaQr, IncrementalResetConfigurationValidationAndProducerOrdering) {
   roots=qr.computeDevicePackedIncremental(nullptr,nullptr,0,{0,0},false);
   ASSERT_EQ(roots.size(),2); EXPECT_TRUE(roots[0].isZero()); EXPECT_TRUE(roots[1].isZero());
 }
+
+namespace {
+struct TreeFixture : IncrementalFixture {
+  int* highwater=nullptr;
+  int* pinned_highwater=nullptr;
+  std::vector<int> host_highwater;
+  TreeFixture(size_t capacity,size_t groups):IncrementalFixture(capacity*groups),host_highwater(groups,0) {
+    if(cudaMalloc(reinterpret_cast<void**>(&highwater),std::max<size_t>(1,groups)*sizeof(int))!=cudaSuccess)
+      throw std::runtime_error("CUDA tree extent allocation failed");
+    if(cudaMallocHost(reinterpret_cast<void**>(&pinned_highwater),std::max<size_t>(1,groups)*sizeof(int))!=cudaSuccess) {
+      cudaFree(highwater); throw std::runtime_error("CUDA pinned extent allocation failed");
+    }
+  }
+  ~TreeFixture() { cudaStreamSynchronize(producer); cudaFree(highwater); cudaFreeHost(pinned_highwater); }
+  void uploadTree() {
+    upload();
+    std::copy(host_highwater.begin(),host_highwater.end(),pinned_highwater);
+    if(cudaMemcpyAsync(highwater,pinned_highwater,host_highwater.size()*sizeof(int),cudaMemcpyHostToDevice,producer)!=cudaSuccess)
+      throw std::runtime_error("CUDA tree extent upload failed");
+  }
+};
+}
+
+TEST(CudaQr, IncrementalTreeCachesAncestorsAndSurvivesFlatAndDefaultQr) {
+  for(bool plane:{false,true}) {
+    form::BatchedCudaQr qr;
+    constexpr size_t capacity=83;
+    TreeFixture memory(capacity,2);
+    std::vector<Eigen::MatrixXd> leaves;
+    for(size_t leaf=0;leaf<capacity*2;++leaf) {
+      leaves.push_back(Eigen::MatrixXd::Random(64,7)); memory.leaf(leaf,leaves.back());
+    }
+    memory.host_highwater={int(capacity*64),64}; memory.uploadTree();
+    auto roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,capacity,2,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+capacity},plane);
+    expectIncrementalGram(roots[1],{leaves[capacity]},plane);
+    const auto unchanged=roots[1];
+    const auto full_work=qr.incrementalTreeStats();
+    EXPECT_EQ(full_work.dirty_leaves,capacity+1); EXPECT_EQ(full_work.active_leaves,capacity+1);
+
+    // Both older APIs overwrite their shared scratch and host output storage.
+    qr.compute({Eigen::MatrixXd::Random(641,plane?13:7)});
+    qr.computeDevicePackedIncremental(memory.device,memory.dirty,capacity,{capacity,1},plane,memory.producer);
+    leaves[1]*=1.7; memory.leaf(1,leaves[1]);
+    for(size_t leaf=0;leaf<capacity*2;++leaf) if(leaf!=1)
+      memory.leaf(leaf,Eigen::MatrixXd::Constant(64,7,std::numeric_limits<double>::quiet_NaN()));
+    std::fill(memory.host_dirty.begin(),memory.host_dirty.end(),0); memory.host_dirty[1]=1; memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,capacity,2,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+capacity},plane);
+    EXPECT_TRUE(roots[1].isApprox(unchanged,0.));
+    const auto partial=qr.incrementalTreeStats();
+    EXPECT_EQ(partial.dirty_leaves,1); EXPECT_EQ(partial.changed_groups,1);
+    EXPECT_EQ(partial.merge_tiles,plane?4u:3u);
+    EXPECT_LT(partial.merge_tiles,full_work.merge_tiles);
+    memory.host_dirty[1]=0; memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,capacity,2,memory.highwater,plane,memory.producer);
+    EXPECT_EQ(qr.incrementalTreeStats().dirty_leaves,0);
+    EXPECT_EQ(qr.incrementalTreeStats().merge_tiles,0);
+    EXPECT_EQ(qr.incrementalTreeStats().changed_groups,0);
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+capacity},plane);
+  }
+}
+
+TEST(CudaQr, IncrementalTreeExtentChangesZeroHolesAndConfigurationReset) {
+  form::BatchedCudaQr qr;
+  TreeFixture memory(10,3);
+  Eigen::MatrixXd a=Eigen::MatrixXd::Zero(64,7),b=a;
+  a.row(1)<<1.,2.,3.,4.,.1,.2,.3; a.row(7)=a.row(1); b.row(40)=a.row(1)*2.;
+  for(bool plane:{false,true}) {
+    memory.leaf(0,a); memory.leaf(1,b); memory.leaf(10,a);
+    memory.host_highwater={128,64,0}; memory.host_dirty.assign(30,1); memory.uploadTree();
+    auto roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{a,b},plane); expectIncrementalGram(roots[1],{a},plane); EXPECT_TRUE(roots[2].isZero());
+    memory.host_dirty.assign(30,0); memory.host_highwater={64,0,0}; memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{a},plane); EXPECT_TRUE(roots[1].isZero());
+    EXPECT_EQ(qr.incrementalTreeStats().merge_tiles,0); // A single active child is copied, never refactorized.
+    memory.host_highwater={192,64,0}; memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{a,b},plane); // Old leaves survive; first-ever clean leaf starts at zero.
+    expectIncrementalGram(roots[1],{a},plane);
+    memory.leaf(0,Eigen::MatrixXd::Zero(64,7)); memory.host_dirty[0]=1; memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{b},plane);
+    qr.resetIncremental(); memory.host_dirty.assign(30,0); memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,plane,memory.producer);
+    for(const auto& root:roots) EXPECT_TRUE(root.isZero());
+  }
+  memory.host_highwater={-1,0,0}; memory.uploadTree();
+  EXPECT_THROW(qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,false,memory.producer),std::invalid_argument);
+  memory.host_highwater={641,0,0}; memory.uploadTree();
+  EXPECT_THROW(qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,memory.highwater,false,memory.producer),std::invalid_argument);
+  EXPECT_THROW(qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,10,3,nullptr,false),std::invalid_argument);
+  EXPECT_THROW(qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,std::numeric_limits<size_t>::max(),3,memory.highwater,false),std::invalid_argument);
+  EXPECT_TRUE(qr.computeDevicePackedIncrementalTree(nullptr,nullptr,0,0,nullptr,false).empty());
+  memory.host_highwater={0,0,0}; memory.uploadTree();
+  const auto empty=qr.computeDevicePackedIncrementalTree(nullptr,nullptr,0,3,memory.highwater,false,memory.producer);
+  ASSERT_EQ(empty.size(),3); for(const auto& root:empty) EXPECT_TRUE(root.isZero());
+}
+
+TEST(CudaQr, IncrementalTreeWaitsForProducerBeforeReadingRowsAndExtents) {
+  form::BatchedCudaQr qr;
+  TreeFixture memory(2,1);
+  const Eigen::MatrixXd a=Eigen::MatrixXd::Random(64,7);
+  memory.leaf(0,a); memory.host_highwater={64}; memory.uploadTree();
+  qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,2,1,memory.highwater,false,memory.producer);
+  std::atomic<bool> produced{false};
+  ASSERT_EQ(cudaLaunchHostFunc(memory.producer,[](void* p) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30)); static_cast<std::atomic<bool>*>(p)->store(true);
+  },&produced),cudaSuccess);
+  const Eigen::MatrixXd b=(a*3.).eval(); memory.leaf(0,b); memory.leaf(1,a);
+  memory.pinned_highwater[0]=128;
+  ASSERT_EQ(cudaMemcpyAsync(memory.highwater,memory.pinned_highwater,sizeof(int),cudaMemcpyHostToDevice,memory.producer),cudaSuccess);
+  ASSERT_EQ(cudaMemcpyAsync(memory.device,memory.pinned,2*64*7*sizeof(double),cudaMemcpyHostToDevice,memory.producer),cudaSuccess);
+  const auto roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,2,1,memory.highwater,false,memory.producer);
+  EXPECT_TRUE(produced.load()); EXPECT_EQ(cudaStreamQuery(memory.producer),cudaSuccess);
+  expectIncrementalGram(roots[0],{b,a},false);
+}
+
+TEST(CudaQr, IncrementalTreeRecoversAfterFailedDifferentConfiguration) {
+  form::BatchedCudaQr qr;
+  TreeFixture memory(17,1);
+  const Eigen::MatrixXd a=Eigen::MatrixXd::Random(64,7);
+  memory.leaf(0,a); memory.leaf(1,a); memory.host_highwater={128}; memory.uploadTree();
+  qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,17,1,memory.highwater,false,memory.producer);
+  memory.host_highwater={-1}; memory.uploadTree();
+  EXPECT_THROW(qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,17,1,memory.highwater,true,memory.producer),std::invalid_argument);
+  memory.host_highwater={128}; memory.uploadTree();
+  const auto roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,17,1,memory.highwater,false,memory.producer);
+  expectIncrementalGram(roots[0],{a,a},false);
+}
+
+TEST(CudaQr, IncrementalTreeCrossesAncestorHeightsWithCleanReactivation) {
+  for(bool plane:{false,true}) {
+    form::BatchedCudaQr qr;
+    constexpr size_t capacity=83;
+    TreeFixture memory(capacity,1);
+    std::vector<Eigen::MatrixXd> leaves;
+    for(size_t leaf=0;leaf<capacity;++leaf) {
+      leaves.push_back(Eigen::MatrixXd::Random(64,7)); memory.leaf(leaf,leaves.back());
+    }
+    memory.host_highwater={int(capacity*64)}; memory.uploadTree();
+    qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,capacity,1,memory.highwater,plane,memory.producer);
+    memory.host_dirty.assign(capacity,0);
+    for(size_t leaf=0;leaf<capacity;++leaf)
+      memory.leaf(leaf,Eigen::MatrixXd::Constant(64,7,std::numeric_limits<double>::quiet_NaN()));
+    for(int count:{1,4,5,16,17,65,64,9,10,1,0,65,81,82,81}) {
+      memory.host_highwater={count*64}; memory.uploadTree();
+      const auto roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,capacity,1,memory.highwater,plane,memory.producer);
+      expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+count},plane);
+      EXPECT_EQ(qr.incrementalTreeStats().active_leaves,size_t(count));
+      EXPECT_EQ(qr.incrementalTreeStats().dirty_leaves,0);
+    }
+  }
+}

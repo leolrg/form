@@ -51,9 +51,22 @@ public:
       const double* packed, const unsigned char* dirty, size_t leaf_capacity_per_group,
       const std::vector<size_t>& active_leaves, bool plane,
       void* producer_stream = nullptr);
+  /// Cache both leaf roots and their ancestors; no per-call host extent/plan upload.
+  /// Device highwater[group] is a slot extent in [0,capacity*64]; its ceiling in
+  /// units of 64 selects active leaves. Holes within those leaves must be zero.
+  /// Shrunk-away leaves retain their roots for later clean reactivation. Clean
+  /// leaves never previously activated start at zero. Reset, configuration changes,
+  /// and failed calls start a zero cache; mark every populated leaf dirty afterward.
+  /// This cache is independent of ordinary QR and computeDevicePackedIncremental.
+  /// Input remains caller-owned and every read completes before return.
+  std::vector<Eigen::MatrixXd> computeDevicePackedIncrementalTree(
+      const double* packed, const unsigned char* dirty, size_t leaf_capacity_per_group,
+      size_t group_count, const int* device_highwater, bool plane,
+      void* producer_stream = nullptr);
   void resetIncremental();
   /// Latest call's work; device counters are downloaded only on request.
   IncrementalStats incrementalStats();
+  IncrementalStats incrementalTreeStats();
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

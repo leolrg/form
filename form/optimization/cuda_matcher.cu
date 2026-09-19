@@ -455,12 +455,12 @@ __global__ void fillStableRows(const Group* groups,const int* sorted,int stride,
 __global__ void packStableLeaves(const CudaMatcher::MapPoint* points,const CudaMatcher::Query* queries,
                                 const CudaMatcher::Result* results,const int* slots,const int* highwater,
                                 const int* dirty,unsigned char* flags,int stride,bool plane,double* output) {
-  const int g=blockIdx.y,leaf=blockIdx.x;
-  if(leaf*64>=highwater[g]) return;
+  const int g=blockIdx.y;
+  for(int leaf=blockIdx.x;leaf*64<highwater[g];leaf+=gridDim.x) {
   const int node=g*(stride/64)+leaf,row=threadIdx.x;
   const bool changed=dirty[node]!=0;
   if(row==0) flags[node]=changed;
-  if(!changed) return;
+  if(!changed) continue;
   const int q=slots[g*stride+leaf*64+row];
   double v[7]={};
   if(q>=0) {
@@ -476,6 +476,7 @@ __global__ void packStableLeaves(const CudaMatcher::MapPoint* points,const CudaM
     }
   }
   for(int k=0;k<7;++k) output[size_t(node)*64*7+row+k*64]=v[k];
+  }
 }
 }
 struct CudaMatcher::Impl {
@@ -508,7 +509,7 @@ struct CudaMatcher::Impl {
   double width=1.;
   bool ready=false,searched=false;
   BatchedCudaQr qr;
-  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false;
+  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false,summary_tree=false;
   size_t summary_checks=0;
   double summary_relative_error=0.;
   Buffer<int> query_slots,slot_queries,previous_targets,incoming,highwater,dirty_leaves;
@@ -527,9 +528,11 @@ struct CudaMatcher::Impl {
 CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
   if(const char* value=std::getenv("FORM_CUDA_SUMMARY_REUSE")) {
     const std::string mode(value);
-    if(mode=="blocks64" || mode=="audit64") {
-      setIncrementalSummaries(true); impl_->summary_audit=mode=="audit64";
-    } else if(mode!="off") throw std::invalid_argument("Invalid FORM_CUDA_SUMMARY_REUSE (off|blocks64|audit64)");
+    if(mode=="blocks64" || mode=="audit64" || mode=="tree64" || mode=="audit-tree64") {
+      setIncrementalSummaries(true);
+      setSummaryTree(mode=="tree64" || mode=="audit-tree64");
+      impl_->summary_audit=mode=="audit64" || mode=="audit-tree64";
+    } else if(mode!="off") throw std::invalid_argument("Invalid FORM_CUDA_SUMMARY_REUSE (off|blocks64|audit64|tree64|audit-tree64)");
   }
   if(const char* value=std::getenv("FORM_CUDA_MATCH_REUSE")) {
     const std::string mode(value);
@@ -550,12 +553,16 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
 }
 CudaMatcher::~CudaMatcher()=default;
 void CudaMatcher::setIncrementalSummaries(bool enabled) {
-  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false;
+  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false; impl_->summary_tree=false;
+}
+void CudaMatcher::setSummaryTree(bool enabled) {
+  impl_->invalidateSummaries(); impl_->summary_tree=enabled;
+  if(enabled) impl_->incremental_summaries=true;
 }
 CudaMatcher::SummaryStats CudaMatcher::summaryStats() {
   if(!impl_->incremental_summaries || !impl_->summary_valid) return {};
-  const auto stats=impl_->qr.incrementalStats();
-  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error};
+  const auto stats=impl_->summary_tree?impl_->qr.incrementalTreeStats():impl_->qr.incrementalStats();
+  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error,impl_->summary_tree};
 }
 void CudaMatcher::setSearchKernel(SearchKernel kernel) {
   auto& state=*impl_;
@@ -847,7 +854,20 @@ std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packIncremental(const std::vecto
     fillStableRows<<<s.group_count,256,0,s.stream>>>(s.groups.data,s.indices.data,s.slot_stride,
       s.query_slots.data,s.slot_queries.data,s.incoming.data,s.highwater.data,s.dirty_leaves.data);
     check(cudaGetLastError());
-    check(cudaMemcpyAsync(s.host_highwater.data(),s.highwater.data,size_t(s.group_count)*sizeof(int),cudaMemcpyDeviceToHost,s.stream));
+    if(!s.summary_tree)
+      check(cudaMemcpyAsync(s.host_highwater.data(),s.highwater.data,size_t(s.group_count)*sizeof(int),cudaMemcpyDeviceToHost,s.stream));
+  }
+  if(s.summary_tree) {
+    if(s.group_count) {
+      const int grid=std::min(s.slot_stride/64,32);
+      packStableLeaves<<<dim3(grid,s.group_count),64,0,s.stream>>>(s.points.data,s.queries.data,s.results.data,
+        s.slot_queries.data,s.highwater.data,s.dirty_leaves.data,s.dirty_flags.data,s.slot_stride,plane,s.stable_packed.data);
+      check(cudaGetLastError());
+    }
+    auto roots=s.qr.computeDevicePackedIncrementalTree(s.stable_packed.data,s.dirty_flags.data,
+      s.slot_stride/64,s.group_count,s.highwater.data,plane,s.stream);
+    s.summary_valid=true;
+    return roots;
   }
   check(cudaStreamSynchronize(s.stream));
   std::vector<size_t> active;
