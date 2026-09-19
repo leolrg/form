@@ -21,8 +21,8 @@
 ## Tasks
 
 - [x] Inspect branch, processes, dependencies and create isolated research worktree.
-- [ ] Build and test unmodified baseline; freeze executable, build configuration and hash.
-- [ ] Write focused prior-art comparison and mathematical certificate contract.
+- [x] Build and test unmodified baseline; freeze executable, build configuration and hash. All 108 C++ tests pass; frozen SHA256 `cb4fa9d5c9f66e049b7c9666c1be56b66f1cde1591527c8f151cd03d908b6ba2`.
+- [x] Write focused prior-art comparison and mathematical certificate contract. See `docs/certified-rematching-prior-art.md`; Hamerly's assignment certificates plus delta statistics materially narrow the novelty hypothesis.
 - [ ] Add opt-in search audit with failing tests: force a stable match through a small motion, verify audit identifies it, then compare to an independent full-search oracle. Include equal-distance points in different neighbor voxels, crossings that change nearest or first-hit order, nonzero padding, accepted/rejected transitions, ragged resets and stale-state rejection.
 - [ ] Implement conservative certified search under the same contract, test oracle equivalence over adversarial and randomized poses, and run CUDA sanitizers. Record how floating-point bounds ensure a real-arithmetic gap also preserves the actual computed ordering.
 - [ ] Run sequential 250-scan feasibility replays and analyze certificate yield, churn, block locality and first-search overhead. Continue to a full-stairs audit if promising; if weak, investigate entering/leaving candidate-domain bounds before deciding against the approach.
