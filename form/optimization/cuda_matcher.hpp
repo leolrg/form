@@ -24,12 +24,15 @@ public:
   struct SummaryStats {
     size_t active_leaves=0, dirty_leaves=0, full_rebuild_checks=0;
     double relative_gram_error=0.;
-    bool tree=false, bounded=false;
+    bool tree=false, bounded=false, queued=false;
   };
   void setIncrementalSummaries(bool enabled);
   // Select cached ancestor maintenance; enabling this also enables summaries.
   void setSummaryTree(bool enabled);
   void setSummaryTreeBounds(bool enabled);
+  // Queue arrivals per group; insertion order may vary across warps. Requires
+  // incremental summaries. Changing this invalidates cached row slots/roots.
+  void setSummaryRowQueue(bool enabled);
   void setSummaryTreeWarpCap(size_t cap);
   SummaryStats summaryStats();
   struct Voxel { int coords[3]; int begin, count; };
@@ -55,7 +58,9 @@ public:
   // Configuration lasts until reset or the next setGroups call.
   void setGroups(const std::vector<int>& target_groups, size_t group_count);
   // Strict distance < threshold_squared; threshold must be finite and positive.
-  // Stable query order within each group. Downloads only counts and roots.
+  // Full summaries and observers preserve query order. Incremental summaries
+  // preserve the row multiset; queued insertion order may vary across warps.
+  // Downloads only counts and roots.
   GroupedSummary searchGrouped(const std::array<double,12>& world_T_query,
                                double threshold_squared, bool plane);
   // Lazily downloads and caches all results from the latest completed search.

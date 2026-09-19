@@ -39,9 +39,14 @@ MODES = {
     'tree-squared128': ('certified', 'tree64', 'fused', 'occurrences', 'squared', 128, 1),
     'squared-audit': ('audit', 'audit-tree64', 'fused', 'occurrences', 'squared', 128, 1),
 }
+MODES['tree-squared-split128'] = ('certified', 'tree64', 'split', 'occurrences', 'squared', 128, 1)
+MODES = {mode: (*settings, 'sorted') for mode, settings in MODES.items()}
+MODES['queue128'] = (*MODES['tree-bounded128'][:-1], 'queue')
+MODES['queue-combined'] = (*MODES['tree-squared-split128'][:-1], 'queue')
+MODES['queue-audit'] = ('audit', 'audit-tree64', 'split', 'occurrences', 'squared', 128, 1, 'queue')
 ENV_KEYS = ('FORM_CUDA_MATCH_REUSE', 'FORM_CUDA_SUMMARY_REUSE', 'FORM_CUDA_MATCH_KERNEL',
             'FORM_CUDA_MATCH_TOP2', 'FORM_CUDA_MATCH_CERTIFICATE', 'FORM_CUDA_TREE_WARPS',
-            'FORM_CUDA_TREE_BOUNDS')
+            'FORM_CUDA_TREE_BOUNDS', 'FORM_CUDA_SUMMARY_ROWS')
 
 
 def main():
@@ -129,6 +134,8 @@ def main():
                         raise RuntimeError(f'missing cached-tree path: {name}')
                     if MODES[mode][6] and MODES[mode][1] == 'audit-tree64' and not any(int(row.get('summary_bounded', 0)) for row in stats):
                         raise RuntimeError(f'missing bounded-tree path: {name}')
+                    if MODES[mode][7] == 'queue' and not any(int(row.get('summary_queued', 0)) for row in stats):
+                        raise RuntimeError(f'missing queued-summary path: {name}')
                     if MODES[mode][1] in ('audit64', 'audit-tree64') and not sum(int(row['summary_checks']) for row in stats):
                         raise RuntimeError(f'missing full summary reconstruction checks: {name}')
         save(output/'experiment.json', {'identity': identity, 'modes': args.modes, 'repeats': args.repeats})

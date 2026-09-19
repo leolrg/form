@@ -819,3 +819,88 @@ TEST(CudaMatcher, SquaredCertificateEnvironmentSelectionAndValidation) {
   ScopedMatcherEnvironment invalid("FORM_CUDA_MATCH_CERTIFICATE","invalid");
   EXPECT_THROW(CudaMatcher{},std::invalid_argument);
 }
+
+
+TEST(CudaMatcher, SummaryRowQueueHandlesMixedPartialWarpsAndSlotLifetimes) {
+  for(bool plane:{false,true}) for(int backend:{0,1,2}) {
+    CudaMatcher full,queued;
+    full.setIncrementalSummaries(false);
+    queued.setIncrementalSummaries(true); queued.setSummaryTree(backend!=0);
+    queued.setSummaryTreeBounds(backend==2); queued.setSummaryRowQueue(true);
+    for(int count:{0,31,33,64,257,777,33}) {
+      std::vector<CudaMatcher::MapPoint> points;
+      std::vector<CudaMatcher::Query> queries;
+      std::vector<int> groups;
+      for(int i=0;i<count;++i) {
+        const double x=2.*i+.1; const int group=count==64?0:i%3;
+        queries.push_back({{x,.1,.1,0}});
+        points.push_back({{x,.1,.1,0},{x-.02,.15,.2},{.3,.4,.5}}); groups.push_back(group);
+        if(i%7==0 || i%11==0) {
+          points.push_back({{x+.3,.1,.1,0},{x+.27,.2,.25},{.5,.3,.4}});
+          groups.push_back(i%11==0?(group+1)%3:group);
+        }
+      }
+      const std::vector<CudaMatcher::Voxel> voxels={{{0,0,0},0,int(points.size())}};
+      auto reset=[&] {
+        for(auto* m:{&full,&queued}) { m->reset(voxels,points,queries,2000.); m->setGroups(groups,4); }
+      };
+      reset();
+      auto compare=[&](double shift,double gate,bool active) {
+        auto pose=identity_pose; pose[3]=shift;
+        const auto a=queued.searchGrouped(pose,gate,plane),b=full.searchGrouped(pose,gate,plane);
+        ASSERT_EQ(a.counts,b.counts); EXPECT_EQ(queued.summaryStats().queued,active);
+        for(size_t g=0;g<a.roots.size();++g) {
+          const Eigen::MatrixXd aa=a.roots[g].transpose()*a.roots[g],bb=b.roots[g].transpose()*b.roots[g];
+          EXPECT_LE((aa-bb).norm(),1e-11*(1+bb.norm()));
+          Eigen::VectorXd probe=Eigen::VectorXd::LinSpaced(a.roots[g].cols(),-.4,.6);
+          EXPECT_NEAR((a.roots[g]*probe).squaredNorm(),(b.roots[g]*probe).squaredNorm(),1e-10*(1+bb.norm()));
+        }
+        const auto ar=queued.downloadResults(),br=full.downloadResults();
+        ASSERT_EQ(ar.size(),br.size());
+        for(size_t i=0;i<ar.size();++i) { EXPECT_EQ(ar[i].index,br[i].index); EXPECT_EQ(ar[i].distance,br[i].distance); }
+      };
+      for(int iteration=0;iteration<9;++iteration) compare(iteration%3?.2:0.,iteration%5==4?1e-5:1.,true);
+      compare(0.,1.,true); compare(0.,1.,true); EXPECT_EQ(queued.summaryStats().dirty_leaves,0u);
+      queued.setSummaryRowQueue(false); compare(.2,1.,false);
+      queued.setSummaryRowQueue(true); compare(.2,1.,true);
+      EXPECT_THROW(queued.searchGrouped(identity_pose,0.,plane),std::invalid_argument);
+      compare(0.,1.,true);
+      for(auto& p:points) { p.local[0]+=.17; p.normal[1]*=.7; }
+      reset(); compare(.2,1.,true);
+      groups.assign(points.size(),-1);
+      for(auto* m:{&full,&queued}) m->setGroups(groups,4);
+      compare(0.,1.,true);
+    }
+    queued.reset({}, {},std::vector<CudaMatcher::Query>(33),1.);
+    queued.setGroups({},0);
+    const auto empty=queued.searchGrouped(identity_pose,1.,plane);
+    EXPECT_TRUE(empty.counts.empty()); EXPECT_TRUE(empty.roots.empty());
+    EXPECT_TRUE(queued.summaryStats().queued);
+  }
+}
+
+TEST(CudaMatcher, SummaryRowQueueEnvironmentAuditAndObserverFallback) {
+  ScopedMatcherEnvironment reuse("FORM_CUDA_SUMMARY_REUSE","audit-tree64");
+  ScopedMatcherEnvironment rows("FORM_CUDA_SUMMARY_ROWS","queue");
+  CudaMatcher matcher;
+  matcher.reset({{{0,0,0},0,2}},{{{.1,.1,.1,0},{.1,.1,.1},{.3,.4,.5}},{{.8,.1,.1,0},{.8,.1,.1},{.5,.4,.3}}},
+    {{{.1,.1,.1,0}},{{.8,.1,.1,0}},{{.12,.1,.1,0}}},1.);
+  matcher.setGroups({0,1},2);
+  for(bool plane:{false,true}) {
+    matcher.searchGrouped(identity_pose,1.,plane);
+    EXPECT_TRUE(matcher.summaryStats().queued); EXPECT_EQ(matcher.summaryStats().full_rebuild_checks,2u);
+    {
+      GroupedInputCapture capture;
+      matcher.searchGrouped(identity_pose,1.,plane);
+      EXPECT_FALSE(matcher.summaryStats().queued);
+      ASSERT_EQ(grouped_inputs.size(),2u); EXPECT_EQ(grouped_inputs[0].rows(),2);
+      EXPECT_EQ(grouped_inputs[0](0,plane?0:4),plane?.03:0.);
+      EXPECT_NEAR(grouped_inputs[0](1,plane?0:4),plane?.036:.02,1e-15);
+    }
+    matcher.searchGrouped(identity_pose,1.,plane); EXPECT_TRUE(matcher.summaryStats().queued);
+  }
+  { ScopedMatcherEnvironment sorted("FORM_CUDA_SUMMARY_ROWS","sorted"); CudaMatcher valid; }
+  { ScopedMatcherEnvironment invalid("FORM_CUDA_SUMMARY_ROWS","invalid"); EXPECT_THROW(CudaMatcher{},std::invalid_argument); }
+  matcher.setIncrementalSummaries(false);
+  matcher.searchGrouped(identity_pose,1.,false); EXPECT_FALSE(matcher.summaryStats().queued);
+}
