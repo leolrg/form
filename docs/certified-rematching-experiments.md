@@ -545,3 +545,92 @@ Validation completed before measurement:
 Logs are retained in `validation-v8/`. Full 1,190-scan same-input audit and clean
 current/dense/window ablations are the next measurements, not implied by these
 unit and sanitizer results.
+
+### V8 full-stairs audit
+
+`audit-v8-full/` processes **all 1,190 scans**, including warmup, with independent
+original-search and fresh-summary oracles:
+
+- 308,516,696 queries/oracle comparisons, **zero mismatches**.
+- 242,513,013 certified queries (78.61% of all queries, including first searches;
+  84.74% of the 286,184,841 subsequent-rematch queries). Subsequent matches
+  actually retain their nearest index 96.52% of the time; certification is
+  deliberately conservative. Cell fallback is only 0.407% of subsequent queries.
+- 925,510 fresh-root comparisons; maximum normalized feature-Gram error
+  **2.82910e-15**.
+- 2,970,485 dirty leaves out of 5,365,452 active leaves (55.36%).
+- 32,896 compact calls; 6,552 task-plan refreshes; 14,715,868 metadata bytes
+  uploaded across the complete replay.
+- Matching/feature/pose/iteration counts agree with the off replay. Maximum
+  translation difference is 5.80e-13 m. Audit substitutes full roots downstream;
+  clean runs separately test actual cached-root feedback.
+- GPU sampled peaks: off 460 MiB; compact audit 552 MiB, sampled every 0.25 s.
+  These include CUDA context/allocator reservations and audit buffers, and can
+  miss short allocations. They are not clean production memory deltas.
+
+Full-stairs realized workload averages 27.54 poses and 267,627 point-plus-plane
+correspondences per scan, versus 14.13 poses and 168,122 correspondences on the
+250-scan prefix. Full-sequence results must therefore be measured directly.
+Diagnostic latency is not a performance result.
+
+### V8 current-prefix screening
+
+Two reversed-order clean repetitions, same first 250 stairs scans:
+
+| Mode | Mean total ms/scan | Mean matching ms/scan |
+| --- | ---: | ---: |
+| Off |27.099|8.796|
+| Squared/split search only |27.607|8.503|
+| Compact sorted summaries only |28.054|9.463|
+| Search + compact sorted summaries |26.870|8.627|
+| Compact queued summaries only |26.855|8.737|
+| Search + compact queued summaries |27.868|8.619|
+
+Artifacts: `clean-v8-current/`. Counts agree for all runs, with maximum
+translation difference 2.75e-13 m. This is **not a demonstrated end-to-end win**.
+For example, search-only total time is 26.733/28.481 ms in its two repeats,
+while off is 26.820/27.379 ms. The combined queued path is
+28.538/27.199 ms. Matching-stage means also vary across repeats.
+
+Queued summary maintenance avoids the sort and has lower summary-only stage
+cost than sorted maintenance in this screen. It is selected for the matched
+full/scaled four-way tests; that choice is not a claim of reliable total savings.
+The combined path must outperform search-only to justify partial summaries.
+
+### V8 full-stairs clean four-way comparison
+
+`clean-v8-full/`, all 1,190 scans, two reversed-order repetitions:
+
+| Mode | All-scan mean total ms | Post-warmup mean total ms | Post-warmup mean matching ms |
+| --- | ---: | ---: | ---: |
+| Off |43.906|42.991|12.473|
+| Squared/split search only |42.298|41.394|11.037|
+| Compact queued summaries only |43.686|42.749|12.415|
+| Search + compact queued summaries |43.316|42.429|11.446|
+
+Post-warmup excludes scans0–19; correctness includes every scan. Search-only
+improves total latency in both repeats (40.134/42.654ms versus
+42.177/43.804ms). Combined summaries are2.50% slower than search-only on average.
+All workload/iteration counts agree, maximum translation difference6.90e-13m.
+Thus the broader sequence supports modest search-only savings, but does not
+establish an additional benefit from partial summary maintenance.
+
+### V8 dense-feature scaling with CPU controls
+
+`scale-v8-features/`, same first250 scans, two reversed-order repetitions:
+
+| Backend/mode | Post-warmup total ms | Post-warmup matching ms |
+| --- | ---: | ---: |
+| Existing GPU/off |48.721|20.464|
+| GPU search-only |45.881|17.456|
+| GPU partial compact QR only |50.230|21.266|
+| GPU combined |47.010|18.279|
+| Improved CPU |228.020|170.770|
+| Original FORM CPU |337.647|187.215|
+
+The denser setting realizes493,474 average correspondences (2.94x current) and
+14.26 average poses. All workload/iteration counts agree. Maximum translation
+difference across CPU/GPU runs is8.89e-12m. Search-only improves total latency in
+both repeats (45.803/45.959 versus49.152/48.289ms). Its mean gain is5.83%; combined
+partial summaries are2.46% slower than search-only. This supports a useful but
+modest search optimization and another negative partial-summary result.
