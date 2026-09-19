@@ -94,6 +94,16 @@ the old leaf; arriving rows fill first-available holes and dirty destination
 leaves. Empty slots contribute zero feature rows. Snapshot/group/feature-kind
 changes invalidate the state rather than mixing incompatible rows.
 
+The sorted variant obtains incoming rows from a stable grouped radix sort.
+The queued variant instead reserves incoming queue segments with warp-aggregated
+integer atomics. Removal/enqueue and first-hole filling remain separate kernels
+on one stream, so arrivals cannot overwrite rows before departures finish.
+It skips global sorting only for ordinary incremental operation; full-QR audits
+and raw-row observers retain the original sorted path. Queue reservation order
+is nondeterministic. This changes slot/QR ordering, not nearest-neighbor IDs or
+the per-group feature-row multiset, and requires separate numerical and timing
+validation. It does not add a deterministic-execution guarantee.
+
 A leaf stores a Householder QR root of its feature rows. For feature matrix `F`
 and cached root `U`, the invariant in real arithmetic is `U^T U = F^T F`.
 An internal node stores the QR root of its children's stacked roots, so its

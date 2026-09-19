@@ -459,3 +459,48 @@ plans are another follow-up for overlaunching small groups under a global cap.
 Only 61 of 4,486 post-warmup V6 audit summary calls have zero dirty leaves,
 representing 83,471 of roughly42 million queries. An all-unchanged fast path has
 few opportunities in this trace; it is not a substitute for partial updates.
+
+## V7: queue incoming rows
+
+Revision `d195679`, frozen binary SHA256
+`ec278c2623d53ff1e0f0093b152a34d6fb7deee8e38cc536a2fe53cdafe7f13a`.
+The optional queue path enqueues only accepted queries without a current slot,
+then fills first holes in a separate kernel. It removes the ordinary rematch's
+radix sort, incoming-row compaction, and group descriptor upload. Full QR audits
+and observers keep their original sorting. Queue order can vary, so this is not
+a bitwise trajectory-equivalence claim. Sorted rows remain the default.
+
+All 125 main, 2 parallel, and 9 scalar tests pass. Six queued search configurations
+pass. Two dedicated tests cover partial warps, mixed groups, no/full arrivals,
+migration, rejection, reinsertion, multichunk filling, reset/failure/toggling,
+observer order, and full-QR audit. They pass memcheck, device initcheck, and
+racecheck with zero findings on SM80. A compile-time scalar-atomic fallback is
+provided for pre-SM70 targets; installed CUDA13 rejects compute_60 before source
+compilation, so that compatibility path is not verified here.
+
+`audit-v7` checks 45,285,082 searches with zero mismatches and 66,386 fresh-root
+comparisons, maximum normalized Gram error 2.55743e-15. All 4,834 summary calls
+report queued mode. There are 480,279 dirty leaves out of 748,395 active-leaf
+observations, versus 478,820 dirty leaves in V5's sorted audit: approximately0.3%
+more dirty leaves, including warmup. Different queue/feature ordering can change
+this count across executions. This is a correctness/churn result, not timing.
+
+V7 clean comparison (`clean-v7-current`), same two-repeat protocol:
+
+| Variant | Total ms/scan | Matching ms/scan |
+| --- | ---: | ---: |
+| Off | 27.595 | 9.025 |
+| Split squared search | 27.055 | 8.274 |
+| Bounded tree128, sorted rows | 26.767 | 9.013 |
+| Bounded tree128 + split squared search, sorted | 26.422 | 8.278 |
+| Bounded tree128, queued rows | 27.897 | 9.022 |
+| Bounded tree128 + split squared search, queued | 26.951 | 8.110 |
+
+All workload counts agree; maximum translation difference is 2.57e-13 m.
+Queuing does not establish a further end-to-end improvement in this screening
+run. Search-only total varies from 25.997 to28.113 ms; its matching time varies
+from8.022 to8.527 ms. Combined queued matching is7.871/8.349 ms, but total is
+26.330/27.572 ms. These fluctuations make small total-time rankings inconclusive.
+The stable finding remains that search work falls while partial-summary overhead
+largely consumes its own QR savings. Compact task scheduling and broader workload
+comparisons remain outstanding.
