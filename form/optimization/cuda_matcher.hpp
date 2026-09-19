@@ -9,11 +9,15 @@ namespace form {
 class CudaMatcher {
 public:
   enum class ReuseMode { Disabled, Audit, Certified };
+  enum class SearchKernel { Fused, Split };
   struct ReuseStats {
     unsigned long long total=0, certified=0, searched=0, cell_fallback=0, gap_fallback=0;
-    unsigned long long unchanged=0, mismatches=0, oracle_searched=0;
+    unsigned long long unchanged=0, mismatches=0, oracle_searched=0, split_queries=0;
   };
   void setReuseMode(ReuseMode mode);
+  // Research ablations; both setters invalidate existing certificates.
+  void setSearchKernel(SearchKernel kernel);
+  void setOccurrenceBound(bool enabled);
   // Statistics for the latest search; downloads only when requested.
   ReuseStats reuseStats();
   struct SummaryStats {

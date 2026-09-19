@@ -36,6 +36,44 @@ feedback. Including warmup:
 These establish correctness evidence and actual partial work, not speed. Clean
 four-way off/search-only/summary-only/combined ablations follow separately.
 
+### V3 clean ablation: initial maintenance costs exceed savings
+
+Two reversed-order repetitions on the same current 250-scan prefix:
+
+| Mode | Mean total ms/scan | Mean matching-stage ms/scan |
+| --- | --- | --- |
+| Both disabled | 27.284 | 8.673 |
+| Certified search only | 27.530 | 8.805 |
+| Partial leaf summaries only | 27.517 | 9.682 |
+| Both enabled | 29.288 | 10.129 |
+
+Artifacts: `clean-v3-current/`. This is another **negative performance result**;
+the summary-only total is approximately flat, while its matching stage is slower.
+Extraction and other stage variation must not be attributed to the summary method.
+
+A separate partial-summary trace (`trace-v3/blocks.json`) measures these kernels
+on scans 20–249:
+
+| Kernel family | ms/scan |
+| --- | --- |
+| Original nearest search | 1.922 |
+| Mark changed rows | 0.052 |
+| Fill stable slots | 0.363 |
+| Pack dirty leaves | 0.074 |
+| Dirty leaf QR | 0.418 |
+| Rebuild affected groups' merges | 1.057 |
+| Retain group roots | 0.066 |
+
+Thus the partial QR kernels total 1.540 ms, compared to 1.408 ms for the earlier
+full-QR trace. Leaf savings alone are insufficient. Partial QR also incurs
+2.619 ms of host CUDA API time (inclusive/overlapping device time), versus 1.977 ms
+for full QR; slot maintenance adds 1.246 ms of API time under `match_pack`.
+Both QR tile kernels use 80 registers without spills, so register occupancy alone
+does not explain the difference. V3 includes global work-counter atomics,
+per-call descriptor planning/uploads, and rebuilding all ancestor merges in an
+affected group. The next prototype caches internal tree nodes and removes that
+host planning/transfer path; it must be measured before any gain is claimed.
+
 ## Baseline and verification
 
 The clean baseline passed all 108 C++ tests. Frozen executable SHA256:

@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace form {
 namespace {
@@ -131,7 +132,7 @@ struct SearchAnchor {
   bool empty,valid;
 };
 enum ReuseFlag : unsigned char { Certified=1, Searched=2, CellFallback=4,
-  GapFallback=8, Unchanged=16, Mismatch=32, OracleSearched=64 };
+  GapFallback=8, Unchanged=16, Mismatch=32, OracleSearched=64, InvalidQuery=128 };
 __device__ double exactDistance(const double* points,size_t stride,int j,
                                 const double* world,double padding) {
   const double dx=points[j]-world[0],dy=points[stride+j]-world[1];
@@ -177,13 +178,15 @@ struct RankedPair {
   }
 };
 
-__global__ void nearestReuse(const Bucket* buckets,int mask,const double* __restrict__ points,size_t point_stride,
-                        const CudaMatcher::Query* queries,int count,double width,Pose pose,
-                        CudaMatcher::Result* results,SearchAnchor* anchors,unsigned char* flags,
-                        bool anchors_valid,bool audit) {
-  const int lane=threadIdx.x%32;
-  const int i=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
-  if(i>=count) return; // Whole warp exits, including the final partial block.
+// One thread owns one certificate, so a warp evaluates 32 queries. It never
+// mutates anchors: Audit still needs the previous index, and all retained bounds
+// must remain tied to the last uncertified full search.
+__global__ void certifyQueries(const double* __restrict__ points,size_t point_stride,
+                               const CudaMatcher::Query* queries,int count,double width,Pose pose,
+                               const SearchAnchor* anchors,CudaMatcher::Result* results,
+                               unsigned char* flags) {
+  const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
   const auto q=queries[i];
   double world[3],coords[3];
   for(int axis=0;axis<3;++axis) {
@@ -191,17 +194,15 @@ __global__ void nearestReuse(const Bucket* buckets,int mask,const double* __rest
     world[axis]=((r[0]*q.point[0]+r[1]*q.point[1])+r[2]*q.point[2])+r[3];
     coords[axis]=floor(world[axis]/width);
     if(!isfinite(coords[axis]) || coords[axis]<-2147483647. || coords[axis]>2147483646.) {
-      if(lane==0) { results[i]={0.,-2}; flags[i]=Searched; }
+      results[i].distance=0.; results[i].index=-2; flags[i]=Searched|InvalidQuery;
       return;
     }
   }
-  const int x=int(coords[0]), y=int(coords[1]), z=int(coords[2]);
-  const double maximum=__longlong_as_double(0x7fefffffffffffffLL);
+  const int x=int(coords[0]),y=int(coords[1]),z=int(coords[2]);
   unsigned char status=0;
   bool certified=false;
-  CudaMatcher::Result reused{maximum,-1};
-  // Lane zero alone evaluates the bound and cached point; the warp branches uniformly.
-  if(lane==0 && anchors_valid && anchors[i].valid) {
+  CudaMatcher::Result reused{__longlong_as_double(0x7fefffffffffffffLL),-1};
+  if(anchors[i].valid) {
     const SearchAnchor& anchor=anchors[i];
     const bool same_cell=anchor.cell[0]==x && anchor.cell[1]==y && anchor.cell[2]==z;
     if(!same_cell) status|=CellFallback;
@@ -214,10 +215,66 @@ __global__ void nearestReuse(const Bucket* buckets,int mask,const double* __rest
     }
     if(certified) status|=Certified;
   }
-  certified=__shfl_sync(0xffffffff,int(certified),0);
-  if(certified && !audit) {
-    if(lane==0) { results[i]=reused; flags[i]=status; anchors[i].previous_index=reused.index; }
-    return;
+  if(certified) { results[i].distance=reused.distance; results[i].index=reused.index; }
+  flags[i]=status;
+}
+
+template<bool Occurrences,bool Split>
+__global__ void nearestReuse(const Bucket* buckets,int mask,const double* __restrict__ points,size_t point_stride,
+                        const CudaMatcher::Query* queries,int count,double width,Pose pose,
+                        CudaMatcher::Result* results,SearchAnchor* anchors,unsigned char* flags,
+                        bool anchors_valid,bool audit) {
+  const int lane=threadIdx.x%32;
+  const int i=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+  if(i>=count) return; // Whole warp exits, including the final partial block.
+  const double maximum=__longlong_as_double(0x7fefffffffffffffLL);
+  unsigned char status=0;
+  bool certified=false;
+  CudaMatcher::Result reused{maximum,-1};
+  if constexpr(Split) {
+    status=flags[i];
+    if(status&InvalidQuery) return; // Prepass already emitted the original -2 result.
+    certified=status&Certified;
+    if(certified) {
+      if(lane==0) { reused.distance=results[i].distance; reused.index=results[i].index; }
+      if(!audit) {
+        if(lane==0) anchors[i].previous_index=reused.index;
+        return; // Certified warps avoid even repeating the transform.
+      }
+    }
+  }
+  const auto q=queries[i];
+  double world[3],coords[3];
+  for(int axis=0;axis<3;++axis) {
+    const double* r=pose.matrix+4*axis;
+    world[axis]=((r[0]*q.point[0]+r[1]*q.point[1])+r[2]*q.point[2])+r[3];
+    coords[axis]=floor(world[axis]/width);
+    if(!isfinite(coords[axis]) || coords[axis]<-2147483647. || coords[axis]>2147483646.) {
+      if(lane==0) { results[i]={0.,-2}; flags[i]=Searched; }
+      return;
+    }
+  }
+  const int x=int(coords[0]), y=int(coords[1]), z=int(coords[2]);
+  if constexpr(!Split) {
+    // Lane zero alone evaluates the bound and cached point; the warp branches uniformly.
+    if(lane==0 && anchors_valid && anchors[i].valid) {
+      const SearchAnchor& anchor=anchors[i];
+      const bool same_cell=anchor.cell[0]==x && anchor.cell[1]==y && anchor.cell[2]==z;
+      if(!same_cell) status|=CellFallback;
+      else {
+        const bool identical=world[0]==anchor.world[0] && world[1]==anchor.world[1] && world[2]==anchor.world[2];
+        reused.index=anchor.index;
+        if(reused.index>=0) reused.distance=exactDistance(points,point_stride,reused.index,world,q.point[3]);
+        certified=identical || anchor.empty || (anchor.index>=0 && gapCertified(anchor,world,reused.distance));
+        if(!certified) status|=GapFallback;
+      }
+      if(certified) status|=Certified;
+    }
+    certified=__shfl_sync(0xffffffff,int(certified),0);
+    if(certified && !audit) {
+      if(lane==0) { results[i]=reused; flags[i]=status; anchors[i].previous_index=reused.index; }
+      return;
+    }
   }
   RankedPair pair{maximum,maximum,~0ULL,~0ULL};
   // Independent hash probes occupy 27 lanes instead of serializing every
@@ -246,15 +303,28 @@ __global__ void nearestReuse(const Bucket* buckets,int mask,const double* __rest
       const double dx=points[j]-world[0],dy=points[point_stride+j]-world[1];
       const double dz=points[2*point_stride+j]-world[2],dw=points[3*point_stride+j]-q.point[3];
       const double distance=(dx*dx+dz*dz)+(dy*dy+dw*dw);
-      pair.insert(distance,(static_cast<unsigned long long>(n)<<32)|unsigned(j));
+      const auto candidate=(static_cast<unsigned long long>(n)<<32)|unsigned(j);
+      if constexpr(Occurrences) {
+        // Second-smallest occurrence is a lower bound for every distinct
+        // competitor, even if explicit voxel ranges repeat the winner index.
+        pair.second=fmin(pair.second,fmax(pair.best,distance));
+        if(distance<pair.best) { pair.best=distance; pair.rank=candidate; }
+      } else pair.insert(distance,candidate);
     }
   }
   for(int shift=16;shift;shift/=2) {
     const double other=__shfl_down_sync(0xffffffff,pair.best,shift);
     const auto other_rank=__shfl_down_sync(0xffffffff,pair.rank,shift);
     const double other_second=__shfl_down_sync(0xffffffff,pair.second,shift);
-    const auto other_second_rank=__shfl_down_sync(0xffffffff,pair.second_rank,shift);
-    pair.insert(other,other_rank); pair.insert(other_second,other_second_rank);
+    if constexpr(Occurrences) {
+      pair.second=fmin(fmin(pair.second,other_second),fmax(pair.best,other));
+      if(other<pair.best || (other==pair.best && other_rank<pair.rank)) {
+        pair.best=other; pair.rank=other_rank;
+      }
+    } else {
+      const auto other_second_rank=__shfl_down_sync(0xffffffff,pair.second_rank,shift);
+      pair.insert(other,other_rank); pair.insert(other_second,other_second_rank);
+    }
   }
   if(lane==0) {
     const CudaMatcher::Result result{pair.best,pair.rank==~0ULL?-1:int(unsigned(pair.rank))};
@@ -422,6 +492,8 @@ struct CudaMatcher::Impl {
   Buffer<unsigned char> reuse_flags;
   CudaMatcher::ReuseMode reuse_mode=CudaMatcher::ReuseMode::Disabled;
   bool anchors_valid=false,stats_ready=false;
+  CudaMatcher::SearchKernel search_kernel=CudaMatcher::SearchKernel::Fused;
+  bool occurrence_bound=false,split_prepass=false;
   Buffer<int> indices;
   Buffer<Group> groups;
   Buffer<double> packed;
@@ -465,6 +537,16 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
     else if(mode=="certified") setReuseMode(ReuseMode::Certified);
     else if(mode!="off") throw std::invalid_argument("Invalid FORM_CUDA_MATCH_REUSE (off|audit|certified)");
   }
+  if(const char* value=std::getenv("FORM_CUDA_MATCH_KERNEL")) {
+    const std::string kernel(value);
+    if(kernel=="split") setSearchKernel(SearchKernel::Split);
+    else if(kernel!="fused") throw std::invalid_argument("Invalid FORM_CUDA_MATCH_KERNEL (fused|split)");
+  }
+  if(const char* value=std::getenv("FORM_CUDA_MATCH_TOP2")) {
+    const std::string bound(value);
+    if(bound=="occurrences") setOccurrenceBound(true);
+    else if(bound!="distinct") throw std::invalid_argument("Invalid FORM_CUDA_MATCH_TOP2 (distinct|occurrences)");
+  }
 }
 CudaMatcher::~CudaMatcher()=default;
 void CudaMatcher::setIncrementalSummaries(bool enabled) {
@@ -474,6 +556,16 @@ CudaMatcher::SummaryStats CudaMatcher::summaryStats() {
   if(!impl_->incremental_summaries || !impl_->summary_valid) return {};
   const auto stats=impl_->qr.incrementalStats();
   return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error};
+}
+void CudaMatcher::setSearchKernel(SearchKernel kernel) {
+  auto& state=*impl_;
+  state.anchors_valid=false; state.stats_ready=false;
+  if(kernel!=SearchKernel::Fused && kernel!=SearchKernel::Split)
+    throw std::invalid_argument("Invalid CUDA search kernel");
+  state.search_kernel=kernel;
+}
+void CudaMatcher::setOccurrenceBound(bool enabled) {
+  impl_->anchors_valid=false; impl_->stats_ready=false; impl_->occurrence_bound=enabled;
 }
 void CudaMatcher::setReuseMode(ReuseMode mode) {
   auto& s=*impl_;
@@ -486,7 +578,7 @@ CudaMatcher::ReuseStats CudaMatcher::reuseStats() {
   auto& s=*impl_;
   ReuseStats stats;
   if(!s.stats_ready) return stats;
-  stats.total=s.count;
+  stats.total=s.count; stats.split_queries=s.split_prepass?s.count:0;
   if(s.reuse_mode==ReuseMode::Disabled) { stats.searched=s.count; return stats; }
   std::vector<unsigned char> flags(s.count);
   if(s.count) check(cudaMemcpyAsync(flags.data(),s.reuse_flags.data,s.count,cudaMemcpyDeviceToHost,s.stream));
@@ -571,7 +663,7 @@ void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_search_launch);
   auto& s=*this;
   const bool anchors_valid=s.anchors_valid;
-  s.anchors_valid=false; s.stats_ready=false;
+  s.anchors_valid=false; s.stats_ready=false; s.split_prepass=false;
   s.searched=false; s.host_results_ready=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before search");
   for(auto v:matrix) if(!std::isfinite(v)) throw std::invalid_argument("Nonfinite CUDA query pose");
@@ -584,8 +676,26 @@ void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
       nearest<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data);
     } else {
       s.anchors.reserve(s.count); s.reuse_flags.reserve(s.count);
-      nearestReuse<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data,
-        s.anchors.data,s.reuse_flags.data,anchors_valid,s.reuse_mode==ReuseMode::Audit);
+      // The first full search cannot certify anything; omit the split prepass.
+      s.split_prepass=s.search_kernel==SearchKernel::Split && anchors_valid;
+      if(s.split_prepass) {
+        certifyQueries<<<1+(s.count-1)/128,128,0,s.stream>>>(s.search_positions.data,s.point_stride,
+          s.queries.data,s.count,s.width,pose,s.anchors.data,s.results.data,s.reuse_flags.data);
+        check(cudaGetLastError());
+      }
+      auto launch=[&](auto occurrences,auto split) {
+        nearestReuse<decltype(occurrences)::value,decltype(split)::value>
+          <<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,
+          s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data,
+          s.anchors.data,s.reuse_flags.data,anchors_valid,s.reuse_mode==ReuseMode::Audit);
+      };
+      if(s.occurrence_bound) {
+        if(s.split_prepass) launch(std::true_type{},std::true_type{});
+        else launch(std::true_type{},std::false_type{});
+      } else {
+        if(s.split_prepass) launch(std::false_type{},std::true_type{});
+        else launch(std::false_type{},std::false_type{});
+      }
       check(cudaGetLastError());
       if(s.reuse_mode==ReuseMode::Audit) {
         s.oracle_results.reserve(s.count);

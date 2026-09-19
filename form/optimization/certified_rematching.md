@@ -106,3 +106,61 @@ top-two comparisons and warp shuffles on each full search, and directed arithmet
 for each attempted certificate. Only lane zero evaluates the predicate and reads
 the cached point. No speedup follows merely from a high unchanged-index fraction;
 benchmarking must account for first-search overhead and inconclusive certificates.
+
+## Search-kernel and competitor-bound ablations
+
+Two independent opt-in controls retain the original fused/distinct implementation
+as the default:
+
+- `setSearchKernel(SearchKernel::Fused|Split)`, or
+  `FORM_CUDA_MATCH_KERNEL=fused|split`.
+- `setOccurrenceBound(false|true)`, or
+  `FORM_CUDA_MATCH_TOP2=distinct|occurrences`.
+
+Both setters invalidate existing anchors, even when setting the same value.
+Disabled reuse continues to invoke the untouched original search kernel regardless
+of these controls. Invalid environment values are rejected.
+
+The split variant evaluates one certificate per thread, with 32 query certificates
+per warp. Its prepass writes flags and a current winner result only; it does not
+modify any anchor or previous index. The subsequent full-search kernel is ordered
+on the same stream. In Certified mode its certified warps return before repeating
+the transform or performing neighbor probes. Invalid prepass coordinates retain
+the original -2 result. In Audit mode every valid query still executes full search,
+checks the prepass candidate, and is independently checked by the untouched oracle.
+The first search after invalidation omits the prepass entirely. `split_queries`
+counts queries actually passed through this separate certificate kernel.
+
+The occurrence variant keeps the original winner reduction exactly: within each
+lane the first strictly smaller computed distance wins; across lanes the minimum
+(distance, visit rank) wins. It replaces distinct-index top-two tracking with the
+two smallest clamped computed distances over *all candidate occurrences*. For a
+new distance d and old local values b,s, the update is
+
+    s' = min(s, max(b,d));    b' = min(b,d).
+
+For two partial pairs (a1,a2) and (b1,b2), the merged second distance is
+
+    min(a2, b2, max(a1,b1)).
+
+Use the pre-merge best values in this expression. DBL_MAX initialization acts as
+sentinel padding; infinite and exact-DBL_MAX distances do not create a selectable
+winner. All candidate distances are nonnegative and non-NaN for validated finite
+search coordinates, so these min/max operations introduce no new arithmetic error.
+Templates select these reductions without a per-candidate runtime mode branch.
+
+To prove conservatism with overlapping voxel ranges, let w be the original winner
+and j any distinct competitor. There are at least two occurrences no greater than
+j's computed distance: one of w and the occurrence of j itself. Thus the second
+occurrence distance R is no greater than *every* distinct competitor's clamped
+computed distance. The earlier enclosure proof only needs this inequality, not
+that R is attained by a distinct competitor. Repeated winner indices can lower R
+and reduce certificate yield; they cannot permit a false certificate. Computed
+ties lower R to the winner distance and remain subject to the strict rounded-bound
+comparison, except for the proven identical-coordinate special case.
+
+The split variant adds a launch and per-query flag traffic, and still launches
+masked fallback warps. The occurrence bound saves comparisons, rank storage, and
+one rank shuffle per reduction step, at the possible cost of weaker certificates.
+Both variants require measured end-to-end comparisons rather than a speedup claim
+from certificate yield alone.
