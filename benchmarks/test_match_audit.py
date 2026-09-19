@@ -2,7 +2,7 @@ import io
 import struct
 import unittest
 
-from analyze_match_audit import read_records, summarize_records
+from analyze_match_audit import read_records, summarize_records, compare_records
 
 
 def record(scan, kind, groups, matches):
@@ -57,6 +57,14 @@ class MatchAuditTests(unittest.TestCase):
         for matches in ([(0, 1, .1)], [(0, 0, float('nan'))], [(-1, 0, .1)]):
             with self.assertRaises(ValueError):
                 list(read_records(io.BytesIO(b'FORMMAT1' + record(20, 0, [1], matches))))
+
+    def test_comparison_requires_identical_stream_and_canonical_groups(self):
+        a = b'FORMMAT1' + record(20, 0, [4, 5], [(2, 0, .1)])
+        b = b'FORMMAT1' + record(20, 0, [5, 4], [(2, 1, .1)])
+        self.assertEqual(compare_records(read_records(io.BytesIO(a)), read_records(io.BytesIO(b)))['queries'], 1)
+        for bad in (b'FORMMAT1', b[:-8] + struct.pack('<d', .2)):
+            with self.assertRaises(ValueError):
+                compare_records(read_records(io.BytesIO(a)), read_records(io.BytesIO(bad)))
 
 
 if __name__ == '__main__':

@@ -2,6 +2,7 @@
 #include "form/optimization/diagnostics.hpp"
 #include "form/optimization/cuda_matching.hpp"
 #include "form/optimization/cuda_matcher.hpp"
+#include "form/optimization/match_audit.hpp"
 #include "form/feature/summary.hpp"
 #include <unordered_map>
 #include <type_traits>
@@ -171,6 +172,10 @@ template<class Point> struct Snapshot {
       device->setGroups(*target_groups,scans.size());
     }
     auto summaries=device->searchGrouped(pose,threshold,I==0);
+    if(detail::matchAudit().statsEnabled() && !map->queries.empty())
+      detail::matchAudit().appendStats(map->queries.front().scan,I,device->reuseStats());
+    if(detail::matchAudit().enabled() && !map->queries.empty())
+      detail::matchAudit().append(map->queries.front().scan,I,scans,*target_groups,threshold,device->downloadResults());
     if(idle_batch) current=std::move(idle_batch);
     else current=std::make_shared<MatchBatch<Point>>();
     current->map=map; current->device=device; current->target_groups=target_groups;

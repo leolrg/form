@@ -323,3 +323,193 @@ TEST(CudaMatcher, DeviceInversePoseValidationAndOverflow) {
   EXPECT_NO_THROW(matcher.reset(voxels,points,queries,1.,{identity_pose},{0}));
   EXPECT_EQ(matcher.search(identity_pose)[0].index,0);
 }
+
+
+TEST(CudaMatcher, ReuseCertifiesSmallMotionWithExactCurrentDistances) {
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified}) {
+    CudaMatcher matcher,oracle;
+    matcher.setReuseMode(mode); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    std::vector<CudaMatcher::MapPoint> points={{{.2,.3,.4,.5},{},{}},{{.8,.7,.6,.2},{},{}}};
+    std::vector<CudaMatcher::Query> queries(67,CudaMatcher::Query{{.21,.3,.4,.5}});
+    matcher.reset({{{0,0,0},0,2}},points,queries,1.);
+    oracle.reset({{{0,0,0},0,2}},points,queries,1.);
+    matcher.search(identity_pose);
+    EXPECT_EQ(matcher.reuseStats().searched,queries.size());
+    for(int step=1;step<=4;++step) {
+      auto pose=identity_pose; pose[3]=step*.001;
+      const auto expected=oracle.search(pose),actual=matcher.search(pose);
+      for(size_t i=0;i<actual.size();++i) {
+        EXPECT_EQ(actual[i].index,expected[i].index);
+        EXPECT_EQ(actual[i].distance,expected[i].distance);
+      }
+      const auto stats=matcher.reuseStats();
+      EXPECT_EQ(stats.total,queries.size()); EXPECT_EQ(stats.certified,queries.size());
+      EXPECT_EQ(stats.searched,mode==CudaMatcher::ReuseMode::Audit?queries.size():0);
+      EXPECT_EQ(stats.mismatches,0);
+      EXPECT_EQ(stats.oracle_searched,mode==CudaMatcher::ReuseMode::Audit?queries.size():0);
+    }
+  }
+}
+
+TEST(CudaMatcher, ReuseCrossingsTiesPaddingAndImmutableAnchor) {
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified}) {
+    CudaMatcher matcher,oracle; matcher.setReuseMode(mode); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    // Arbitrary world placement is legal. Crossing introduces point 2 and changes tie order.
+    std::vector<CudaMatcher::Voxel> voxels={{{0,0,0},0,2},{{2,0,0},2,1}};
+    std::vector<CudaMatcher::MapPoint> points={{{.8,.2,.2,.5},{},{}},{{1.2,.2,.2,.5},{},{}},{{1.,.2,.2,.5},{},{}}};
+    matcher.reset(voxels,points,{{{.9,.2,.2,.5}}},1.); oracle.reset(voxels,points,{{{.9,.2,.2,.5}}},1.);
+    for(double dx:{0.,.02,.04,.08,.099,.1,.101,.15,-.05}) {
+      auto pose=identity_pose; pose[3]=dx;
+      const auto expected=oracle.search(pose)[0],actual=matcher.search(pose)[0];
+      EXPECT_EQ(actual.index,expected.index); EXPECT_EQ(actual.distance,expected.distance);
+      EXPECT_EQ(matcher.reuseStats().mismatches,0);
+      if(dx==.1) EXPECT_EQ(matcher.reuseStats().cell_fallback,1);
+    }
+    points={{{.2,.3,.4,0.},{},{}},{{.2,.3,.4,0.},{},{}},{{.2,.3,.4,2.},{},{}}};
+    matcher.reset({{{0,0,0},0,3}},points,{{{.2,.3,.4,0}}},1.);
+    matcher.search(identity_pose); matcher.search(identity_pose);
+    EXPECT_EQ(matcher.reuseStats().certified,1); // Identical position safely preserves ties.
+    auto pose=identity_pose; pose[3]=.001;
+    EXPECT_EQ(matcher.search(pose)[0].index,0);
+    EXPECT_EQ(matcher.reuseStats().certified,0); EXPECT_EQ(matcher.reuseStats().gap_fallback,1);
+  }
+}
+
+TEST(CudaMatcher, ReuseRecomputesGateAndSummaryAndInvalidatesAfterFailure) {
+  CudaMatcher matcher,oracle; matcher.setReuseMode(CudaMatcher::ReuseMode::Certified);
+  oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+  for(int rows:{1,67,7,7}) {
+    std::vector<CudaMatcher::MapPoint> points={{{.2+rows*.001,.3,.4,.5},{.1,.2,.3},{.3,.4,.5}},{{.8,.7,.6,.2},{},{}}};
+    std::vector<CudaMatcher::Query> queries(rows,CudaMatcher::Query{{.21,.3,.4,.5}});
+    for(auto* m:{&matcher,&oracle}) { m->reset({{{0,0,0},0,2}},points,queries,1.); m->setGroups({0,1},2); }
+    for(bool plane:{false,true}) for(double dx:{0.,.001,.002}) for(double gate:{1e-6,1.}) {
+      auto pose=identity_pose; pose[3]=dx;
+      const auto expected=oracle.searchGrouped(pose,gate,plane),actual=matcher.searchGrouped(pose,gate,plane);
+      EXPECT_EQ(actual.counts,expected.counts);
+      for(size_t i=0;i<actual.roots.size();++i) EXPECT_TRUE(actual.roots[i].isApprox(expected.roots[i],1e-15));
+      const auto expected_results=oracle.downloadResults(),actual_results=matcher.downloadResults();
+      for(int i=0;i<rows;++i) { EXPECT_EQ(actual_results[i].index,expected_results[i].index); EXPECT_EQ(actual_results[i].distance,expected_results[i].distance); }
+    }
+    auto invalid=identity_pose; invalid[3]=std::numeric_limits<double>::infinity();
+    EXPECT_THROW(matcher.search(invalid),std::invalid_argument);
+    matcher.search(identity_pose); EXPECT_EQ(matcher.reuseStats().certified,0);
+    invalid[3]=1e100; EXPECT_THROW(matcher.search(invalid),std::invalid_argument);
+    matcher.search(identity_pose); EXPECT_EQ(matcher.reuseStats().certified,0);
+    EXPECT_THROW(matcher.reset({}, {}, queries,-1.),std::invalid_argument);
+    EXPECT_THROW(matcher.search(identity_pose),std::logic_error);
+  }
+}
+
+TEST(CudaMatcher, ReuseOracleParityAcrossRandomizedMotionAndAdversarialScales) {
+  std::mt19937 rng(71903);
+  std::uniform_real_distribution<double> uniform(.1,.9);
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified}) {
+    CudaMatcher matcher,oracle; matcher.setReuseMode(mode); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    for(double scale:{1.,1e-160,1e-310,1e150,1e155}) {
+      std::vector<CudaMatcher::MapPoint> points;
+      std::vector<CudaMatcher::Query> queries;
+      for(int i=0;i<131;++i) {
+        points.push_back({{scale*uniform(rng),scale*uniform(rng),scale*uniform(rng),scale*uniform(rng)},{},{}});
+        if(i<67) queries.push_back({{points.back().world[0],points.back().world[1],points.back().world[2],points.back().world[3]}});
+      }
+      points[65]=points[0]; // Distinct equal-distance competitor in another lane/tile.
+      // Explicitly overlapping ranges are legal, and repeat identical point indices.
+      const std::vector<CudaMatcher::Voxel> voxels={{{0,0,0},0,131},{{1,0,0},32,99}};
+      for(auto* m:{&matcher,&oracle}) m->reset(voxels,points,queries,scale);
+      for(int step=0;step<40;++step) {
+        const double angle=step*1e-4;
+        auto pose=identity_pose;
+        pose[0]=std::cos(angle); pose[1]=-std::sin(angle); pose[4]=std::sin(angle); pose[5]=std::cos(angle);
+        pose[3]=scale*step*.0002; pose[7]=-scale*step*.0001;
+        const auto expected=oracle.search(pose),actual=matcher.search(pose);
+        for(size_t i=0;i<actual.size();++i) {
+          ASSERT_EQ(actual[i].index,expected[i].index) << scale << ":" << step << ":" << i;
+          ASSERT_EQ(actual[i].distance,expected[i].distance) << scale << ":" << step << ":" << i;
+        }
+        EXPECT_EQ(matcher.reuseStats().mismatches,0);
+      }
+    }
+    const std::vector<CudaMatcher::MapPoint> points={{{.2,.2,.2,0},{},{}},{{.8,.2,.2,0},{},{}}};
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},points,{{{.25,.2,.2,0}}},1.);
+    for(int step=0;step<30;++step) {
+      auto pose=identity_pose; pose[3]=step*.015;
+      const auto expected=oracle.search(pose)[0],actual=matcher.search(pose)[0];
+      ASSERT_EQ(actual.index,expected.index); ASSERT_EQ(actual.distance,expected.distance);
+      EXPECT_EQ(matcher.reuseStats().mismatches,0);
+    }
+  }
+}
+
+TEST(CudaMatcher, ReuseEmptyDomainsOverflowAndModeChanges) {
+  CudaMatcher matcher; matcher.setReuseMode(CudaMatcher::ReuseMode::Certified);
+  matcher.reset({}, {}, {{{.2,.3,.4,0}}},1.);
+  matcher.search(identity_pose);
+  auto pose=identity_pose; pose[3]=.001;
+  EXPECT_EQ(matcher.search(pose)[0].index,-1); EXPECT_EQ(matcher.reuseStats().certified,1);
+  matcher.setReuseMode(CudaMatcher::ReuseMode::Certified);
+  matcher.search(pose); EXPECT_EQ(matcher.reuseStats().searched,1);
+  matcher.reset({{{0,0,0},0,1}},{{{1e200,0,0,0},{},{}}},{{{.2,.3,.4,0}}},1.);
+  matcher.search(identity_pose);
+  EXPECT_EQ(matcher.search(pose)[0].index,-1); EXPECT_EQ(matcher.reuseStats().certified,0);
+  EXPECT_EQ(matcher.search(pose)[0].index,-1); EXPECT_EQ(matcher.reuseStats().certified,1);
+  matcher.setGroups({0},1);
+  EXPECT_THROW(matcher.searchGrouped(pose,-1.,false),std::invalid_argument);
+  matcher.search(pose); EXPECT_EQ(matcher.reuseStats().certified,0);
+  pose[3]=1e100;
+  EXPECT_THROW(matcher.searchGrouped(pose,1.,false),std::invalid_argument);
+  matcher.search(identity_pose); EXPECT_EQ(matcher.reuseStats().certified,0);
+  matcher.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+  matcher.search(identity_pose); EXPECT_EQ(matcher.reuseStats().certified,0);
+  EXPECT_EQ(matcher.reuseStats().searched,1);
+  EXPECT_THROW(matcher.setReuseMode(static_cast<CudaMatcher::ReuseMode>(123)),std::invalid_argument);
+  matcher.reset({}, {}, {},1.); matcher.setReuseMode(CudaMatcher::ReuseMode::Certified);
+  EXPECT_TRUE(matcher.search(identity_pose).empty()); EXPECT_EQ(matcher.reuseStats().total,0);
+}
+
+TEST(CudaMatcher, ReuseRoundedTieAndOverflowedCompetitorFallBack) {
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified}) {
+    CudaMatcher matcher,oracle; matcher.setReuseMode(mode); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    const double below=std::nextafter(.5,0.);
+    // The tiny y difference is lost when added to x squared: computed tie.
+    std::vector<CudaMatcher::MapPoint> points={
+      {{.25,.5,.5,0},{},{}},{{.75,std::nextafter(.5,1.),.5,0},{},{}}};
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},points,{{{below,.5,.5,0}}},1.);
+    matcher.search(identity_pose);
+    auto pose=identity_pose; pose[3]=.5-below;
+    const auto expected=oracle.search(pose)[0],actual=matcher.search(pose)[0];
+    EXPECT_EQ(expected.index,0); EXPECT_EQ(expected.distance,.0625);
+    EXPECT_EQ(actual.index,expected.index); EXPECT_EQ(actual.distance,expected.distance);
+    EXPECT_EQ(matcher.reuseStats().certified,0); EXPECT_EQ(matcher.reuseStats().gap_fallback,1);
+    // The anchor runner-up overflows, then becomes finite and wins in the same voxel.
+    points={{{1e154,0,0,0},{},{}},{{2.5e154,0,0,0},{},{}}};
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},points,{{{1e154,0,0,0}}},1e155);
+    EXPECT_EQ(matcher.search(identity_pose)[0].index,0);
+    pose=identity_pose; pose[3]=.9e154;
+    const auto finite_expected=oracle.search(pose)[0],finite_actual=matcher.search(pose)[0];
+    EXPECT_EQ(finite_expected.index,1); EXPECT_TRUE(std::isfinite(finite_expected.distance));
+    EXPECT_EQ(finite_actual.index,finite_expected.index); EXPECT_EQ(finite_actual.distance,finite_expected.distance);
+    EXPECT_EQ(matcher.reuseStats().certified,0); EXPECT_EQ(matcher.reuseStats().gap_fallback,1);
+    EXPECT_EQ(matcher.reuseStats().mismatches,0);
+  }
+}
+
+TEST(CudaMatcher, ReuseGroupReassignmentAndExclusionUseCurrentGroups) {
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified}) {
+    CudaMatcher matcher,oracle; matcher.setReuseMode(mode); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    std::vector<CudaMatcher::MapPoint> points={
+      {{.2,.3,.4,.5},{.1,.2,.3},{.3,.4,.5}},{{.8,.7,.6,.2},{.7,.6,.5},{.2,.3,.4}}};
+    const std::vector<CudaMatcher::Query> queries={{{.21,.3,.4,.5}},{{.81,.7,.6,.2}}};
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},points,queries,1.);
+    matcher.search(identity_pose);
+    for(const std::vector<int>& groups:{std::vector<int>{0,1},std::vector<int>{1,0},std::vector<int>{-1,1},std::vector<int>{0,-1}}) {
+      for(auto* m:{&matcher,&oracle}) m->setGroups(groups,2);
+      for(bool plane:{false,true}) {
+        auto pose=identity_pose; pose[3]=.001;
+        const auto expected=oracle.searchGrouped(pose,1.,plane),actual=matcher.searchGrouped(pose,1.,plane);
+        EXPECT_EQ(actual.counts,expected.counts);
+        for(size_t i=0;i<actual.roots.size();++i) EXPECT_TRUE(actual.roots[i].isApprox(expected.roots[i],1e-15));
+        EXPECT_EQ(matcher.reuseStats().certified,2); EXPECT_EQ(matcher.reuseStats().mismatches,0);
+      }
+    }
+  }
+}

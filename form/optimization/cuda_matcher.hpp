@@ -8,6 +8,14 @@ namespace form {
 // Scan-lifetime snapshot. No GTSAM or CUDA types cross this interface.
 class CudaMatcher {
 public:
+  enum class ReuseMode { Disabled, Audit, Certified };
+  struct ReuseStats {
+    unsigned long long total=0, certified=0, searched=0, cell_fallback=0, gap_fallback=0;
+    unsigned long long unchanged=0, mismatches=0, oracle_searched=0;
+  };
+  void setReuseMode(ReuseMode mode);
+  // Statistics for the latest search; downloads only when requested.
+  ReuseStats reuseStats();
   struct Voxel { int coords[3]; int begin, count; };
   struct MapPoint { double world[4], local[3], normal[3]; };
   struct Query { double point[4]; };

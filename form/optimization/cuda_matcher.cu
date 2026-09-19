@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -122,6 +123,168 @@ __global__ void nearest(const Bucket* buckets,int mask,const double* __restrict_
   if(lane==0) results[i]={best,rank==~0ULL?-1:int(unsigned(rank))};
 }
 
+// Anchors change only after an uncertified full search, including in Audit.
+struct SearchAnchor {
+  double world[3],second;
+  int cell[3],index,previous_index;
+  bool empty,valid;
+};
+enum ReuseFlag : unsigned char { Certified=1, Searched=2, CellFallback=4,
+  GapFallback=8, Unchanged=16, Mismatch=32, OracleSearched=64 };
+__device__ double exactDistance(const double* points,size_t stride,int j,
+                                const double* world,double padding) {
+  const double dx=points[j]-world[0],dy=points[stride+j]-world[1];
+  const double dz=points[2*stride+j]-world[2],dw=points[3*stride+j]-padding;
+  return (dx*dx+dz*dz)+(dy*dy+dw*dw);
+}
+// See certified_rematching.md for the floating-point enclosure proof.
+__device__ bool gapCertified(const SearchAnchor& anchor,const double* world,double winner) {
+  constexpr double error=0x1p-46; // 64 * binary64 epsilon
+  constexpr double tiny=0x1p-1069; // 32 * binary64 denorm_min
+  if(!isfinite(winner) || winner>=__longlong_as_double(0x7fefffffffffffffLL)) return false;
+  double displacement2=0.;
+  for(int axis=0;axis<3;++axis) {
+    const double delta=fmax(fabs(__dsub_rd(world[axis],anchor.world[axis])),
+                            fabs(__dsub_ru(world[axis],anchor.world[axis])));
+    displacement2=__dadd_ru(displacement2,__dmul_ru(delta,delta));
+  }
+  if(!isfinite(displacement2)) return false;
+  const double old2=fmax(0.,__ddiv_rd(__dsub_rd(anchor.second,tiny),1.+error));
+  const double lower_norm=fmax(0.,__dsub_rd(__dsqrt_rd(old2),__dsqrt_ru(displacement2)));
+  const double lower=__dsub_rd(__dmul_rd(1.-error,__dmul_rd(lower_norm,lower_norm)),tiny);
+  return winner<lower;
+}
+struct RankedPair {
+  double best,second;
+  unsigned long long rank,second_rank;
+  __device__ void insert(double distance,unsigned long long candidate) {
+    if(candidate==~0ULL) return;
+    // Overlapping explicit voxel ranges may contain the same point index.
+    if(rank!=~0ULL && unsigned(candidate)==unsigned(rank)) {
+      if(candidate<rank) rank=candidate;
+      return;
+    }
+    if(second_rank!=~0ULL && unsigned(candidate)==unsigned(second_rank)) {
+      if(candidate>=second_rank) return;
+      second_rank=candidate;
+    }
+    if(distance<best || (distance==best && candidate<rank && rank!=~0ULL)) {
+      second=best; second_rank=rank; best=distance; rank=candidate;
+    } else if(distance<second || (distance==second && candidate<second_rank && second_rank!=~0ULL)) {
+      second=distance; second_rank=candidate;
+    }
+  }
+};
+
+__global__ void nearestReuse(const Bucket* buckets,int mask,const double* __restrict__ points,size_t point_stride,
+                        const CudaMatcher::Query* queries,int count,double width,Pose pose,
+                        CudaMatcher::Result* results,SearchAnchor* anchors,unsigned char* flags,
+                        bool anchors_valid,bool audit) {
+  const int lane=threadIdx.x%32;
+  const int i=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+  if(i>=count) return; // Whole warp exits, including the final partial block.
+  const auto q=queries[i];
+  double world[3],coords[3];
+  for(int axis=0;axis<3;++axis) {
+    const double* r=pose.matrix+4*axis;
+    world[axis]=((r[0]*q.point[0]+r[1]*q.point[1])+r[2]*q.point[2])+r[3];
+    coords[axis]=floor(world[axis]/width);
+    if(!isfinite(coords[axis]) || coords[axis]<-2147483647. || coords[axis]>2147483646.) {
+      if(lane==0) { results[i]={0.,-2}; flags[i]=Searched; }
+      return;
+    }
+  }
+  const int x=int(coords[0]), y=int(coords[1]), z=int(coords[2]);
+  const double maximum=__longlong_as_double(0x7fefffffffffffffLL);
+  unsigned char status=0;
+  bool certified=false;
+  CudaMatcher::Result reused{maximum,-1};
+  // Lane zero alone evaluates the bound and cached point; the warp branches uniformly.
+  if(lane==0 && anchors_valid && anchors[i].valid) {
+    const SearchAnchor& anchor=anchors[i];
+    const bool same_cell=anchor.cell[0]==x && anchor.cell[1]==y && anchor.cell[2]==z;
+    if(!same_cell) status|=CellFallback;
+    else {
+      const bool identical=world[0]==anchor.world[0] && world[1]==anchor.world[1] && world[2]==anchor.world[2];
+      reused.index=anchor.index;
+      if(reused.index>=0) reused.distance=exactDistance(points,point_stride,reused.index,world,q.point[3]);
+      certified=identical || anchor.empty || (anchor.index>=0 && gapCertified(anchor,world,reused.distance));
+      if(!certified) status|=GapFallback;
+    }
+    if(certified) status|=Certified;
+  }
+  certified=__shfl_sync(0xffffffff,int(certified),0);
+  if(certified && !audit) {
+    if(lane==0) { results[i]=reused; flags[i]=status; anchors[i].previous_index=reused.index; }
+    return;
+  }
+  RankedPair pair{maximum,maximum,~0ULL,~0ULL};
+  // Independent hash probes occupy 27 lanes instead of serializing every
+  // lookup through lane zero. Divergent collision chains reconverge at ballot.
+  int neighbor_begin=-1,neighbor_length=0;
+  if(lane<27) {
+    const int a=x+neighborShift(0x2a9542829549ULL,lane);
+    const int b=y+neighborShift(0x2828295489495ULL,lane);
+    const int c=z+neighborShift(0x8888888954955ULL,lane);
+    int slot=hash(a,b,c)&mask;
+    Bucket voxel=buckets[slot];
+    while(voxel.begin!=-1 && (voxel.x!=a || voxel.y!=b || voxel.z!=c)) {
+      slot=(slot+1)&mask; voxel=buckets[slot];
+    }
+    neighbor_begin=voxel.begin; neighbor_length=voxel.count;
+  }
+  unsigned occupied=__ballot_sync(0xffffffff,neighbor_length>0);
+  const bool empty=occupied==0;
+  while(occupied) {
+    const int n=__ffs(occupied)-1;
+    occupied&=occupied-1;
+    const int begin=__shfl_sync(0xffffffff,neighbor_begin,n);
+    const int length=__shfl_sync(0xffffffff,neighbor_length,n);
+    for(size_t offset=lane;offset<size_t(length);offset+=32) {
+      const int j=begin+int(offset);
+      const double dx=points[j]-world[0],dy=points[point_stride+j]-world[1];
+      const double dz=points[2*point_stride+j]-world[2],dw=points[3*point_stride+j]-q.point[3];
+      const double distance=(dx*dx+dz*dz)+(dy*dy+dw*dw);
+      pair.insert(distance,(static_cast<unsigned long long>(n)<<32)|unsigned(j));
+    }
+  }
+  for(int shift=16;shift;shift/=2) {
+    const double other=__shfl_down_sync(0xffffffff,pair.best,shift);
+    const auto other_rank=__shfl_down_sync(0xffffffff,pair.rank,shift);
+    const double other_second=__shfl_down_sync(0xffffffff,pair.second,shift);
+    const auto other_second_rank=__shfl_down_sync(0xffffffff,pair.second_rank,shift);
+    pair.insert(other,other_rank); pair.insert(other_second,other_second_rank);
+  }
+  if(lane==0) {
+    const CudaMatcher::Result result{pair.best,pair.rank==~0ULL?-1:int(unsigned(pair.rank))};
+    status|=Searched;
+    if(audit && anchors_valid && result.index==anchors[i].previous_index) status|=Unchanged;
+    if(certified && (result.index!=reused.index || result.distance!=reused.distance)) status|=Mismatch;
+    results[i]=result; flags[i]=status;
+    if(!certified || (status&Mismatch)) {
+      auto& anchor=anchors[i];
+      for(int axis=0;axis<3;++axis) { anchor.world[axis]=world[axis]; anchor.cell[axis]=int(coords[axis]); }
+      anchor.index=result.index; anchor.second=pair.second; anchor.empty=empty; anchor.valid=true;
+    }
+    anchors[i].previous_index=result.index;
+  }
+}
+
+// Audit uses the untouched original kernel as an independent oracle on the
+// identical snapshot. Return oracle results, and invalidate any disagreeing anchor.
+__global__ void auditOriginal(const CudaMatcher::Result* oracle,CudaMatcher::Result* results,
+                              SearchAnchor* anchors,unsigned char* flags,int count) {
+  const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
+  unsigned char status=flags[i]|OracleSearched;
+  if(results[i].index!=oracle[i].index || results[i].distance!=oracle[i].distance) {
+    status|=Mismatch; anchors[i].valid=false;
+  }
+  flags[i]=status;
+  // Memberwise copy avoids reading Result's uninitialized trailing ABI padding.
+  results[i].distance=oracle[i].distance; results[i].index=oracle[i].index;
+}
+
 __global__ void classify(const CudaMatcher::Result* results,int count,
                          const int* target_groups,int group_count,double threshold,
                          int* keys,int* sequence,int* counts) {
@@ -169,7 +332,11 @@ struct CudaMatcher::Impl {
   Buffer<double> search_positions;
   size_t point_stride=0;
   Buffer<Query> queries;
-  Buffer<Result> results;
+  Buffer<Result> results,oracle_results;
+  Buffer<SearchAnchor> anchors;
+  Buffer<unsigned char> reuse_flags;
+  CudaMatcher::ReuseMode reuse_mode=CudaMatcher::ReuseMode::Disabled;
+  bool anchors_valid=false,stats_ready=false;
   Buffer<int> indices;
   Buffer<Group> groups;
   Buffer<double> packed;
@@ -190,14 +357,46 @@ struct CudaMatcher::Impl {
   Impl() { check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)); }
   ~Impl() { if(stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
 };
-CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {}
+CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
+  if(const char* value=std::getenv("FORM_CUDA_MATCH_REUSE")) {
+    const std::string mode(value);
+    if(mode=="audit") setReuseMode(ReuseMode::Audit);
+    else if(mode=="certified") setReuseMode(ReuseMode::Certified);
+    else if(mode!="off") throw std::invalid_argument("Invalid FORM_CUDA_MATCH_REUSE (off|audit|certified)");
+  }
+}
 CudaMatcher::~CudaMatcher()=default;
+void CudaMatcher::setReuseMode(ReuseMode mode) {
+  auto& s=*impl_;
+  s.anchors_valid=false; s.stats_ready=false;
+  if(mode!=ReuseMode::Disabled && mode!=ReuseMode::Audit && mode!=ReuseMode::Certified)
+    throw std::invalid_argument("Invalid CUDA reuse mode");
+  s.reuse_mode=mode;
+}
+CudaMatcher::ReuseStats CudaMatcher::reuseStats() {
+  auto& s=*impl_;
+  ReuseStats stats;
+  if(!s.stats_ready) return stats;
+  stats.total=s.count;
+  if(s.reuse_mode==ReuseMode::Disabled) { stats.searched=s.count; return stats; }
+  std::vector<unsigned char> flags(s.count);
+  if(s.count) check(cudaMemcpyAsync(flags.data(),s.reuse_flags.data,s.count,cudaMemcpyDeviceToHost,s.stream));
+  check(cudaStreamSynchronize(s.stream));
+  for(auto flag:flags) {
+    stats.certified+=bool(flag&Certified); stats.searched+=bool(flag&Searched);
+    stats.cell_fallback+=bool(flag&CellFallback); stats.gap_fallback+=bool(flag&GapFallback);
+    stats.unchanged+=bool(flag&Unchanged); stats.mismatches+=bool(flag&Mismatch);
+    stats.oracle_searched+=bool(flag&OracleSearched);
+  }
+  return stats;
+}
 void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPoint>& points,
                         const std::vector<Query>& queries,double width,
                         const std::vector<std::array<double,12>>& inverse_poses,
                         const std::vector<int>& point_pose_indices) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::matcher_reset);
   auto& s=*impl_;
+  s.anchors_valid=false; s.stats_ready=false;
   s.ready=false; s.searched=false; s.groups_ready=false; s.host_results_ready=false;
   if(!std::isfinite(width) || width<=0) throw std::invalid_argument("Invalid CUDA voxel width");
   constexpr size_t limit=std::numeric_limits<int>::max();
@@ -261,6 +460,8 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
 void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_search_launch);
   auto& s=*this;
+  const bool anchors_valid=s.anchors_valid;
+  s.anchors_valid=false; s.stats_ready=false;
   s.searched=false; s.host_results_ready=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before search");
   for(auto v:matrix) if(!std::isfinite(v)) throw std::invalid_argument("Nonfinite CUDA query pose");
@@ -269,15 +470,29 @@ void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
     // Two queries per block: A100 sweeps over 64/128/256/512 favor 64 for
     // sparse and dense maps, with 62.5% occupancy and less block tail work.
     constexpr int search_threads=64;
-    nearest<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data);
+    if(s.reuse_mode==ReuseMode::Disabled) {
+      nearest<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data);
+    } else {
+      s.anchors.reserve(s.count); s.reuse_flags.reserve(s.count);
+      nearestReuse<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data,
+        s.anchors.data,s.reuse_flags.data,anchors_valid,s.reuse_mode==ReuseMode::Audit);
+      check(cudaGetLastError());
+      if(s.reuse_mode==ReuseMode::Audit) {
+        s.oracle_results.reserve(s.count);
+        nearest<<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.oracle_results.data);
+        check(cudaGetLastError());
+        auditOriginal<<<1+(s.count-1)/256,256,0,s.stream>>>(s.oracle_results.data,s.results.data,s.anchors.data,s.reuse_flags.data,s.count);
+      }
+    }
     check(cudaGetLastError());
   }
+  s.anchors_valid=true; s.stats_ready=true;
 }
-const std::vector<CudaMatcher::Result>& CudaMatcher::search(const std::array<double,12>& matrix) {
+const std::vector<CudaMatcher::Result>& CudaMatcher::search(const std::array<double,12>& matrix) try {
   impl_->launchSearch(matrix);
   impl_->searched=true;
   return downloadResults();
-}
+} catch(...) { impl_->anchors_valid=false; impl_->stats_ready=false; throw; }
 const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_download);
   auto& s=*impl_;
@@ -286,7 +501,7 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
     if(s.count) check(cudaMemcpyAsync(s.host_results.data(),s.results.data,size_t(s.count)*sizeof(Result),cudaMemcpyDeviceToHost,s.stream));
     check(cudaStreamSynchronize(s.stream));
     for(const auto& r:s.host_results) if(r.index==-2) {
-      s.searched=false;
+      s.searched=false; s.anchors_valid=false; s.stats_ready=false;
       throw std::invalid_argument("CUDA transformed query exceeds voxel coordinate range");
     }
     s.host_results_ready=true;
@@ -318,7 +533,7 @@ void CudaMatcher::setGroups(const std::vector<int>& target_groups,size_t group_c
   s.groups_ready=true;
 }
 CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,12>& matrix,
-                                                       double threshold_squared,bool plane) {
+                                                       double threshold_squared,bool plane) try {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_search_grouped);
   auto& s=*impl_;
   s.searched=false; s.host_results_ready=false;
@@ -358,7 +573,7 @@ CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,1
   phase.reset();
   result.roots=s.packSummaries(descriptors,shapes,total,max_rows,plane);
   return result;
-}
+} catch(...) { impl_->anchors_valid=false; impl_->stats_ready=false; throw; }
 std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packSummaries(const std::vector<Group>& descriptors,
     const std::vector<BatchedCudaQr::DeviceInput>& shapes,size_t total,int max_rows,bool plane) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_pack);

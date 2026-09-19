@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import math
 import struct
+from itertools import zip_longest
 
 
 def read_records(stream):
@@ -34,6 +35,20 @@ def read_records(stream):
             if group >= 0 and index < 0:
                 raise ValueError('accepted missing match')
         yield dict(scan=scan, kind=kind, groups=groups, matches=matches)
+
+
+def compare_records(reference, candidate):
+    counts = dict(searches=0, queries=0)
+    for a, b in zip_longest(reference, candidate):
+        if a is None or b is None or (a['scan'], a['kind']) != (b['scan'], b['kind']):
+            raise ValueError('different rematch streams')
+        def canonical(record):
+            return [(i, record['groups'][g] if g >= 0 else None, d) for i, g, d in record['matches']]
+        if canonical(a) != canonical(b):
+            raise ValueError(f"matching mismatch at scan {a['scan']}, kind {a['kind']}")
+        counts['searches'] += 1
+        counts['queries'] += len(a['matches'])
+    return counts
 
 
 def summarize_records(records, block_sizes=(32, 64, 128, 256), warmup=20):
