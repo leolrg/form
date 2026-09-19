@@ -16,6 +16,12 @@ public:
   void setReuseMode(ReuseMode mode);
   // Statistics for the latest search; downloads only when requested.
   ReuseStats reuseStats();
+  struct SummaryStats {
+    size_t active_leaves=0, dirty_leaves=0, full_rebuild_checks=0;
+    double relative_gram_error=0.;
+  };
+  void setIncrementalSummaries(bool enabled);
+  SummaryStats summaryStats();
   struct Voxel { int coords[3]; int begin, count; };
   struct MapPoint { double world[4], local[3], normal[3]; };
   struct Query { double point[4]; };

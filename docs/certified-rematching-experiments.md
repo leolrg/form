@@ -5,6 +5,37 @@ Research branch: `codex/certified-rematching`, isolated worktree
 unchanged at `1255543`. These are preliminary feasibility observations, not final
 speed or novelty claims.
 
+## Latest verified checkpoint: V3 partial QR
+
+The stable 64-row slot implementation keeps unchanged rows in their target scan's
+slots, fills first-available holes on migration/insertion, and rebuilds only dirty
+leaf roots. Affected groups currently rebuild their root merges; this prototype
+does **not** yet cache all internal ancestors. Unchanged groups keep their roots.
+All of this is opt-in (`FORM_CUDA_SUMMARY_REUSE=blocks64`).
+
+The default build passes 120 C++ tests (109 main, 2 parallel, 9 scalar); the main
+suite also passes with both certified search and partial summaries enabled. Five
+incremental tests pass CUDA memcheck, device initcheck and racecheck with zero
+errors/hazards. Cases include multiple 256-thread scan chunks, migrations,
+rejection, reinsertion, zero/rank-deficient matrices, producer stream ownership,
+and comparison of nonlinear cost and the full both-pose augmented Hessian.
+Independent read-only reviews found no remaining actionable logic defect.
+
+Frozen V3 SHA256:
+`bbe40d949ad75e97065968f2e0113dc76c00a9b61c55e50eae2e28fb7904c526`.
+Diagnostic `audit-v3/` replays the first 250 stairs scans. In `audit64` mode,
+incremental roots are compared to fresh full QR roots on the identical inputs,
+then the full roots are supplied to the optimizer to preserve its original
+feedback. Including warmup:
+
+- 45,285,082 original-kernel search comparisons, zero mismatches.
+- 66,386 scan-pair summary checks; maximum relative feature-Gram error
+  `2.78067e-15` (threshold `1e-10`). Gram error is normalized by `1 + ||G||`.
+- 478,796 dirty leaves out of 748,395 active leaves, 63.98%.
+
+These establish correctness evidence and actual partial work, not speed. Clean
+four-way off/search-only/summary-only/combined ablations follow separately.
+
 ## Baseline and verification
 
 The clean baseline passed all 108 C++ tests. Frozen executable SHA256:
@@ -108,3 +139,102 @@ This supports trying selective search, but does not measure speed. Cross-cell
 certificates can recover at most a small fraction of this workload's remaining
 searches; improving gap certificates, fallback search cost, or summary maintenance
 is a higher-priority experiment. Clean, repeated measurements follow separately.
+
+## V2 clean selective-search comparison and trace
+
+Two sequential repetitions, reversed mode order on repetition 2, use the same
+250-scan current workload and exclude scans 0–19. No analysis, build, sanitizers,
+or other experiments overlapped clean replay. Artifacts:
+`benchmarks/results/certified-rematching/clean-v2-current/`.
+
+| Mode | Total run means (ms/scan) | Mean total | Mean matching stage |
+| --- | --- | --- | --- |
+| Frozen baseline `1255543` | 27.33 / 26.20 | 26.76 | 8.60 |
+| Research binary, reuse disabled | 25.88 / 27.26 | 26.57 | 8.38 |
+| Certified search, full summaries | 29.35 / 26.75 | 28.05 | 8.82 |
+| Improved CPU, matched settings | 86.50 / 82.06 | 84.28 | 58.54 |
+
+There is **no demonstrated end-to-end acceleration** from this initial search
+prototype. It is 5.6% slower by the two-run mean, with appreciable repeat variation.
+All modes/repeats preserve per-scan workload counts; maximum translation difference
+from the disabled run is `1.02e-13 m` across the eight runs.
+
+Separate Nsight traces (`trace-v2/`, also scans 20–249) show search kernels at
+1.920 ms/scan disabled versus 1.668 ms certified: a 0.252 ms or 13.1% reduction.
+QR kernel time remains 1.408 versus 1.418 ms. Transfers have identical byte counts
+but different measured durations, so subtracting total device busy time would
+misattribute transfer variability to the certificate. These traces explain why
+the skipped-query count must not be presented as a speedup; they do not supersede
+the clean timing result.
+
+The next search variants will separate the cheap certificate into one thread per
+query from warp-cooperative fallback search, and reduce runner-up acquisition
+overhead while retaining a conservative lower bound. Partial summary maintenance
+is an independent ablation, not assumed to rescue the search result.
+
+## Stable per-target-scan slots: offline summary work model
+
+`benchmarks/analyze_stable_blocks.py` replays the V1 off-mode correspondence
+capture on the CPU. It changes no production code. Nine tests cover migrations,
+rejections, unchanged slots, dirty-hole preference, first-hole allocation,
+randomized ownership, retained tree height after deletion, and internal QR work
+for leaves larger than 64 rows. The final reports are:
+
+- `benchmarks/results/certified-rematching/audit-v1/stable-blocks-current-v2.json`
+- `benchmarks/results/certified-rematching/audit-v1/stable-blocks-first64-current-v2.json`
+
+Both exclude scans 0–19. They cover 460 initial feature-type searches and 4,026
+subsequent searches across 230 scans. Initial searches contain 4,316,170 accepted
+rows; subsequent searches contain 37,720,241 accepted rows. The latter have
+2,123,481 changed summary rows. These accepted-row counts differ slightly from
+the query counts above because some queries have no accepted correspondence.
+
+Each target scan initially receives compact slots in query order. A query keeps
+its slot while its target scan remains the same, even when its matched point
+changes; that change dirties its leaf. Rejection or migration frees the old slot
+and dirties its old leaf. Incoming rows fill available slots before allocating
+more leaves. The `dirty` policy prefers holes in leaves already requiring an
+update; the simpler `first` policy always fills the lowest available slot.
+Unchanged leaves retain their previous square-root factors. Empty leaves retain
+their indices, and cached tree ancestors are updated when any descendant changes.
+
+The following fractions include initial construction and compare against fully
+rebuilding the usual grouped 64-row QR on every search. Smaller is less modeled
+work. Merge counts include internal merges needed to construct 128/256-row
+virtual leaves from actual 64-row tiles, plus changed ancestors in the cached
+tree. Plane trees use fanout four and point trees use fanout nine, matching their
+13- and 7-column roots. Counts are not FLOP-weighted or measured runtimes.
+
+| Slots per leaf | Hole policy | Raw rows refactorized / full rows | 64-row tile factorizations / full tiles | Merge input roots / full merge inputs |
+| --- | --- | --- | --- | --- |
+| 32 | Dirty first | 52.62% | 103.00% | 160.20% |
+| 64 | Dirty first | 63.92% | 63.62% | 88.63% |
+| 64 | First available | 64.54% | 64.23% | 89.02% |
+| 128 | Dirty first | 75.16% | 74.79% | 102.29% |
+| 256 | Dirty first | 84.88% | 84.36% | 87.87% |
+
+**Prototype choice: 64-row leaves with first-available slots.** Dirty-first
+allocation saves only another 0.61 percentage points of rows and tile work,
+which does not justify a more complicated first prototype. Stable slots also
+avoid the severe target-scan fragmentation of fixed query-index blocks. At
+64 rows, allocated leaf count exceeds active leaf count by only about 0.034%
+across this capture, although partially vacant active leaves still exist.
+
+The plausible gain is narrower than the low correspondence churn initially
+suggests: this policy still refactorizes about 65% of all rows, and an ideal
+cached merge tree still processes about 89% of the baseline's merge inputs.
+The model excludes slot maintenance, dirty detection, packing live rows from
+holes, cache storage, allocation, synchronization, and kernel launches. A
+prototype that rebuilds all affected groups' merge trees will do additional work
+beyond the cached-ancestor estimate. These results justify a feasibility prototype;
+they establish neither GPU speedup nor end-to-end speedup.
+
+Changing row order preserves the fixed-correspondence objective mathematically,
+but changes floating-point QR reduction order. The prototype therefore needs
+independent factor/error/Jacobian checks and trajectory comparisons; these work
+counts are not a correctness proof for its eventual implementation.
+
+A possible later experiment is to initialize slots by certificate difficulty
+or observed correspondence churn, concentrating unstable rows into fewer leaves.
+That idea has not been implemented or measured, and its initialization/reordering
+cost must be included if pursued.

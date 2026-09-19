@@ -173,7 +173,7 @@ template<class Point> struct Snapshot {
     }
     auto summaries=device->searchGrouped(pose,threshold,I==0);
     if(detail::matchAudit().statsEnabled() && !map->queries.empty())
-      detail::matchAudit().appendStats(map->queries.front().scan,I,device->reuseStats());
+      detail::matchAudit().appendStats(map->queries.front().scan,I,device->reuseStats(),device->summaryStats());
     if(detail::matchAudit().enabled() && !map->queries.empty())
       detail::matchAudit().append(map->queries.front().scan,I,scans,*target_groups,threshold,device->downloadResults());
     if(idle_batch) current=std::move(idle_batch);

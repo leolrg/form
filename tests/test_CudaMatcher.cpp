@@ -1,11 +1,104 @@
 #include "form/optimization/cuda_matcher.hpp"
 #include "form/feature/cuda_qr.hpp"
+#include "form/feature/summary.hpp"
 #include "form/feature/features.hpp"
 #include "form/mapping/map.hpp"
 #include <gtest/gtest.h>
 #include <random>
 
 using form::CudaMatcher;
+
+TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRejection) {
+  const std::array<double,12> identity={1,0,0,0,0,1,0,0,0,0,1,0};
+  auto shifted=identity; shifted[3]=.2;
+  for(bool plane:{false,true}) for(int extra_group:{0,1}) {
+    CudaMatcher full,partial;
+    full.setIncrementalSummaries(false);
+    full.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    partial.setReuseMode(CudaMatcher::ReuseMode::Certified);
+    partial.setIncrementalSummaries(true);
+    std::vector<CudaMatcher::MapPoint> points;
+    std::vector<CudaMatcher::Query> queries;
+    for(int i=0;i<192;++i) {
+      points.push_back({{i+.1,.1,.1,0},{i*.7,.2,.3},{.3,.4,.5}});
+      queries.push_back({{i+.1,.1,.1,0}});
+    }
+    points.push_back({{.4,.1,.1,0},{.15,.25,.35},{.4,.5,.6}});
+    std::vector<int> groups(points.size(),0); groups.back()=extra_group;
+    for(auto* matcher:{&full,&partial}) {
+      matcher->reset({{{0,0,0},0,int(points.size())}},points,queries,1000.);
+      matcher->setGroups(groups,2);
+    }
+    auto compare=[&](const auto& pose,double gate) {
+      const auto expected=full.searchGrouped(pose,gate,plane);
+      const auto actual=partial.searchGrouped(pose,gate,plane);
+      ASSERT_EQ(actual.counts,expected.counts);
+      for(size_t i=0;i<actual.roots.size();++i) {
+        const Eigen::MatrixXd a=actual.roots[i].transpose()*actual.roots[i];
+        const Eigen::MatrixXd b=expected.roots[i].transpose()*expected.roots[i];
+        EXPECT_LE((a-b).norm(),1e-11*(1+b.norm()));
+        Eigen::Matrix<double,13,13> ap=Eigen::Matrix<double,13,13>::Zero(),bp=ap;
+        Eigen::Matrix<double,7,7> aq=Eigen::Matrix<double,7,7>::Zero(),bq=aq;
+        if(plane) { ap=actual.roots[i]; bp=expected.roots[i]; }
+        else { aq=actual.roots[i]; bq=expected.roots[i]; }
+        const form::FeatureSummary sa(ap,aq),sb(bp,bq);
+        for(double angle:{-.7,0.,.3}) {
+          const gtsam::Pose3 ti(gtsam::Rot3::RzRyRx(angle,.1,-.2),gtsam::Point3(.2,-.3,.4));
+          const gtsam::Pose3 tj(gtsam::Rot3::RzRyRx(-.1,angle,.2),gtsam::Point3(-.4,.2,.3));
+          const auto ha=sa.augmentedHessian(ti,tj),hb=sb.augmentedHessian(ti,tj);
+          EXPECT_LE((ha-hb).norm(),1e-10*(1+hb.norm()));
+          EXPECT_NEAR(sa.squaredError(ti,tj),sb.squaredError(ti,tj),1e-10*(1+sb.squaredError(ti,tj)));
+        }
+      }
+    };
+    compare(identity,1.);
+    EXPECT_EQ(partial.summaryStats().active_leaves,3u);
+    EXPECT_EQ(partial.summaryStats().dirty_leaves,3u);
+    compare(shifted,1.);
+    EXPECT_EQ(partial.summaryStats().dirty_leaves,size_t(extra_group?2:1));
+    compare(shifted,1.);
+    EXPECT_EQ(partial.summaryStats().dirty_leaves,0u);
+    compare(shifted,.005); // Every query rejected; delete all former rows.
+    compare(identity,1.); // Reinsert into retained empty slots.
+    partial.setGroups(std::vector<int>(points.size(),-1),2);
+    const auto empty=partial.searchGrouped(identity,1.,plane);
+    EXPECT_EQ(empty.counts,(std::vector<size_t>{0,0}));
+    for(const auto& root:empty.roots) EXPECT_EQ(root.norm(),0.);
+  }
+}
+
+TEST(CudaMatcher, IncrementalSlotsCrossBlockScanChunksAndRefillScatteredHoles) {
+  const std::array<double,12> identity={1,0,0,0,0,1,0,0,0,0,1,0};
+  auto shifted=identity; shifted[3]=.2;
+  std::vector<CudaMatcher::MapPoint> points;
+  std::vector<CudaMatcher::Query> queries;
+  std::vector<int> groups;
+  for(int i=0;i<777;++i) {
+    const double x=2*i+.1;
+    queries.push_back({{x,.1,.1,0}});
+    points.push_back({{x,.1,.1,0},{x-.01,.1,.1},{.3,.4,.5}}); groups.push_back(0);
+    if(i%17==0) { points.push_back({{x+.3,.1,.1,0},{x+.29,.1,.1},{.5,.4,.3}}); groups.push_back(1); }
+  }
+  for(bool plane:{false,true}) {
+    CudaMatcher full,partial;
+    full.setIncrementalSummaries(false);
+    partial.setIncrementalSummaries(true);
+    for(auto* matcher:{&full,&partial}) {
+      matcher->reset({{{0,0,0},0,int(points.size())}},points,queries,2000.);
+      matcher->setGroups(groups,3);
+    }
+    for(int iteration=0;iteration<20;++iteration) {
+      const auto pose=iteration%3?shifted:identity;
+      const double gate=iteration%5==4?1e-4:1.;
+      const auto a=partial.searchGrouped(pose,gate,plane),b=full.searchGrouped(pose,gate,plane);
+      ASSERT_EQ(a.counts,b.counts);
+      for(size_t g=0;g<a.roots.size();++g) {
+        const Eigen::MatrixXd aa=a.roots[g].transpose()*a.roots[g],bb=b.roots[g].transpose()*b.roots[g];
+        EXPECT_LE((aa-bb).norm(),1e-11*(1+bb.norm()));
+      }
+    }
+  }
+}
 
 TEST(CudaMatcher, EmptyMapAndQueryTail) {
   CudaMatcher matcher;

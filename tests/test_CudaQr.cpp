@@ -212,3 +212,126 @@ TEST(CudaQr, DevicePackedEmptyInputValidationAndDiagnosticCapture) {
   qr.computeDevicePacked(memory.device,{{2,false}},memory.producer);
   ASSERT_EQ(device_observed.size(),1); EXPECT_TRUE(device_observed[0].isApprox(compact,0.));
 }
+
+namespace {
+struct IncrementalFixture : DevicePackedFixture {
+  unsigned char* dirty=nullptr;
+  std::vector<unsigned char> host_dirty;
+  explicit IncrementalFixture(size_t leaves):DevicePackedFixture(std::max<size_t>(1,leaves*64*7)),host_dirty(leaves,1) {
+    if(cudaMalloc(reinterpret_cast<void**>(&dirty),std::max<size_t>(1,leaves))!=cudaSuccess)
+      throw std::runtime_error("CUDA dirty allocation failed");
+    std::fill(pinned,pinned+leaves*64*7,0.);
+  }
+  ~IncrementalFixture() { cudaStreamSynchronize(producer); cudaFree(dirty); }
+  void upload() {
+    if(cudaMemcpyAsync(device,pinned,host_dirty.size()*64*7*sizeof(double),cudaMemcpyHostToDevice,producer)!=cudaSuccess ||
+       cudaMemcpyAsync(dirty,host_dirty.data(),host_dirty.size(),cudaMemcpyHostToDevice,producer)!=cudaSuccess)
+      throw std::runtime_error("CUDA incremental upload failed");
+  }
+  void leaf(size_t index,const Eigen::MatrixXd& matrix) { std::memcpy(pinned+index*64*7,matrix.data(),64*7*sizeof(double)); }
+};
+Eigen::MatrixXd expandLeaf(const Eigen::MatrixXd& compact,bool plane) {
+  if(!plane) return compact;
+  Eigen::MatrixXd expanded(compact.rows(),13);
+  for(int a=0;a<3;++a) for(int b=0;b<3;++b)
+    expanded.col(3*a+b)=compact.col(3+a).cwiseProduct(compact.col(b));
+  expanded.middleCols(9,3)=compact.middleCols(3,3); expanded.col(12)=compact.col(6);
+  return expanded;
+}
+void expectIncrementalGram(const Eigen::MatrixXd& root,const std::vector<Eigen::MatrixXd>& leaves,bool plane) {
+  Eigen::MatrixXd expected=Eigen::MatrixXd::Zero(plane?13:7,plane?13:7);
+  for(const auto& compact:leaves) { const auto expanded=expandLeaf(compact,plane); expected+=expanded.transpose()*expanded; }
+  ASSERT_TRUE(root.allFinite());
+  EXPECT_LE((root.transpose()*root-expected).norm(),2e-11*(1.+expected.norm()));
+}
+}
+
+TEST(CudaQr, IncrementalDirtyLeafRetainsUntouchedRootsAndSkipsUnchangedGroups) {
+  for(bool plane:{false,true}) {
+    form::BatchedCudaQr qr;
+    const size_t capacity=10;
+    IncrementalFixture memory(2*capacity);
+    std::vector<Eigen::MatrixXd> leaves;
+    for(size_t i=0;i<2*capacity;++i) {
+      leaves.push_back(Eigen::MatrixXd::Random(64,7)); memory.leaf(i,leaves.back());
+    }
+    memory.upload();
+    auto roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,capacity,{10,2},plane,memory.producer);
+    ASSERT_EQ(roots.size(),2);
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+10},plane);
+    expectIncrementalGram(roots[1],{leaves.begin()+10,leaves.begin()+12},plane);
+    EXPECT_EQ(qr.incrementalStats().dirty_leaves,12); EXPECT_EQ(qr.incrementalStats().active_leaves,12);
+    const Eigen::MatrixXd unchanged=roots[1];
+    leaves[1]*=2.; memory.leaf(1,leaves[1]);
+    // Clean leaves must not be read from the producer again, even in the same group.
+    for(size_t i=0;i<2*capacity;++i) if(i!=1) memory.leaf(i,Eigen::MatrixXd::Constant(64,7,std::numeric_limits<double>::quiet_NaN()));
+    std::fill(memory.host_dirty.begin(),memory.host_dirty.end(),0); memory.host_dirty[1]=1; memory.upload();
+    roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,capacity,{10,2},plane,memory.producer);
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+10},plane);
+    EXPECT_TRUE(roots[1].isApprox(unchanged,0.));
+    EXPECT_EQ(qr.incrementalStats().dirty_leaves,1); EXPECT_EQ(qr.incrementalStats().changed_groups,1);
+    EXPECT_GT(qr.incrementalStats().merge_tiles,0);
+    memory.host_dirty[1]=0; memory.upload();
+    qr.computeDevicePackedIncremental(memory.device,memory.dirty,capacity,{10,2},plane,memory.producer);
+    EXPECT_EQ(qr.incrementalStats().dirty_leaves,0); EXPECT_EQ(qr.incrementalStats().merge_tiles,0);
+    EXPECT_EQ(qr.incrementalStats().changed_groups,0);
+  }
+}
+
+TEST(CudaQr, IncrementalInsertionDeletionMigrationAndRankDeficiency) {
+  for(bool plane:{false,true}) {
+    form::BatchedCudaQr qr;
+    IncrementalFixture memory(6);
+    Eigen::MatrixXd a=Eigen::MatrixXd::Zero(64,7),b=a;
+    a.row(2)<<1.,2.,3.,4.,.1,.2,.3; a.row(7)=a.row(2); b.row(40)=a.row(2)*2.;
+    memory.leaf(0,a); memory.leaf(1,b); memory.upload();
+    auto roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,3,{2,0},plane,memory.producer);
+    expectIncrementalGram(roots[0],{a,b},plane); EXPECT_TRUE(roots[1].isZero());
+    const Eigen::MatrixXd zero=Eigen::MatrixXd::Zero(64,7);
+    memory.leaf(0,zero); memory.leaf(3,a);
+    memory.host_dirty={1,0,0,1,0,0}; memory.upload();
+    roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,3,{2,1},plane,memory.producer);
+    expectIncrementalGram(roots[0],{b},plane); expectIncrementalGram(roots[1],{a},plane);
+    EXPECT_EQ(qr.incrementalStats().dirty_leaves,2);
+    memory.host_dirty.assign(6,0); memory.upload();
+    roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,3,{0,0},plane,memory.producer);
+    EXPECT_TRUE(roots[0].isZero()); EXPECT_TRUE(roots[1].isZero()); EXPECT_EQ(qr.incrementalStats().changed_groups,2);
+    roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,3,{2,1},plane,memory.producer);
+    expectIncrementalGram(roots[0],{b},plane); expectIncrementalGram(roots[1],{a},plane);
+    EXPECT_EQ(qr.incrementalStats().dirty_leaves,0); EXPECT_EQ(qr.incrementalStats().changed_groups,2);
+  }
+}
+
+TEST(CudaQr, IncrementalResetConfigurationValidationAndProducerOrdering) {
+  form::BatchedCudaQr qr;
+  IncrementalFixture memory(2);
+  const Eigen::MatrixXd a=Eigen::MatrixXd::Random(64,7);
+  memory.leaf(0,a); memory.leaf(1,a); memory.upload();
+  qr.computeDevicePackedIncremental(memory.device,memory.dirty,2,{2},false,memory.producer);
+  memory.host_dirty={1,0};
+  ASSERT_EQ(cudaMemcpyAsync(memory.dirty,memory.host_dirty.data(),2,cudaMemcpyHostToDevice,memory.producer),cudaSuccess);
+  std::atomic<bool> produced{false};
+  ASSERT_EQ(cudaLaunchHostFunc(memory.producer,[](void* p) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30)); static_cast<std::atomic<bool>*>(p)->store(true);
+  },&produced),cudaSuccess);
+  const Eigen::MatrixXd changed=(a*3.).eval(); memory.leaf(0,changed);
+  // Only pinned asynchronous input follows the delay; no pageable upload or
+  // fresh allocation may accidentally satisfy the required producer ordering.
+  ASSERT_EQ(cudaMemcpyAsync(memory.device,memory.pinned,2*64*7*sizeof(double),cudaMemcpyHostToDevice,memory.producer),cudaSuccess);
+  auto roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,2,{2},false,memory.producer);
+  EXPECT_TRUE(produced.load()); EXPECT_EQ(cudaStreamQuery(memory.producer),cudaSuccess);
+  expectIncrementalGram(roots[0],{changed,a},false);
+  memory.host_dirty={0,0}; memory.upload(); qr.resetIncremental();
+  roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,2,{2},false,memory.producer);
+  EXPECT_TRUE(roots[0].isZero());
+  memory.host_dirty={1,1}; memory.upload();
+  roots=qr.computeDevicePackedIncremental(memory.device,memory.dirty,2,{2},true,memory.producer);
+  expectIncrementalGram(roots[0],{changed,a},true);
+  EXPECT_THROW(qr.computeDevicePackedIncremental(memory.device,memory.dirty,1,{2},true,memory.producer),std::invalid_argument);
+  EXPECT_THROW(qr.computeDevicePackedIncremental(nullptr,memory.dirty,2,{1},false),std::invalid_argument);
+  EXPECT_THROW(qr.computeDevicePackedIncremental(memory.device,nullptr,2,{1},false),std::invalid_argument);
+  EXPECT_THROW(qr.computeDevicePackedIncremental(memory.device,memory.dirty,std::numeric_limits<size_t>::max(),{1,1},false),std::invalid_argument);
+  EXPECT_TRUE(qr.computeDevicePackedIncremental(nullptr,nullptr,0,{},false).empty());
+  roots=qr.computeDevicePackedIncremental(nullptr,nullptr,0,{0,0},false);
+  ASSERT_EQ(roots.size(),2); EXPECT_TRUE(roots[0].isZero()); EXPECT_TRUE(roots[1].isZero());
+}

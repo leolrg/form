@@ -215,3 +215,123 @@ These are proposed experiments only; none was run for this note.
 No accuracy improvement is implied: the target is the same estimator with less
 work. Any observed accuracy change must be explained by numerical differences,
 changed matching semantics, or a deliberately changed algorithm.
+
+## Follow-up: correspondence tracking and dynamic square-root neighbors
+
+This bounded follow-up on 2026-09-19 searched the original title, its author and
+institutional repositories, later exact ICP search, registration QR compression,
+and incremental LiDAR sufficient statistics. It adds useful comparators but does
+not close the literature review.
+
+### Greenspan–Godin retrieval status
+
+The original 2001 full text was **not retrieved**. The
+[IEEE record](https://ieeexplore.ieee.org/document/924426) and DOI retrieval failed
+in this environment; the DBLP bibliographic route returned an anti-bot page.
+Title/author searches of NRC and Queen's University did not identify an accessible
+copy of the original. The accessible NRC item
+`69df0800-3552-4491-9fc8-5cceec080cec` is *The Parallel Iterative Closest Point
+Algorithm*, not the requested paper, and must not be cited as its full text.
+The evidence below comes from later authors' own implementations and papers;
+it does not warrant asserting that we verified the 2001 theorem or its precise
+assumptions. No access restriction was bypassed.
+
+### Additional primary sources inspected
+
+**Zinßer, Schmidt, Niemann, *Performance Analysis of Nearest Neighbor Algorithms
+for ICP Registration of 3-D Point Sets*, VMV 2003.** The
+[author-hosted paper](https://www.yjschmidt.de/pdf/jschmidt_vmv_2003.pdf), §6,
+implements the STCNN/k-d-tree combination attributed to Greenspan and Godin.
+It precomputes neighbor lists for target points, tests whether the new query can
+be searched safely in the old winner's neighborhood, and otherwise falls back
+to the k-d tree. Its modification fixes neighbor count rather than radius to
+control memory. Section 8 explicitly includes initialization time and shows why
+more expensive preprocessing can trade off against faster queries. This is a
+strong established baseline for exact restricted search with fallback. It is
+not evidence for maintaining FORM feature roots. A comparison must include
+neighborhood construction and retained memory, and must preserve FORM's candidate
+domain rather than silently switching to unrestricted nearest-neighbor matching.
+
+**Anderson, Raettig, Larson, Nykl, Taylor, Wischgoll, *Delaunay walk for fast
+nearest neighbor: accelerating correspondence matching for ICP*, Machine Vision
+and Applications 33, article 31, 2022.** The
+[publisher's full text](https://link.springer.com/article/10.1007/s00138-022-01279-w)
+and [author-hosted paper](https://avida.cs.wright.edu/publications/pdf/J31.pdf)
+describe greedy search over target Delaunay edges. Section 4.3 initializes each
+walk at the previous iteration's nearest neighbor; CPU and GPU variants exploit
+the iterative correspondence history. This establishes a later, relevant
+alternative to ordinary cached k-d search. It does not demonstrate the proposed
+QR-summary coupling. Its 3D global search and degeneracy/tie behavior must be
+reconciled with FORM's 4D metric and voxel domain before treating it as an
+equivalent matcher. Otherwise present it as a separate algorithmic comparator.
+
+**Kaess, Ranganathan, Dellaert, *iSAM: Incremental Smoothing and Mapping*, IEEE
+Transactions on Robotics, 2008.** In the
+[author-hosted paper](https://www.cs.cmu.edu/~kaess/pub/Kaess08tro.pdf), §III,
+new measurement rows extend the triangular factor and are eliminated with Givens
+rotations, with corresponding right-hand-side updates. Thus incremental square-root
+maintenance in SLAM itself is long established, not merely a numerical-library
+technique. The important distinction is the retained object: iSAM updates a
+linearized global measurement system, whereas the proposed local roots encode
+fixed feature rows that can subsequently evaluate a nonlinear factor at any
+pose. This distinction describes scope, not an argument that specialization
+alone establishes novelty.
+
+**Doherty, Lu, Singh, Leonard, *Discrete-Continuous Smoothing and Mapping*, 2022.**
+The [initial author preprint](https://arxiv.org/pdf/2204.11936v1), §V-A, explicitly
+represents point-cloud correspondences as discrete variables and the rigid
+transformation as a continuous variable, recovering ICP through alternating
+optimization. Section IV-B uses iSAM2 for incremental continuous inference.
+The [revised paper](https://arxiv.org/pdf/2204.11936) retains the incremental
+inference discussion, but its organization and examples differ; the ICP citation
+here is intentionally versioned to v1. This is further reason not to claim a
+new general connection between correspondence updates and incremental smoothing.
+The inspected sections do not provide anchored winner-margin certificates or
+7/13-column all-pose feature-root updates.
+
+**Liu, Liu, Zhang, *Efficient and Consistent Bundle Adjustment on Lidar Point
+Clouds* (BALM2).** The [author preprint](https://arxiv.org/abs/2209.08854) and
+[v2 full text](https://arxiv.org/pdf/2209.08854v2), revised June 2024, formalize
+point clusters that compactly represent points associated with a common feature.
+The resulting solver evaluates costs, derivatives, and uncertainty without
+enumerating every raw point at every evaluation. This is adjacent and significant
+prior art for pose-dependent LiDAR optimization from compact geometric statistics.
+It uses a feature-eliminating bundle-adjustment formulation, not FORM's exact
+existing point/plane residual contract. Consequently its runtime and accuracy
+must not be compared as if only a summary representation had changed. A claim
+such as “first pose-independent sufficient statistics for LiDAR optimization”
+would be untenable without a much more precise definition.
+
+**Fang and coauthors, *Inc-DLOM: Incremental Direct LiDAR Odometry and Mapping*,
+2025.** The [institutional full text](https://ira.lib.polyu.edu.hk/bitstream/10397/110702/1/Fang_Inc-DLOM_Incremental_Direct.pdf)
+defines Incremental GICP using voxel-map lookup and constructs pose-dependent
+normal-equation contributions in equations (17)–(20). Its Cholesky square root
+whitens a covariance; it should not be confused with a dynamically maintained
+all-pose feature QR root. This is a useful negative classification result:
+keywords “incremental,” “GICP,” and “square root” do not identify the same claim.
+
+### Revised assessment and additional falsification checks
+
+The follow-up reinforces the original assessment: ordinary exact correspondence
+tracking, bounded fallback search, incremental square-root SLAM, compact LiDAR
+statistics, and discrete/continuous incremental inference are all established.
+No source inspected in this bounded search directly supplied the entire FORM
+contract proposed here. **That absence in retrieved sources is not evidence of
+priority or a completed novelty check.** The unretrieved 2001 paper and broader
+forward citations remain limitations.
+
+Add STCNN/k-d and previous-neighbor Delaunay search to the comparator candidates,
+subject to matching-semantic compatibility. Separate the question “can a
+certificate avoid a full query?” from “is it faster than an exact locally warm
+query?” Report certificate scan cost even when no correspondence changes: a
+per-query certificate pass remains linear in the number of queries, so a
+claim that total rematching work depends only on changed correspondences would
+require additional event scheduling or a different proven algorithm.
+
+For partial QR, compare both whole-pair reuse and a fixed dirty-leaf tree with
+ordinary row-update methods. Demonstrate that any observed benefit survives
+changing leaf organization and correspondence churn. An advantage caused only by
+grouping rows into large batches is a batching result, not evidence for a new
+certificate-to-summary coupling. The possible research value is a proved,
+numerically reliable preservation of the entire FORM estimator contract with a
+measured useful operating range; that remains to be established experimentally.

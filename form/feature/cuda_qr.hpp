@@ -13,6 +13,7 @@ public:
   using InputObserver = void (*)(const std::vector<Eigen::MatrixXd>&);
   /// Diagnostic hook; set before processing, one caller at a time.
   static void setInputObserver(InputObserver observer);
+  static bool hasInputObserver();
   ~BatchedCudaQr();
   BatchedCudaQr(const BatchedCudaQr&) = delete;
   BatchedCudaQr& operator=(const BatchedCudaQr&) = delete;
@@ -37,6 +38,22 @@ public:
   std::vector<Eigen::MatrixXd> computeDevicePacked(
       const double* packed, const std::vector<DeviceInput>& input,
       void* producer_stream = nullptr);
+  struct IncrementalStats {
+    size_t active_leaves=0;
+    unsigned long long dirty_leaves=0, merge_tiles=0, changed_groups=0;
+  };
+  /// Fixed 64x7 column-major leaves; flattened index is group*capacity+leaf.
+  /// All-zero rows represent holes. Clean leaves retain their cached roots.
+  /// reset/configuration changes initialize clean leaves to zero; callers must
+  /// mark every populated leaf dirty on those calls. Active extents may shrink.
+  /// Producer buffers remain caller-owned; return waits for every input read.
+  std::vector<Eigen::MatrixXd> computeDevicePackedIncremental(
+      const double* packed, const unsigned char* dirty, size_t leaf_capacity_per_group,
+      const std::vector<size_t>& active_leaves, bool plane,
+      void* producer_stream = nullptr);
+  void resetIncremental();
+  /// Latest call's work; device counters are downloaded only on request.
+  IncrementalStats incrementalStats();
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

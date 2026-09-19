@@ -22,7 +22,7 @@ public:
     if(stats_path && *stats_path) {
       stats_.exceptions(std::ios::failbit|std::ios::badbit);
       stats_.open(stats_path);
-      stats_ << "scan,kind,total,certified,searched,cell_fallback,gap_fallback,unchanged,mismatches,oracle_searched\n";
+      stats_ << "scan,kind,total,certified,searched,cell_fallback,gap_fallback,unchanged,mismatches,oracle_searched,active_leaves,dirty_leaves,summary_checks,relative_gram_error\n";
     }
     const char* path=std::getenv("FORM_MATCH_AUDIT_PATH");
     if(!path || !*path) return;
@@ -35,11 +35,12 @@ public:
   }
   bool enabled() const { return output_.is_open(); }
   bool statsEnabled() const { return stats_.is_open(); }
-  void appendStats(size_t scan,int kind,const CudaMatcher::ReuseStats& s) {
+  void appendStats(size_t scan,int kind,const CudaMatcher::ReuseStats& s,const CudaMatcher::SummaryStats& q) {
     std::lock_guard<std::mutex> lock(mutex_);
     stats_ << scan << ',' << kind << ',' << s.total << ',' << s.certified << ',' << s.searched
            << ',' << s.cell_fallback << ',' << s.gap_fallback << ',' << s.unchanged << ',' << s.mismatches
-           << ',' << s.oracle_searched << '\n';
+           << ',' << s.oracle_searched << ',' << q.active_leaves << ',' << q.dirty_leaves << ',' << q.full_rebuild_checks
+           << ',' << q.relative_gram_error << '\n';
     stats_.flush();
   }
   void append(size_t scan,int kind,const std::vector<size_t>& groups,

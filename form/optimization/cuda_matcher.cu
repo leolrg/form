@@ -4,6 +4,7 @@
 #include "form/feature/cuda_qr.hpp"
 #include <cuda_runtime.h>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -322,6 +323,90 @@ __global__ void pack(const CudaMatcher::MapPoint* points,const CudaMatcher::Quer
   }
   for(int k=0;k<7;++k) output[group.offset+row+size_t(k)*group.rows]=v[k];
 }
+
+// Stable slots belong to a target scan. Pose changes alone never dirty a row:
+// local feature coordinates are immutable for this snapshot.
+__global__ void updateStableRows(const CudaMatcher::Result* results,const int* keys,int count,
+                                int groups,int stride,int* query_slots,int* slot_queries,
+                                int* previous_targets,int* dirty) {
+  const int q=blockIdx.x*blockDim.x+threadIdx.x;
+  if(q>=count) return;
+  const int slot=query_slots[q],target=results[q].index;
+  const int group=keys[q]<groups?keys[q]:-1;
+  if(slot>=0 && (group!=slot/stride || target!=previous_targets[q])) {
+    atomicExch(dirty+slot/64,1);
+    if(group!=slot/stride) { slot_queries[slot]=-1; query_slots[q]=-1; }
+  }
+  previous_targets[q]=target;
+}
+
+// One block per target scan compacts arriving rows and fills its first holes.
+// Block scans preserve query order and avoid global allocation atomics.
+__global__ void fillStableRows(const Group* groups,const int* sorted,int stride,
+                              int* query_slots,int* slot_queries,int* incoming,
+                              int* highwater,int* dirty) {
+  using Scan=cub::BlockScan<int,256>;
+  __shared__ typename Scan::TempStorage temporary;
+  __shared__ int arrivals,holes,last;
+  const int g=blockIdx.x,t=threadIdx.x;
+  const Group group=groups[g];
+  if(t==0) { arrivals=0; holes=0; last=highwater[g]; }
+  __syncthreads();
+  for(int start=0;start<group.rows;start+=256) {
+    const int row=start+t;
+    const int q=row<group.rows?sorted[group.first+row]:-1;
+    const int fresh=q>=0 && query_slots[q]<0;
+    int prefix,total;
+    Scan(temporary).ExclusiveSum(fresh,prefix,total);
+    if(fresh) incoming[g*stride+arrivals+prefix]=q;
+    __syncthreads();
+    if(t==0) arrivals+=total;
+    __syncthreads();
+  }
+  const int end=highwater[g]+min(stride-highwater[g],arrivals);
+  for(int start=0;start<end && holes<arrivals;start+=256) {
+    const int slot=start+t;
+    const int vacant=slot<end && slot_queries[g*stride+slot]<0;
+    int prefix,total;
+    Scan(temporary).ExclusiveSum(vacant,prefix,total);
+    if(vacant && holes+prefix<arrivals) {
+      const int q=incoming[g*stride+holes+prefix];
+      slot_queries[g*stride+slot]=q; query_slots[q]=g*stride+slot;
+      atomicExch(dirty+(g*stride+slot)/64,1);
+      atomicMax(&last,slot+1);
+    }
+    __syncthreads();
+    if(t==0) holes+=total;
+    __syncthreads();
+  }
+  if(t==0) highwater[g]=last;
+}
+
+__global__ void packStableLeaves(const CudaMatcher::MapPoint* points,const CudaMatcher::Query* queries,
+                                const CudaMatcher::Result* results,const int* slots,const int* highwater,
+                                const int* dirty,unsigned char* flags,int stride,bool plane,double* output) {
+  const int g=blockIdx.y,leaf=blockIdx.x;
+  if(leaf*64>=highwater[g]) return;
+  const int node=g*(stride/64)+leaf,row=threadIdx.x;
+  const bool changed=dirty[node]!=0;
+  if(row==0) flags[node]=changed;
+  if(!changed) return;
+  const int q=slots[g*stride+leaf*64+row];
+  double v[7]={};
+  if(q>=0) {
+    const auto p=points[results[q].index];
+    const auto query=queries[q];
+    if(plane) {
+      for(int k=0;k<3;++k) { v[k]=query.point[k]; v[3+k]=p.normal[k]; }
+      v[6]=p.normal[0]*(query.point[0]-p.local[0])+
+        (p.normal[1]*(query.point[1]-p.local[1])+p.normal[2]*(query.point[2]-p.local[2]));
+    } else {
+      v[0]=1.;
+      for(int k=0;k<3;++k) { v[1+k]=p.local[k]; v[4+k]=query.point[k]-p.local[k]; }
+    }
+  }
+  for(int k=0;k<7;++k) output[size_t(node)*64*7+row+k*64]=v[k];
+}
 }
 struct CudaMatcher::Impl {
   cudaStream_t stream=nullptr;
@@ -351,6 +436,16 @@ struct CudaMatcher::Impl {
   double width=1.;
   bool ready=false,searched=false;
   BatchedCudaQr qr;
+  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false;
+  size_t summary_checks=0;
+  double summary_relative_error=0.;
+  Buffer<int> query_slots,slot_queries,previous_targets,incoming,highwater,dirty_leaves;
+  Buffer<unsigned char> dirty_flags;
+  Buffer<double> stable_packed;
+  std::vector<int> host_highwater;
+  int slot_stride=0;
+  void invalidateSummaries() { summary_valid=false; qr.resetIncremental(); }
+  std::vector<Eigen::MatrixXd> packIncremental(const std::vector<Group>& descriptors,bool plane);
   void launchSearch(const std::array<double,12>& matrix);
   std::vector<Eigen::MatrixXd> packSummaries(const std::vector<Group>& descriptors,
       const std::vector<BatchedCudaQr::DeviceInput>& shapes,size_t total,int max_rows,bool plane);
@@ -358,6 +453,12 @@ struct CudaMatcher::Impl {
   ~Impl() { if(stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
 };
 CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
+  if(const char* value=std::getenv("FORM_CUDA_SUMMARY_REUSE")) {
+    const std::string mode(value);
+    if(mode=="blocks64" || mode=="audit64") {
+      setIncrementalSummaries(true); impl_->summary_audit=mode=="audit64";
+    } else if(mode!="off") throw std::invalid_argument("Invalid FORM_CUDA_SUMMARY_REUSE (off|blocks64|audit64)");
+  }
   if(const char* value=std::getenv("FORM_CUDA_MATCH_REUSE")) {
     const std::string mode(value);
     if(mode=="audit") setReuseMode(ReuseMode::Audit);
@@ -366,6 +467,14 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
   }
 }
 CudaMatcher::~CudaMatcher()=default;
+void CudaMatcher::setIncrementalSummaries(bool enabled) {
+  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false;
+}
+CudaMatcher::SummaryStats CudaMatcher::summaryStats() {
+  if(!impl_->incremental_summaries || !impl_->summary_valid) return {};
+  const auto stats=impl_->qr.incrementalStats();
+  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error};
+}
 void CudaMatcher::setReuseMode(ReuseMode mode) {
   auto& s=*impl_;
   s.anchors_valid=false; s.stats_ready=false;
@@ -396,6 +505,7 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
                         const std::vector<int>& point_pose_indices) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::matcher_reset);
   auto& s=*impl_;
+  s.invalidateSummaries();
   s.anchors_valid=false; s.stats_ready=false;
   s.ready=false; s.searched=false; s.groups_ready=false; s.host_results_ready=false;
   if(!std::isfinite(width) || width<=0) throw std::invalid_argument("Invalid CUDA voxel width");
@@ -511,6 +621,7 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
 void CudaMatcher::setGroups(const std::vector<int>& target_groups,size_t group_count) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_group_setup);
   auto& s=*impl_;
+  s.invalidateSummaries();
   s.groups_ready=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before grouping");
   if(target_groups.size()!=size_t(s.point_count) || group_count>65535)
@@ -571,9 +682,76 @@ CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,1
           s.sequence.data,s.indices.data,s.count,0,s.sort_bits,s.stream));
   }
   phase.reset();
-  result.roots=s.packSummaries(descriptors,shapes,total,max_rows,plane);
+  s.summary_checks=0; s.summary_relative_error=0.;
+  if(s.incremental_summaries && !BatchedCudaQr::hasInputObserver()) {
+    result.roots=s.packIncremental(descriptors,plane);
+    if(s.summary_audit) {
+      auto fresh=s.packSummaries(descriptors,shapes,total,max_rows,plane);
+      for(size_t group=0;group<fresh.size();++group) {
+        const Eigen::MatrixXd reference=fresh[group].transpose()*fresh[group];
+        const Eigen::MatrixXd actual=result.roots[group].transpose()*result.roots[group];
+        const double error=(actual-reference).norm()/(1.+reference.norm());
+        if(!std::isfinite(error) || error>1e-10)
+          throw std::runtime_error("Incremental summary differs from full QR reconstruction");
+        s.summary_relative_error=std::max(s.summary_relative_error,error); ++s.summary_checks;
+      }
+      result.roots=std::move(fresh); // Keep the original solver feedback in audits.
+    }
+  }
+  else {
+    s.invalidateSummaries(); // Diagnostic observers require logical raw row order.
+    result.roots=s.packSummaries(descriptors,shapes,total,max_rows,plane);
+  }
   return result;
-} catch(...) { impl_->anchors_valid=false; impl_->stats_ready=false; throw; }
+} catch(...) { impl_->anchors_valid=false; impl_->stats_ready=false; impl_->invalidateSummaries(); throw; }
+
+std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packIncremental(const std::vector<Group>& descriptors,bool plane) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_pack);
+  auto& s=*this;
+  if(!s.summary_valid || s.summary_plane!=plane) {
+    s.invalidateSummaries();
+    const size_t stride=std::max<size_t>(64,((size_t(s.count)+63)/64)*64);
+    const size_t slots=stride*size_t(s.group_count);
+    if(stride>size_t(std::numeric_limits<int>::max()) || slots>size_t(std::numeric_limits<int>::max()))
+      throw std::invalid_argument("Incremental summary slot dimensions exceed int range");
+    s.slot_stride=int(stride);
+    s.query_slots.reserve(s.count); s.previous_targets.reserve(s.count);
+    s.slot_queries.reserve(slots); s.incoming.reserve(slots);
+    s.highwater.reserve(s.group_count); s.host_highwater.assign(s.group_count,0);
+    s.dirty_leaves.reserve(slots/64); s.dirty_flags.reserve(slots/64);
+    s.stable_packed.reserve(slots*7);
+    if(s.count) check(cudaMemsetAsync(s.query_slots.data,0xff,size_t(s.count)*sizeof(int),s.stream));
+    if(slots) check(cudaMemsetAsync(s.slot_queries.data,0xff,slots*sizeof(int),s.stream));
+    if(s.group_count) check(cudaMemsetAsync(s.highwater.data,0,size_t(s.group_count)*sizeof(int),s.stream));
+    s.summary_plane=plane;
+  }
+  const size_t leaves=size_t(s.group_count)*(s.slot_stride/64);
+  if(leaves) check(cudaMemsetAsync(s.dirty_leaves.data,0,leaves*sizeof(int),s.stream));
+  s.groups.upload(descriptors,s.stream);
+  if(s.count) {
+    updateStableRows<<<1+(s.count-1)/256,256,0,s.stream>>>(s.results.data,s.sort_keys.data,s.count,s.group_count,
+      s.slot_stride,s.query_slots.data,s.slot_queries.data,s.previous_targets.data,s.dirty_leaves.data);
+    check(cudaGetLastError());
+  }
+  if(s.group_count) {
+    fillStableRows<<<s.group_count,256,0,s.stream>>>(s.groups.data,s.indices.data,s.slot_stride,
+      s.query_slots.data,s.slot_queries.data,s.incoming.data,s.highwater.data,s.dirty_leaves.data);
+    check(cudaGetLastError());
+    check(cudaMemcpyAsync(s.host_highwater.data(),s.highwater.data,size_t(s.group_count)*sizeof(int),cudaMemcpyDeviceToHost,s.stream));
+  }
+  check(cudaStreamSynchronize(s.stream));
+  std::vector<size_t> active;
+  int maximum=0;
+  for(int high:s.host_highwater) { const int n=(high+63)/64; active.push_back(n); maximum=std::max(maximum,n); }
+  if(maximum) {
+    packStableLeaves<<<dim3(maximum,s.group_count),64,0,s.stream>>>(s.points.data,s.queries.data,s.results.data,
+      s.slot_queries.data,s.highwater.data,s.dirty_leaves.data,s.dirty_flags.data,s.slot_stride,plane,s.stable_packed.data);
+    check(cudaGetLastError());
+  }
+  auto roots=s.qr.computeDevicePackedIncremental(s.stable_packed.data,s.dirty_flags.data,s.slot_stride/64,active,plane,s.stream);
+  s.summary_valid=true;
+  return roots;
+}
 std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packSummaries(const std::vector<Group>& descriptors,
     const std::vector<BatchedCudaQr::DeviceInput>& shapes,size_t total,int max_rows,bool plane) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_pack);

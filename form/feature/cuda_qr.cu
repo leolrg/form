@@ -159,6 +159,37 @@ __global__ void qrTiles(const double* input, double* output,
   if(task.width==7) qrWarp<7,Rows>(input,output,task);
   else qrWarp<13,Rows>(input,output,task);
 }
+// Each dirty leaf uses exactly the same Householder arithmetic as full QR.
+__global__ void qrDirtyLeaves(const double* input,double* roots,const unsigned char* dirty,
+                              const Task* tasks,const int* task_groups,int count,
+                              unsigned int* changed,unsigned long long* work) {
+  const size_t tile=(static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;
+  if(tile>=size_t(count)) return;
+  const Task task=tasks[tile];
+  if(!dirty[task.source/(64*7)]) return; // Warp-uniform, before any input read.
+  if(threadIdx.x%32==0) { atomicExch(changed+task_groups[tile],1u); atomicAdd(work,1ULL); }
+  if(task.width==7) qrWarp<7,64>(input,roots,task);
+  else qrWarp<13,64>(input,roots,task);
+}
+__global__ void qrChangedGroups(const double* input,double* output,const Task* tasks,
+                                const int* task_groups,int count,const unsigned int* changed,
+                                unsigned long long* work) {
+  const size_t tile=(static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;
+  if(tile>=size_t(count) || !changed[task_groups[tile]]) return;
+  const Task task=tasks[tile];
+  if(threadIdx.x%32==0) atomicAdd(work+1,1ULL);
+  if(task.width==7) qrWarp<7,64>(input,output,task);
+  else qrWarp<13,64>(input,output,task);
+}
+__global__ void retainGroupRoots(const double* input,double* roots,const size_t* offsets,
+                                 const size_t* active,const unsigned int* changed,
+                                 int width,unsigned long long* work) {
+  const size_t group=blockIdx.x;
+  if(!changed[group]) return;
+  if(threadIdx.x==0) atomicAdd(work+2,1ULL);
+  for(int element=threadIdx.x;element<width*width;element+=blockDim.x)
+    roots[group*width*width+element]=active[group]?input[offsets[group]+element]:0.;
+}
 } // namespace
 
 struct BatchedCudaQr::Impl {
@@ -169,6 +200,15 @@ struct BatchedCudaQr::Impl {
   HostBuffer<double> host_input, host_roots;
   HostBuffer<Task> host_tasks;
   int first_rows,reduction_rows,block_threads;
+  Buffer<double> incremental_leaves,incremental_roots;
+  Buffer<int> incremental_task_groups;
+  Buffer<size_t> incremental_offsets,incremental_active;
+  Buffer<unsigned int> incremental_changed;
+  Buffer<unsigned long long> incremental_work;
+  size_t incremental_capacity=0,incremental_groups=0;
+  bool incremental_plane=false,incremental_ready=false,incremental_stats_ready=false;
+  std::vector<size_t> incremental_previous_active;
+  size_t incremental_total_active=0;
   std::vector<Eigen::MatrixXd> run(const std::vector<InputLayout>& input, size_t total,
                                    const double* device_input = nullptr, bool device = false);
   explicit Impl(bool pinned,int first,int reduction,int threads)
@@ -187,7 +227,174 @@ struct BatchedCudaQr::Impl {
 BatchedCudaQr::BatchedCudaQr(bool pinned_host_buffers,int first_rows,int reduction_rows,int block_threads)
     : impl_(std::make_unique<Impl>(pinned_host_buffers,first_rows,reduction_rows,block_threads)) {}
 void BatchedCudaQr::setInputObserver(InputObserver observer) { input_observer = observer; }
+bool BatchedCudaQr::hasInputObserver() { return input_observer!=nullptr; }
 BatchedCudaQr::~BatchedCudaQr() = default;
+void BatchedCudaQr::resetIncremental() {
+  impl_->incremental_ready=false; impl_->incremental_stats_ready=false;
+}
+BatchedCudaQr::IncrementalStats BatchedCudaQr::incrementalStats() {
+  auto& state=*impl_;
+  IncrementalStats result;
+  if(!state.incremental_stats_ready) return result;
+  result.active_leaves=state.incremental_total_active;
+  unsigned long long work[3]={};
+  check(cudaMemcpyAsync(work,state.incremental_work.data,sizeof(work),cudaMemcpyDeviceToHost,state.stream));
+  check(cudaStreamSynchronize(state.stream));
+  result.dirty_leaves=work[0]; result.merge_tiles=work[1]; result.changed_groups=work[2];
+  return result;
+}
+std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncremental(
+    const double* packed,const unsigned char* dirty,size_t capacity,
+    const std::vector<size_t>& active,bool plane,void* producer_stream) {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::qr_total);
+  auto& state=*impl_;
+  const bool retained=state.incremental_ready && state.incremental_capacity==capacity &&
+    state.incremental_groups==active.size() && state.incremental_plane==plane;
+  // Any failure leaves the next call conservatively zero-initialized.
+  state.incremental_ready=false; state.incremental_stats_ready=false;
+  const size_t groups=active.size();
+  const int width=plane?13:7;
+  constexpr size_t leaf_elements=64*7;
+  const size_t square=size_t(width)*width;
+  if(groups>size_t(std::numeric_limits<int>::max()) ||
+     (groups && capacity>std::numeric_limits<size_t>::max()/groups))
+    throw std::invalid_argument("CUDA incremental QR layout overflows");
+  const size_t allocated=groups*capacity;
+  if(allocated>std::numeric_limits<size_t>::max()/leaf_elements)
+    throw std::invalid_argument("CUDA incremental QR leaf layout overflows");
+  addElements(0,allocated*leaf_elements);
+  const size_t leaf_root_elements=addElements(0,allocated*square);
+  const size_t group_root_elements=addElements(0,groups*square);
+  size_t total_active=0;
+  for(size_t count:active) {
+    if(count>capacity || count>size_t(std::numeric_limits<int>::max()) ||
+       total_active>size_t(std::numeric_limits<int>::max())-count)
+      throw std::invalid_argument("CUDA incremental QR active extent is invalid");
+    total_active+=count;
+  }
+  if(total_active && (!packed || !dirty))
+    throw std::invalid_argument("CUDA incremental QR device input is null");
+  check(cudaEventRecord(state.producer_ready.value,static_cast<cudaStream_t>(producer_stream)));
+  check(cudaStreamWaitEvent(state.stream,state.producer_ready.value,0));
+  state.incremental_work.reserve(3);
+  check(cudaMemsetAsync(state.incremental_work.data,0,3*sizeof(unsigned long long),state.stream));
+  state.incremental_leaves.reserve(std::max<size_t>(1,leaf_root_elements));
+  state.incremental_roots.reserve(std::max<size_t>(1,group_root_elements));
+  if(!retained) {
+    if(leaf_root_elements) check(cudaMemsetAsync(state.incremental_leaves.data,0,leaf_root_elements*sizeof(double),state.stream));
+    if(group_root_elements) check(cudaMemsetAsync(state.incremental_roots.data,0,group_root_elements*sizeof(double),state.stream));
+  }
+  std::vector<unsigned int> changed(groups);
+  std::vector<Task> tasks;
+  std::vector<int> task_groups;
+  std::vector<Layout> layout;
+  for(size_t group=0;group<groups;++group) {
+    changed[group]=!retained || active[group]!=state.incremental_previous_active[group];
+    layout.push_back({group*capacity*square,int(active[group]),width});
+    for(size_t leaf=0;leaf<active[group];++leaf) {
+      const size_t flat=group*capacity+leaf;
+      tasks.push_back({flat*leaf_elements,flat*square,64,width,64,plane?2:0});
+      task_groups.push_back(int(group));
+    }
+  }
+  const size_t first_count=tasks.size();
+  std::vector<std::pair<size_t,size_t>> levels;
+  while(std::any_of(layout.begin(),layout.end(),[](auto item){return item.roots>1;})) {
+    const size_t begin=tasks.size();
+    std::vector<Layout> next;
+    size_t destination=0;
+    for(size_t group=0;group<groups;++group) {
+      const auto item=layout[group];
+      const int fanin=64/width;
+      const int roots=item.roots/fanin+(item.roots%fanin!=0);
+      next.push_back({destination,roots,width});
+      for(int root=0;root<roots;++root) {
+        tasks.push_back({item.offset+size_t(root)*fanin*square,destination+size_t(root)*square,
+                         std::min(fanin,item.roots-root*fanin)*width,width,width,1});
+        task_groups.push_back(int(group));
+      }
+      destination=addElements(destination,size_t(roots)*square);
+    }
+    levels.push_back({begin,tasks.size()-begin}); layout=std::move(next);
+  }
+  std::vector<size_t> offsets;
+  for(const auto& item:layout) offsets.push_back(item.offset);
+  state.incremental_changed.reserve(groups); state.incremental_active.reserve(groups);
+  state.incremental_offsets.reserve(groups); state.incremental_task_groups.reserve(tasks.size());
+  state.descriptors.reserve(tasks.size()); state.host_tasks.reserve(tasks.size());
+  state.a.reserve(std::max<size_t>(1,total_active*square));
+  state.b.reserve(std::max<size_t>(1,total_active*square));
+  state.host_roots.reserve(std::max<size_t>(1,group_root_elements));
+  if(groups) {
+    check(cudaMemcpyAsync(state.incremental_changed.data,changed.data(),groups*sizeof(unsigned int),cudaMemcpyHostToDevice,state.stream));
+    check(cudaMemcpyAsync(state.incremental_active.data,active.data(),groups*sizeof(size_t),cudaMemcpyHostToDevice,state.stream));
+    check(cudaMemcpyAsync(state.incremental_offsets.data,offsets.data(),groups*sizeof(size_t),cudaMemcpyHostToDevice,state.stream));
+  }
+  if(!tasks.empty()) {
+    std::memcpy(state.host_tasks.data,tasks.data(),tasks.size()*sizeof(Task));
+    check(cudaMemcpyAsync(state.descriptors.data,state.host_tasks.data,tasks.size()*sizeof(Task),cudaMemcpyHostToDevice,state.stream));
+    check(cudaMemcpyAsync(state.incremental_task_groups.data,task_groups.data(),tasks.size()*sizeof(int),cudaMemcpyHostToDevice,state.stream));
+  }
+  const int warps=state.block_threads/32;
+  if(first_count) {
+    qrDirtyLeaves<<<(first_count+warps-1)/warps,state.block_threads,0,state.stream>>>(
+      packed,state.incremental_leaves.data,dirty,state.descriptors.data,state.incremental_task_groups.data,
+      int(first_count),state.incremental_changed.data,state.incremental_work.data);
+    check(cudaGetLastError());
+  }
+  const double* source=state.incremental_leaves.data;
+  double* destination=state.a.data;
+  for(auto level:levels) {
+    qrChangedGroups<<<(level.second+warps-1)/warps,state.block_threads,0,state.stream>>>(
+      source,destination,state.descriptors.data+level.first,state.incremental_task_groups.data+level.first,
+      int(level.second),state.incremental_changed.data,state.incremental_work.data);
+    check(cudaGetLastError());
+    source=destination; destination=destination==state.a.data?state.b.data:state.a.data;
+  }
+  if(groups) {
+    retainGroupRoots<<<groups,32,0,state.stream>>>(source,state.incremental_roots.data,
+      state.incremental_offsets.data,state.incremental_active.data,state.incremental_changed.data,width,state.incremental_work.data);
+    check(cudaGetLastError());
+    check(cudaMemcpyAsync(state.host_roots.data,state.incremental_roots.data,group_root_elements*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
+  }
+  check(cudaStreamSynchronize(state.stream));
+  if(input_observer) {
+    // Diagnostic-only download preserves group rows, including all-zero holes.
+    state.host_input.reserve(std::max<size_t>(1,total_active*leaf_elements));
+    size_t cursor=0;
+    for(size_t group=0;group<groups;++group) {
+      const size_t count=active[group]*leaf_elements;
+      if(count) check(cudaMemcpyAsync(state.host_input.data+cursor,packed+group*capacity*leaf_elements,count*sizeof(double),cudaMemcpyDeviceToHost,state.stream));
+      cursor+=count;
+    }
+    check(cudaStreamSynchronize(state.stream));
+    std::vector<Eigen::MatrixXd> observed;
+    cursor=0;
+    for(size_t group=0;group<groups;++group) {
+      Eigen::MatrixXd expanded(active[group]*64,width);
+      for(size_t leaf=0;leaf<active[group];++leaf) {
+        const Eigen::Map<const Eigen::Matrix<double,64,7>> compact(state.host_input.data+cursor);
+        if(!plane) expanded.middleRows(leaf*64,64)=compact;
+        else {
+          for(int a=0;a<3;++a) for(int b=0;b<3;++b)
+            expanded.block(leaf*64,3*a+b,64,1)=compact.col(3+a).cwiseProduct(compact.col(b));
+          expanded.block(leaf*64,9,64,3)=compact.middleCols(3,3);
+          expanded.block(leaf*64,12,64,1)=compact.col(6);
+        }
+        cursor+=leaf_elements;
+      }
+      observed.emplace_back(std::move(expanded));
+    }
+    input_observer(observed);
+  }
+  std::vector<Eigen::MatrixXd> result;
+  for(size_t group=0;group<groups;++group)
+    result.emplace_back(Eigen::Map<const Eigen::MatrixXd>(state.host_roots.data+group*square,width,width));
+  state.incremental_capacity=capacity; state.incremental_groups=groups; state.incremental_plane=plane;
+  state.incremental_previous_active=active; state.incremental_total_active=total_active;
+  state.incremental_ready=true; state.incremental_stats_ready=true;
+  return result;
+}
 
 std::vector<Eigen::MatrixXd>
 BatchedCudaQr::computeCorrespondences(const std::vector<Correspondences>& input) {
