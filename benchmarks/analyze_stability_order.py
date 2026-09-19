@@ -1,28 +1,34 @@
 """Offline stable64 ordering experiment; counts QR work, never predicts timing.
 
 Policies: ordinary query order; future change-count ordering (unimplementable
-oracle heuristic, not an optimum); and reorder once at rematch 1 using the first
-observed change flag, paying for a complete rebuild. Later incoming rows always
-use ascending original query IDs and first holes. One scan's histories are held
+oracle heuristic, not an optimum); reorder once at rematch 1 using the first
+observed change flag, paying for a complete rebuild; a rematch-2 persistence
+score with full rebuild; and stable partitioning only already-dirty leaves.
+Later incoming rows always use ascending original query IDs and first holes.
+One scan's histories are held
 at a time. Actual QR counters include zero-filled dirty leaves, persistent
 highwater holes, and singleton parent copies, matching the cached-tree work
 rules rather than the optimistic live-row-only StableBlocks counters.
 """
 import argparse
+from collections import Counter
 import json
 
 from analyze_match_audit import read_records
-from analyze_stable_blocks import StableBlocks
+from analyze_stable_blocks import StableBlocks, merge_work
 
 
-POLICIES = ('query_order', 'oracle_future_changes', 'first_change_flag')
+POLICIES = ('query_order', 'oracle_future_changes', 'first_change_flag',
+            'two_transition_persistence', 'dirty_only_partition')
+PHASES = ('first', 'steady', 'reorder', 'total', 'after_rematch2')
 
 
 class PrioritizedBlocks(StableBlocks):
-    """Sort only the initial arrivals; maintain caller indices thereafter."""
-    def __init__(self, kind, priority=None):
+    """Optional initial priority and dirty-only moves preserve caller indices."""
+    def __init__(self, kind, priority=None, dirty_partition=False):
         super().__init__(64, kind, hole_policy='first')
         self.priority = priority
+        self.dirty_partition = dirty_partition
 
     def update(self, rows):
         old_rows = self.previous
@@ -52,6 +58,9 @@ class PrioritizedBlocks(StableBlocks):
                 if location is not None:
                     group, slot = location
                     dirty.setdefault(group, set()).add(slot // 64)
+        if self.dirty_partition:
+            self.partition_dirty(rows, old_rows, dirty)
+            self.recount_partitioned(result, dirty)
         merges = inputs = copies = 0
         for group, changed in dirty.items():
             extent = len(self.slots[group]) // 64
@@ -72,6 +81,40 @@ class PrioritizedBlocks(StableBlocks):
                       actual_cached_copy_nodes=copies, actual_qr64_tasks=leaves + merges)
         return result
 
+    def partition_dirty(self, rows, old_rows, dirty):
+        for group, leaves in dirty.items():
+            indices = [slot for leaf in sorted(leaves)
+                       for slot in range(leaf * 64, (leaf + 1) * 64)]
+            queries = [self.slots[group][slot] for slot in indices
+                       if self.slots[group][slot] is not None]
+            # Python's stable sort preserves existing slot order inside each
+            # class, including after previous partitions and migrations.
+            queries.sort(key=lambda q: old_rows is not None and old_rows[q] == rows[q])
+            for i, slot in enumerate(indices):
+                query = queries[i] if i < len(queries) else None
+                self.slots[group][slot] = query
+                if query is not None:
+                    self.locations[query] = (group, slot)
+
+    def recount_partitioned(self, result, dirty):
+        """Keep inherited live-row counters accurate after holes move."""
+        active = Counter((group, slot // 64)
+                         for group, slots in self.slots.items()
+                         for slot, query in enumerate(slots) if query is not None)
+        dirty_pairs = {(group, leaf) for group, leaves in dirty.items() for leaf in leaves}
+        surviving = sum(leaf in active for leaf in dirty_pairs)
+        nodes = inputs = 0
+        for group, leaves in dirty.items():
+            n, i = merge_work([leaf for g, leaf in active if g == group], leaves,
+                              self.fanout, len(self.slots[group]) // 64)
+            nodes += n
+            inputs += i
+        result.update(active_leaves=len(active), dirty_surviving_leaves=surviving,
+                      rebuild_padded_rows=64 * surviving, rebuild_qr64_tiles=surviving,
+                      produced_leaf_root_rows=sum(min(self.columns, active[k]) for k in dirty_pairs),
+                      flat_merge_input_roots=sum(g in dirty for g, _ in active),
+                      tree_merge_nodes=nodes, tree_merge_input_roots=inputs)
+
 
 def add_counts(target, counts):
     for key, value in counts.items():
@@ -80,8 +123,7 @@ def add_counts(target, counts):
 
 def analyze_snapshot(history, kind):
     """Analyze one feature-kind history with immutable original query indices."""
-    report = {p: {'first': {}, 'steady': {}, 'reorder': {}, 'total': {}}
-              for p in POLICIES}
+    report = {p: {phase: {} for phase in PHASES} for p in POLICIES}
     if not history:
         return report
     count = len(history[0])
@@ -93,26 +135,32 @@ def analyze_snapshot(history, kind):
             future[q] += a != b
     first_flag = ([int(a != b) for a, b in zip(history[0], history[1])]
                   if len(history) > 1 else [0] * count)
+    persistence = ([first_flag[q] + 2 * int(a != b)
+                    for q, (a, b) in enumerate(zip(history[1], history[2]))]
+                   if len(history) > 2 else [0] * count)
     for policy in POLICIES:
-        state = PrioritizedBlocks(kind, future if policy == 'oracle_future_changes' else None)
+        state = PrioritizedBlocks(kind, future if policy == 'oracle_future_changes' else None,
+                                  dirty_partition=policy == 'dirty_only_partition')
         for iteration, rows in enumerate(history):
-            reorder = policy == 'first_change_flag' and iteration == 1
+            reorder = ((policy == 'first_change_flag' and iteration == 1) or
+                       (policy == 'two_transition_persistence' and iteration == 2))
             if reorder:
-                state = PrioritizedBlocks(kind, first_flag)
+                state = PrioritizedBlocks(kind, first_flag if iteration == 1 else persistence)
             counters = state.update(rows)
             if reorder:
-                counters['changed_rows'] = sum(a != b for a, b in zip(history[0], rows))
+                counters['changed_rows'] = sum(a != b for a, b in zip(history[iteration - 1], rows))
                 add_counts(report[policy]['reorder'], counters)
             phase = 'first' if iteration == 0 else 'steady'
             add_counts(report[policy][phase], counters)
             add_counts(report[policy]['total'], counters)
+            if iteration > 2:
+                add_counts(report[policy]['after_rematch2'], counters)
     return report
 
 
 def summarize_records(records, warmup=20):
     report = dict(snapshots=0, feature_snapshots=0, max_snapshot_rows=0,
-                  policies={p: {'first': {}, 'steady': {}, 'reorder': {}, 'total': {}}
-                            for p in POLICIES}, by_kind={})
+                  policies={p: {phase: {} for phase in PHASES} for p in POLICIES}, by_kind={})
     histories = {}
     epoch = None
 

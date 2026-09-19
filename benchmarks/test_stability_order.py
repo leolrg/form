@@ -55,6 +55,79 @@ class StabilityOrderTests(unittest.TestCase):
         self.assertEqual(result['reorder']['searches'], 1)
         self.assertEqual(result['steady']['changed_rows'], 0)
 
+    def test_two_transition_rebuild_and_remaining_work(self):
+        first = [(9, i) for i in range(128)]
+        history = [first]
+        for step in range(1, 4):
+            rows = list(history[-1])
+            rows[0], rows[64] = (9, 1000 * step), (9, 1000 * step + 1)
+            history.append(rows)
+        result = analyze_snapshot(history, 0)
+        learned = result['two_transition_persistence']
+        self.assertEqual(learned['total']['actual_leaf_qr64'], 7)
+        self.assertEqual(learned['steady']['actual_leaf_qr64'], 5)
+        self.assertEqual(learned['reorder']['actual_leaf_qr64'], 2)
+        self.assertEqual(learned['after_rematch2']['actual_leaf_qr64'], 1)
+        self.assertEqual(result['query_order']['after_rematch2']['actual_leaf_qr64'], 2)
+        self.assertEqual(learned['steady']['changed_rows'], 6)
+
+    def test_two_transition_policy_does_not_rebuild_short_history(self):
+        rows = [(9, i) for i in range(65)]
+        result = analyze_snapshot([rows, rows], 0)['two_transition_persistence']
+        self.assertEqual(result['total']['actual_leaf_qr64'], 2)
+        self.assertEqual(result['reorder'], {})
+        self.assertEqual(result['after_rematch2'], {})
+
+    def test_two_transition_priority_uses_latest_change_weight(self):
+        first = [(9, i) for i in range(257)]
+        second = list(first)
+        # Initial-only unstable query gets score1; late change gets score2.
+        second[0] = (9, 1000)
+        third = list(second)
+        third[1] = (9, 1001)
+        fourth = list(third)
+        fourth[0] = (9, 2000)
+        result = analyze_snapshot([first, second, third, fourth], 0)
+        # Scores put original query0 at slot255, query1 at256. The changed
+        # query0 therefore dirties the four-input merge, not the singleton tail.
+        learned = result['two_transition_persistence']['after_rematch2']
+        self.assertEqual(learned['actual_leaf_qr64'], 1)
+        self.assertEqual(learned['actual_cached_merge_input_roots'], 6)
+
+    def test_dirty_partition_preserves_clean_leaves_and_row_ownership(self):
+        rows = [(9, q) for q in range(192)]
+        state = PrioritizedBlocks(0, dirty_partition=True)
+        normal = PrioritizedBlocks(0)
+        state.update(rows)
+        normal.update(rows)
+        clean = list(state.slots[9][64:128])
+        rows[0], rows[128], rows[129] = (9, 1000), (9, 1001), None
+        result = state.update(rows)
+        expected = normal.update(rows)
+        self.assertEqual(state.slots[9][64:128], clean)
+        self.assertEqual(state.slots[9][:2], [0, 128])
+        self.assertIsNone(state.slots[9][-1])
+        self.assertEqual(sorted(q for q in state.slots[9] if q is not None),
+                         [q for q, row in enumerate(rows) if row is not None])
+        for slot, query in enumerate(state.slots[9]):
+            if query is not None:
+                self.assertEqual(state.locations[query], (9, slot))
+        self.assertEqual(result['actual_qr64_tasks'], expected['actual_qr64_tasks'])
+        self.assertEqual(state.previous, rows)
+        self.assertEqual(state.update(rows)['actual_qr64_tasks'], 0)
+
+    def test_dirty_partition_migrations_keep_groups_and_feature_multisets(self):
+        rows = [(9, q) for q in range(70)] + [(10, q) for q in range(70, 140)]
+        state = PrioritizedBlocks(1, dirty_partition=True)
+        state.update(rows)
+        rows[0], rows[75], rows[76] = (10, 1000), (9, 1001), None
+        state.update(rows)
+        for group, slots in state.slots.items():
+            actual = sorted(rows[q] for q in slots if q is not None)
+            expected = sorted(row for row in rows if row is not None and row[0] == group)
+            self.assertEqual(actual, expected)
+        self.assertIsNone(state.locations[76])
+
     def test_singleton_parent_is_copy_and_empty_holes_still_participate(self):
         state = PrioritizedBlocks(0)
         rows = [(9, i) for i in range(320)]
