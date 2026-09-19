@@ -393,3 +393,27 @@ current 32-warps-per-group cap, a dominant target group can use only 32 SMs on
 this 108-SM GPU; group skew makes the overall grid count an optimistic measure
 of parallel useful work. Matching-pack CUDA API time is 0.566 ms and QR API time
 2.671 ms; these overlap device execution and must not be added to kernel times.
+
+## V6: squared certificates and launch tuning
+
+Revision `d0c88a2`, frozen binary SHA256
+`d5d0833d1ca4eb5b9b09ff1607df55130a70ab73fda6d022b677fae4716af13b`.
+The optional squared predicate removes square roots and division using directed
+reciprocal enclosures and a strict polynomial inequality. Its proof and extreme
+scale fallback behavior are in `form/optimization/certified_rematching.md`.
+Tree variants sweep 32/128/256 warps per group and optionally mirror the exact
+highwater recurrence on the host to bound launch depth without a download. See
+`certified-rematching-launch-tuning.md` for resource estimates and validity.
+
+Validation: 123 main, 2 parallel, and 9 scalar tests pass. The 123-test main suite
+also passes all eight audit/certified × fused/split × distinct/occurrences settings
+with the squared predicate. Seven QR tests pass memcheck, initcheck, and racecheck;
+three squared matcher tests and two incremental matcher tests pass corresponding
+memory/race coverage, with device-only matcher initcheck for the documented ABI
+padding issue. Review found no blocking issue in the arithmetic or highwater mirror.
+
+The 250-scan `audit-v6` run checks 45,285,082 queries with zero mismatches and
+66,386 full-QR comparisons, maximum normalized Gram error 2.16557e-15. Its
+32,967,529 successful certificates equal the earlier norm-predicate count on
+this replay. All 4,834 summary calls report the bounded tree path. Audit timing
+is excluded from performance claims.
