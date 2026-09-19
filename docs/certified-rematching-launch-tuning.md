@@ -84,3 +84,27 @@ Compare first/full-dirty, sparse, and unchanged cases separately; a larger grid
 can help full refreshes while hurting sparse ones. Select a final configuration
 only after clean replay timing and an independent trace. Those results belong
 in `certified-rematching-experiments.md`.
+
+## V8 compact per-group tasks
+
+The compact scheduler launches one warp per retained `(group,node)` task,
+without capped per-group warp loops. Per-level task lists persist until the
+rounded per-group bounds change. Thirty-two threads per block remain the
+production setting; correctness tests also exercise 128-thread blocks. The
+capped launch-cap setting does not affect the compact API.
+
+Compiled SM80 resources for revision `1fe130f`:
+
+| Kernel | Registers/thread | Stack/shared/local bytes |
+| --- | ---: | ---: |
+| Compact tree leaf | 80 | 0 / 0 / 0 |
+| Compact tree ancestor | 82 | 0 / 0 / 0 |
+| Capped tree leaf | 90 | 0 / 0 / 0 |
+| Capped tree ancestor | 92 | 0 / 0 / 0 |
+
+The compact grid includes active clean nodes whose flags must be inspected;
+this is not device compaction of only dirty nodes. The implementation checks
+the one-dimensional grid limit before launch, and uses the larger previous or
+current bound per group to handle shrinking extents. Metadata planning and
+uploads are counted separately in diagnostic statistics. Resource reductions
+alone do not establish an end-to-end speedup.

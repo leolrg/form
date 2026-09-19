@@ -181,3 +181,33 @@ cached metadata. Planning, metadata uploads, initialization and the full
 end-to-end runtime must be counted. Per-call diagnostic counters record task
 plan refreshes and metadata upload bytes. Queue ordering can change dirty-leaf
 locality independently of scheduling; sorted and queued ablations are separate.
+
+## Running the opt-in research variants
+
+The default remains the established acceleration pipeline. Research controls:
+
+| Environment variable | Values |
+| --- | --- |
+| `FORM_CUDA_MATCH_REUSE` | `off`, `audit`, `certified` |
+| `FORM_CUDA_MATCH_KERNEL` | `fused`, `split` |
+| `FORM_CUDA_MATCH_TOP2` | `distinct`, `occurrences` |
+| `FORM_CUDA_MATCH_CERTIFICATE` | `norm`, `squared` |
+| `FORM_CUDA_SUMMARY_REUSE` | `off`, `blocks64`, `audit64`, `tree64`, `audit-tree64` |
+| `FORM_CUDA_TREE_LAYOUT` | `capped`, `compact` |
+| `FORM_CUDA_TREE_WARPS` | `32`, `128`, `256` (capped layout only) |
+| `FORM_CUDA_TREE_BOUNDS` | `0`, `1` (compact always uses per-group bounds) |
+| `FORM_CUDA_SUMMARY_ROWS` | `sorted`, `queue` |
+
+`benchmarks/run_rematching.py` clears inherited research options, records the
+selected settings and executable/input hashes, and runs sequential repetitions
+in alternating order. `squared-split` selects certified search with fresh full
+QR. `compact-queue` selects full search with compact queued summaries, while
+`compact-combined` adds the identical squared/split certificate. Thus these
+three modes and `off` form a matched four-way ablation. `compact` and
+`compact-sorted-combined` use the sorted row path instead.
+
+`compact-audit --diagnostic --stats-only` runs both original search and fresh
+summary checks on identical inputs. Audit outputs feed reference results to
+the optimizer; separately timed non-audit runs are required to validate actual
+cached feedback. Optional `--gpu-sample-interval 0.25` enables process GPU-memory
+sampling only in diagnostic mode; sampled peaks can miss short allocations.

@@ -520,3 +520,28 @@ All workload counts agree. Maximum translation differences against GPU off
 are 2.89e-13 m for improved CPU and 9.10e-12 m for reference. These are controls
 for the broader existing acceleration, **not gains attributable to certified
 rematching**. Dense/window and full-sequence comparisons follow separately.
+
+## V8 compact active-node scheduling validation
+
+Revision `1fe130f`, frozen replay SHA256
+`b6b87935b02a8221d455d832b9791c3a7ecf87850e5b3e465651838b17259220`.
+Per-group tasks remove the rectangular launch across small and large groups;
+plans and per-group validation metadata upload only when changed. The same
+leaf/ancestor arithmetic is shared with the capped tree. Default behavior is
+unchanged; compact mode is opt-in.
+
+Validation completed before measurement:
+
+- 127 main, 2 parallel and 9 scalar C++ tests passed.
+- 13 focused tree/matcher tests passed memcheck and racecheck with zero findings.
+- 9 QR tests passed default initcheck. Four matcher tests passed initcheck with
+  API copy checks disabled for the previously established `Result` tail padding;
+  device checks remained enabled.
+- Independent source review found no blocking correctness issue.
+- Tests cover cached-plan reuse, independent bound uploads, empty/rank-deficient
+  inputs, growth/shrink/reactivation, invalid bounds, API switching, producer
+  stream ordering, migrations, rejection/reinsertion and queued row lifetimes.
+
+Logs are retained in `validation-v8/`. Full 1,190-scan same-input audit and clean
+current/dense/window ablations are the next measurements, not implied by these
+unit and sanitizer results.
