@@ -316,3 +316,80 @@ The offline stability-order model is now documented in
 whole-run leaf/merge QR calls by 32.12%, but is unavailable online. A causal
 first-rematch-change ordering saves only 0.48% including its rebuild. The latter
 does not justify a production implementation; these counts are not timings.
+
+## V5: cached internal QR nodes
+
+Revision `370e703`, frozen binary SHA256
+`6d89d1835af9e29d898bc1f4f37661d18a00e2718e3fdbb3765e6854c05da6fc`.
+Leaves and internal roots persist independently of the ordinary/flat QR scratch
+buffers. Device highwater controls active extents; clean leaves and ancestors
+retain their roots. Unary ancestors copy their child. Extent status travels with
+the compact root download; per-node work counters are downloaded only when
+explicitly requested. The matcher no longer downloads highwater before packing.
+
+The full check target passes: 118 main tests, 2 parallel-extraction tests, and
+9 scalar-extraction tests. The main suite before the final boundary-test addition
+also passed under both `tree64` and `audit-tree64`. Five tree primitive tests
+cover unchanged roots, single-leaf paths, reset/failure recovery, delayed producer
+ordering, rank deficiency, and shrinking/reactivating extents across multiple
+fan-in boundaries. Together with two matcher integration tests they pass CUDA
+memcheck/initcheck coverage and combined racecheck with zero reported hazards.
+Matcher initcheck uses device-only checking to exclude the previously documented
+uninitialized ABI padding in host Result structures. Independent code review
+found no blocking defect; a separate host model exercised 36,000 extent/dirty
+transitions.
+
+The 250-scan `audit-v5` run enables both the unchanged original search oracle and
+independent full QR reconstruction. It uses `--stats-only` to retain diagnostics
+without another raw correspondence dump:
+
+- 45,285,082 checked queries; zero search mismatches.
+- 66,386 group-root comparisons; maximum normalized Gram error 2.90841e-15.
+- 748,395 active-leaf observations, 478,820 dirty leaves (including warmup).
+- 40,595,314 queries processed by the split prepass; 4,834 tree-summary calls.
+
+Audit supplies original search results and full-rebuild roots downstream.
+Actual cached-root solver feedback is checked separately in the clean runs.
+These correctness checks do not establish acceleration. The initial tree launch
+caps work at 32 warps per group and launches all capacity-derived ancestor levels;
+these are explicit performance variables for the following traces.
+
+Clean V5 means, two reversed-order repeats with the same 250/20-scan protocol:
+
+| Variant | Total ms/scan | Matching ms/scan |
+| --- | ---: | ---: |
+| Off | 26.988 | 8.498 |
+| Fused occurrence-bound search | 25.620 | 7.718 |
+| Split occurrence-bound search | 26.178 | 7.877 |
+| Cached tree, full search | 27.419 | 9.358 |
+| Cached tree + split occurrence-bound search | 26.167 | 8.665 |
+
+All workload counts agree and maximum translation difference is 1.55e-13 m.
+See `clean-v5-current/comparison-verified.json`; the comparison tool checks
+recorded output hashes and complete run counts before reading results. Small
+end-to-end differences still vary between repeats; the cached tree itself does
+not yet beat full rebuilding on this workload.
+
+`trace-v5/tree` is a separate 250-scan Nsight trace, excluding warmup. It has zero
+unattributed timed device events. Device durations per scan:
+
+| Kernel | ms/scan |
+| --- | ---: |
+| Original nearest | 1.9221 |
+| Update stable row assignments | 0.0527 |
+| Fill stable row slots | 0.3550 |
+| Pack dirty leaves | 0.0877 |
+| Prepare tree extents | 0.0400 |
+| Update tree leaves | 0.7124 |
+| Update tree ancestors | 1.0635 |
+| Finish tree roots | 0.0733 |
+
+Tree QR kernels total 1.8893 ms/scan, versus 1.408 ms for the earlier full QR
+trace. Flat partial leaf QR took 0.418 ms; the tree's 0.712 ms despite comparable
+leaf work motivates launch tuning. Resource inspection of the frozen V5 binary
+reports 90 registers/thread for tree leaves and 92 for ancestors, no spills or
+shared memory. The earlier flat QR kernels used 80 registers/thread. At the
+current 32-warps-per-group cap, a dominant target group can use only 32 SMs on
+this 108-SM GPU; group skew makes the overall grid count an optimistic measure
+of parallel useful work. Matching-pack CUDA API time is 0.566 ms and QR API time
+2.671 ms; these overlap device execution and must not be added to kernel times.
