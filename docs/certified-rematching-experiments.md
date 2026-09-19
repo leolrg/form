@@ -276,3 +276,43 @@ A possible later experiment is to initialize slots by certificate difficulty
 or observed correspondence churn, concentrating unstable rows into fewer leaves.
 That idea has not been implemented or measured, and its initialization/reordering
 cost must be included if pursued.
+
+## V4: split certificates and cheaper runner-up bounds
+
+Frozen binary SHA256 `62d2cacbf96fc31e9fe6b065b33048826f6afd8dd7f51cb669f1d3ad9a760f56`
+adds a thread-per-query certificate pass and a conservative second-occurrence
+bound. The latter avoids tracking distinct runner-up identities: duplicates can
+only weaken the bound. Neither variant changes the reference matcher or flat
+incremental QR from V3. All 113 main tests pass under the eight audit/certified,
+fused/split, distinct/occurrences combinations. Four targeted matching tests
+also pass CUDA memcheck, device initcheck, and racecheck.
+
+The 250-scan `audit-v4` run checks 45,285,082 queries with the unchanged original
+GPU kernel on identical inputs, including warmup, with **zero mismatches**.
+There are 32,967,529 successful certificates. This is an audit result, not timing.
+
+`clean-v4-current` runs two repeats in reversed mode order, 32 CPU threads,
+first 250 stairs scans with the first 20 excluded, no tracing/audit, and no
+concurrent benchmark/build. Means in ms/scan:
+
+| Variant | Total | Matching |
+| --- | ---: | ---: |
+| Off | 27.111 | 8.569 |
+| Fused, distinct | 25.827 | 8.029 |
+| Fused, occurrences | 26.468 | 7.972 |
+| Split, distinct | 27.287 | 8.423 |
+| Split, occurrences | 26.375 | 7.979 |
+| Split, occurrences + flat incremental QR | 28.583 | 9.479 |
+
+All feature/iteration count comparisons agree; largest translation difference
+against the first off run is 1.37e-13 m. Search-only savings are small and noisy:
+the existing fused/distinct implementation also looks faster here despite
+losing in earlier clean experiments. These two repeats do not establish a
+reliable new end-to-end improvement. Flat incremental QR still loses.
+Cached internal QR ancestors are the next experimental variant.
+
+The offline stability-order model is now documented in
+`stability-order-model.md`. A future-informed initial ordering reduces modeled
+whole-run leaf/merge QR calls by 32.12%, but is unavailable online. A causal
+first-rematch-change ordering saves only 0.48% including its rebuild. The latter
+does not justify a production implementation; these counts are not timings.
