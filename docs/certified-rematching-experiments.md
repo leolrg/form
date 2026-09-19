@@ -542,9 +542,9 @@ Validation completed before measurement:
   inputs, growth/shrink/reactivation, invalid bounds, API switching, producer
   stream ordering, migrations, rejection/reinsertion and queued row lifetimes.
 
-Logs are retained in `validation-v8/`. Full 1,190-scan same-input audit and clean
-current/dense/window ablations are the next measurements, not implied by these
-unit and sanitizer results.
+Logs are retained in `validation-v8/`. The following full-sequence audit and
+clean current/dense/window sections record the subsequent measurements; those
+results are separate from these unit and sanitizer checks.
 
 ### V8 full-stairs audit
 
@@ -634,3 +634,141 @@ difference across CPU/GPU runs is8.89e-12m. Search-only improves total latency i
 both repeats (45.803/45.959 versus49.152/48.289ms). Its mean gain is5.83%; combined
 partial summaries are2.46% slower than search-only. This supports a useful but
 modest search optimization and another negative partial-summary result.
+
+### V8 larger-window scaling with CPU controls
+
+`scale-v8-window/`, same first 250 scans, two reversed-order repetitions:
+
+| Backend/mode | Post-warmup total ms | Post-warmup matching ms |
+| --- | ---: | ---: |
+| Existing GPU/off |51.093|9.834|
+| GPU search-only |49.839|9.183|
+| GPU partial compact QR only |50.586|9.817|
+| GPU combined |49.865|9.142|
+| Improved CPU |119.721|59.293|
+| Original FORM CPU |203.630|63.689|
+
+The setting realizes 38.56 average poses (2.73x current) and 520,164 average
+retained-graph correspondences (3.09x). These counts include older scan-pair
+factors and are not new nearest-neighbor query counts. All workload/iteration
+counts agree; maximum translation difference across CPU/GPU is 2.62e-12 m.
+Search-only improves total latency in both repeats (50.387/49.291 versus
+51.632/50.554 ms). Its mean gain is 2.45%. Combined summaries are essentially
+flat against search-only (approximately 0.0255 ms slower), so they provide no meaningful
+additional benefit in this larger-variable regime either.
+
+### V8 quad_hard initial cross-scene result: confirmation required
+
+`scene-v8-quad_hard/`, first 600 scans, two reversed-order repetitions:
+
+| Mode | Post-warmup total ms | Post-warmup matching ms |
+| --- | ---: | ---: |
+| Off |53.623|11.963|
+| Search-only |53.907|11.942|
+| Partial compact QR only |52.724|11.748|
+| Combined |52.166|11.471|
+
+All counts agree; maximum translation difference is 7.91e-12 m. Search-only is
+approximately flat. Combined appears 2.72% faster than off, but its repeats are
+53.139/51.192 ms versus 53.921/53.326 for off. The matching-stage benefit against
+search-only is only 0.073 ms in the first repeat and 0.870 ms in the second.
+This is a possible scene-dependent partial-summary win, not a settled result.
+A second two-repeat confirmation set is required before interpreting it. This
+observation prevents claiming that partial summaries fail on every scene.
+
+### V8 maths_hard initial cross-scene result
+
+`scene-v8-maths_hard/`, first 600 scans, two reversed-order repetitions:
+
+| Mode | Post-warmup total ms | Post-warmup matching ms |
+| --- | ---: | ---: |
+| Off |53.632|11.400|
+| Search-only |54.332|11.760|
+| Partial compact QR only |53.809|11.570|
+| Combined |53.335|11.208|
+
+All counts agree; maximum translation difference is 1.66e-12 m. Search-only is
+1.31% slower in the mean, while combined is only 0.55% faster. Search-only
+repeats are53.065/55.599 ms against52.979/54.285 ms for off; combined is
+52.346/54.323 ms. These small differences and the repeat variability do not
+support a reliable scene-wide acceleration claim. The subsequent same-input diagnostic audit checks certificate yield and
+summary churn; its times are not speed results. This is an operating-region limitation, not a correctness failure.
+
+### Quad_hard confirmation: initial advantage does not persist
+
+`scene-v8-quad_hard-confirm/` repeats the same frozen binary, settings and first
+600 scans in both orders. Means (total/matching ms): off52.345/11.792,
+search51.982/11.408, partial52.131/11.601, combined52.851/11.466. Thus combined
+is0.97% slower than off in this second set, despite appearing2.72% faster in
+the first. Workload/iteration counts still agree; maximum translation difference
+within the confirmation set is7.29e-12m.
+
+Across all four repetitions, total/matching means are:
+
+| Mode | Total ms | Matching ms |
+| --- | ---: | ---: |
+| Off |52.984|11.877|
+| Search-only |52.944|11.675|
+| Partial compact QR only |52.428|11.674|
+| Combined |52.508|11.469|
+
+The small means do not justify claiming a reliable extra end-to-end contribution
+from partial summaries. Both sets remain in the record. This confirmation does not reproduce
+the apparent favorable exception without selecting the result that fits the
+stairs conclusion. It also shows why search-only should remain opt-in: its
+full-stairs/dense advantage does not transfer clearly to every scene.
+
+### Additional same-input audits
+
+`audit-v8-quad_hard/` and `audit-v8-maths_hard/` each replay the first600 scans
+with both original-search and fresh-summary oracles; only diagnostic timings
+are recorded.
+
+| Scene | Queries/oracle checks | Root checks | Maximum normalized Gram error | Subsequent certified | Dirty leaves |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Quad_hard |154,953,787|435,762|2.99971e-15|78.70%|67.13%|
+| Maths_hard |145,632,500|433,566|2.99165e-15|76.74%|65.99%|
+
+Both have zero matching mismatches. Including full stairs, the audit total is
+609,102,983 queries and1,794,838 root comparisons. Certificates qualify fewer
+queries for reuse than on stairs; more leaves are dirty. Audit executes the
+full oracle despite certification, so these fractions are reuse opportunities,
+not a timing claim about the instrumented run.
+
+
+### Final full-stairs traces and stopping decision
+
+`trace-v8-full/` contains separate Nsight traces for off, search-only and combined,
+using frozen V8. Each processes all 1,190 scans; attribution after 20 warmup scans
+has zero unmatched timed events and zero activity outside its issuing scan.
+
+| GPU kernel work, ms/scan | Off | Search-only | Combined |
+| --- | ---: | ---: | ---: |
+| Correspondence nearest-neighbor search plus certificates |3.329|1.841|1.843|
+| QR including tree extent/root maintenance |1.850|1.859|1.930|
+| Sorting/queued row maintenance plus packing |0.427|0.427|0.360|
+| Total compression and row ordering |2.276|2.286|2.290|
+
+Search saves 1.49 ms of kernel time (44.7%). Partial QR leaf work costs 0.515 ms,
+but ancestors require 1.245 ms, extent/root maintenance 0.171 ms, and row
+maintenance/packing 0.360 ms. This accounts for why reduced leaf arithmetic does
+not translate to reduced total compression time. Host/API durations overlap GPU
+work and are not added to these numbers. Profiled runs are separate from clean
+speed measurements.
+
+The bounded campaign ends with a useful but scene-dependent search-only result
+and no reliable incremental end-to-end benefit from partial QR. Eight frozen
+implementation checkpoints, certificate/search variants, stable block and causal
+ordering models, launch bounds, queued row placement and compact task plans have
+been evaluated. Full stairs, matched CPU/GPU density/window scaling, two additional
+600-scan scenes, a confirmation set, correctness audits and device traces are
+complete. This is a practical stopping decision on A100, not a proof that every
+future clustering algorithm or GPU must fail. Search remains opt-in; partial QR
+remains experimental. No default in the established acceleration branch changes.
+
+The final report is `docs/certified-rematching-results.md`; its companion JSON
+retains comparison records, timing distributions, workload means, audits, trace
+summaries and the four-repeat confirmation aggregate. The novelty assessment
+supports treating certified search as a limited systems component of the broader
+paper, not claiming a new compression principle or a demonstrated speed benefit
+from partial QR maintenance.

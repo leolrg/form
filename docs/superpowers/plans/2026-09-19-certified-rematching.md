@@ -28,9 +28,9 @@
 - [x] Run sequential 250-scan feasibility replays and analyze certificate yield, churn, block locality and first-search overhead. Continue to a full-stairs audit if promising; if weak, assess entering/leaving candidate-domain opportunities before deciding against the approach. Measured cell fallbacks are only 0.88% of subsequent queries, so stronger cross-cell certificates have a very small ceiling.
 - [x] Design stable block summaries from measured churn. Test one changed correspondence in a factor with otherwise unchanged blocks, insertions/deletions/group migration, rank deficiency and raw-result lifetimes before integration. Compare exact incremental versus fresh roots through cost/Jacobian/Hessian evaluations, not root entry equality.
 - [x] Implement GPU partial leaf/ancestor QR recomputation; compare fixed-query blocks, stable group slots and a compact full rebuild fallback where appropriate. Require actual partial work within a changed scan-pair factor.
-- [ ] Review correctness and integrate the best combined variant. Freeze baseline/candidate and execute matched full/scaled CPU/GPU runs plus additional dataset validation.
-- [ ] Investigate performance failures from measured overheads: certificate construction, full-search compaction, sparse QR launch/merge costs, group fragmentation and CPU/GPU transfer boundaries. Retain an experiment ledger with both wins and failures.
-- [ ] Write final mathematical/complexity argument, reproducible result report and novelty assessment; run completion audit, commit and push research branch. Preserve the original branch exactly.
+- [x] Review correctness and integrate the best combined variant. Freeze baseline/candidate and execute matched full/scaled CPU/GPU runs plus additional dataset validation.
+- [x] Investigate performance failures from measured overheads: certificate construction, full-search compaction, sparse QR launch/merge costs, group fragmentation and CPU/GPU transfer boundaries. Retain an experiment ledger with both wins and failures.
+- [x] Write final mathematical/complexity argument, reproducible result report and novelty assessment; run completion audit, commit and push research branch. Preserve the original branch exactly.
 
 ## Initial numerical contract
 
@@ -39,3 +39,14 @@ The source map need not have geometrically correct voxel placement: the public m
 Use immutable last-full-search anchors for certificates. Do not move the anchor after a skipped search without updating a valid competitor bound. A certificate must be strict enough to exclude computed-distance ties; otherwise fall back to the original lexicographic search. Failed snapshot/search operations must invalidate potentially stale certificate state.
 
 Keep audit measurements separate from clean timing: any oracle full search, per-query downloads or host analysis is diagnostic overhead, not part of a reported acceleration.
+
+
+## Final outcome
+
+The measurement campaign is complete. Certified search gives a modest,
+scene-dependent benefit; partial summary maintenance does not give a reliable
+additional end-to-end benefit. The practical variants and their measured failure
+mechanisms are documented in `docs/certified-rematching-results.md` and the
+experiment ledger. This is completion of the bounded negative investigation of
+the coupled trick, with a useful search-only side result; it does not establish
+that the trick meets the desired standalone novelty or publication threshold.

@@ -4,8 +4,10 @@ Assessment dated 2026-09-19, against the current method, experiment ledger,
 prior-art report, and existing acceleration design. This is a bounded assessment
 of possible contribution, not a completed novelty review or a prediction of
 acceptance at ACC or another venue. No new experiments or literature search were
-performed for this note. Full-sequence/scaled rematching results are pending;
-compact QR task scheduling is still a prototype.
+performed for this note. This update incorporates completed V8 full-stairs and
+scaled-prefix comparisons, two additional 600-scan scene suites, the quad_hard
+confirmation, all three scene audits, and the final full-stairs kernel traces.
+The measurement campaign is complete.
 
 ## Present judgment
 
@@ -17,19 +19,103 @@ operating region. The individual ideas, and even the broad combination of
 assignment certificates with selective statistics updates, are established.
 
 As one component of a whole FORM acceleration paper, the search extension can
-be useful even if its incremental end-to-end gain remains modest. Current
-250-scan screening suggests roughly 5% total savings for selected search-only
-configurations and roughly 3% for selected combined configurations, with
-substantial variation across earlier trials. These are screening observations,
-not settled paper results. The existing evidence does **not** establish an
-additional performance benefit from dirty-tree/queue integration over the best
-search-only pipeline. The paper should not make that integration a necessary
-headline unless broader measurements change this conclusion.
+be useful even if its incremental end-to-end gain remains modest. Completed V8
+measurements now support a limited positive result for selective search: mean
+total time after the 20-scan warmup falls by 3.71% on full stairs, 5.83% on the dense prefix, and 2.45%
+on the larger-window prefix. These are reductions in the reported means, not
+confidence bounds or cross-scene guarantees. The completed additional scenes
+do not establish a consistent search speedup: search is approximately flat on
+quad_hard across four repeats and its mean is higher on maths_hard. Its practical
+value is modest and scene-dependent.
+
+Partial QR does **not** add a demonstrated benefit beyond search-only in any
+of these three comparisons. Combined is slower than search-only on full stairs
+and dense features, and effectively tied on the larger window. This supports a
+bounded negative performance finding for partial summaries in the tested
+regimes, alongside a modest useful search extension. The paper should not make
+dirty-tree/queue integration a performance headline on this evidence. An initial
+quad_hard combined-mode win did not consistently replicate in its confirmation;
+small cross-scene mean differences sit within substantial run variation. There
+is no reliable demonstrated additional partial-summary speedup in this campaign.
 
 A method can be correct and technically careful yet remain an engineering
 specialization of prior ideas. Conversely, a small additional speedup does not
 invalidate the broader acceleration work. The relevant question is what each
 component contributes beyond the strongest earlier component and comparator.
+
+## Completed V8 evidence and outstanding limits
+
+All entries below are mean total milliseconds per scan after warmup. Full
+stairs contains 1,190 scans; the density and window comparisons use 250-scan
+stairs prefixes. `Off` is the existing accelerated GPU pipeline; `partial`
+enables the selected partial-summary path and `combined` also enables selective
+search. These incremental comparisons must not use the original CPU as their
+denominator.
+
+| Workload | Off | Search-only | Partial-only | Combined |
+|---|---:|---:|---:|---:|
+| Full stairs | 42.991 | 41.394 | 42.749 | 42.429 |
+| Dense features, prefix | 48.721 | 45.881 | 50.230 | 47.010 |
+| Larger window, prefix | 51.093 | 49.839 | 50.586 | 49.865 |
+| quad_hard, 600 scans, four repeats | 52.984 | 52.944 | 52.428 | 52.508 |
+| maths_hard, 600 scans, two repeats | 53.632 | 54.332 | 53.809 | 53.335 |
+
+For full stairs, the means including all 1,190 scans are respectively 43.906,
+42.298, 43.686, and 43.316 ms; the search-only advantage therefore also holds
+when warmup is included. Against search-only after warmup, combined adds
+1.035 ms/scan on full stairs and 1.129 ms on dense features. Its approximately 0.0255 ms
+larger-window difference is too small to interpret as a meaningful advantage
+for either mode from these means. Partial-only's small reductions in full and
+window means are not evidence that it adds value once search is enabled.
+
+The initial two-repeat quad_hard means were 53.623 / 53.907 / 52.724 / 52.166
+ms in table order. Its separate two-repeat confirmation gave 52.345 / 51.982 /
+52.131 / 52.851 ms. Combined therefore changed from a 1.457 ms advantage over
+off to a 0.506 ms disadvantage; its ranking against search-only also reversed.
+The four-repeat mean must not hide that failure to consistently replicate.
+On maths_hard, combined's 0.297 ms advantage over off is small alongside the
+campaign's run variation, while search-only is 0.700 ms slower in the mean.
+Neither result establishes a robust additional partial-summary benefit. Workload
+counts agree throughout the completed comparisons.
+
+Workload counts agree in both scaled comparisons. Their matched CPU controls
+are 228.020 ms improved CPU / 337.647 ms original reference for dense features,
+and 119.721 / 203.630 ms for the larger window. These substantial baseline gaps
+belong to the broader existing acceleration pipeline; they are not gains from
+the new certificates or partial QR.
+
+The full audit reports 308,516,696 same-input search checks with zero mismatches
+and 925,510 full-QR checks with maximum normalized Gram error about `2.83e-15`.
+The full clean runs using actual cached feedback differ in translation by at
+most `6.9e-13 m` in the reported comparison. The latter complements audit mode,
+which deliberately returns reference results downstream. Translation agreement
+does not alone establish every trajectory metric or universal floating-point
+equivalence.
+
+| Audit scene | Checked queries | Checked roots | Maximum normalized Gram error | Certified subsequent queries | Dirty leaves |
+|---|---:|---:|---:|---:|---:|
+| stairs | 308,516,696 | 925,510 | about `2.83e-15` | 84.74% | 55.36% |
+| quad_hard | 154,953,787 | 435,762 | `2.99971e-15` | 78.70% | 67.13% |
+| maths_hard | 145,632,500 | 433,566 | `2.99165e-15` | 76.74% | 65.99% |
+
+Across these audits, 609,102,983 queries have zero reported matching mismatches,
+and 1,794,838 roots are checked. These are strong tested-input correctness
+results. Certificate fractions describe subsequent searches, not all searches;
+dirty-leaf fractions describe the audited leaf work, not the fraction of total
+processing time. High certification rates on all three scenes alongside mixed
+timing demonstrate why skipped searches alone are insufficient evidence of
+end-to-end acceleration.
+
+Separate full-stairs traces show nearest-neighbor kernels falling from 3.329 to
+1.841 ms/scan with certified search. Fresh QR plus sorting and packing takes
+2.286 ms in search-only mode; the corresponding partial-QR tree plus queued
+row maintenance and packing takes 2.290 ms. Partial leaves cost 0.515 ms, but
+ancestors cost 1.245 ms, before extent/root and row maintenance. The partial
+path therefore does not reduce the complete compression kernel budget. These
+are attributed GPU durations after warmup, not clean end-to-end timings; host
+API durations overlap device time and cannot be added to them. The evidence
+supports a limited systems contribution within the whole acceleration paper,
+without establishing algorithmic priority or venue acceptance.
 
 ## What predates this research branch
 
@@ -99,8 +185,8 @@ the [prior-art report](certified-rematching-prior-art.md).
    The enclosure assumes the documented binary64 arithmetic, gradual underflow,
    finite inputs, and compilation semantics; this is not an arbitrary-platform
    floating-point guarantee.
-2. **Factors:** inserting, deleting, or changing accepted fixed-feature rows
-   preserves each group's row multiset. Dirty-root rebuilding restores
+2. **Factors:** after insertions, deletions, or changes, each group retains the
+   same current fixed-feature row multiset as full reconstruction. Dirty-root rebuilding restores
    `U^T U = F^T F` in real arithmetic. The pre-existing feature representation
    then supplies all-pose cost and both-pose Gauss–Newton equivalence for supported
    isotropic point/plane factors. Pose-dependent robust weights and general
@@ -114,10 +200,10 @@ the [prior-art report](certified-rematching-prior-art.md).
 An explicit composition of these contracts is a useful result even though its
 ingredients are standard. It should be presented as a proved specialization
 with empirical numerical validation, not a universal numerical-equivalence
-theorem. The current audits provide strong evidence on tested inputs, including
-45,285,082 same-input search checks per reported 250-scan audit and 66,386
-full-root checks in relevant summary audits. Audit mode supplies reference
-results downstream, so clean runs using actual cached feedback remain necessary.
+theorem. The full V8 audit and actual-feedback checks summarized above extend
+the earlier prefix evidence substantially. Audit mode supplies reference results
+downstream, so it must remain distinct from clean runs using actual cached
+feedback.
 Neither sampled-pose tests nor small normalized Gram errors alone prove
 all-pose floating-point relative error bounds.
 
@@ -125,8 +211,9 @@ all-pose floating-point relative error bounds.
 
 The branch would strengthen the whole paper if the following hold:
 
-- Full-sequence and scaled-workload comparisons reproduce a useful gain over
-  the best accelerated baseline with the same settings. Report distribution
+- Full-sequence and scaled stairs comparisons show a modest search gain over
+  the accelerated baseline in the reported means; additional scenes limit its
+  breadth. Report the mixed outcome, distribution
   and repeat variability, initialization, retained memory, transfers, and all
   maintenance overhead; separate optimization latency from whole-scan latency.
 - Four-way search/summary ablations identify what helps. To claim an incremental
@@ -145,8 +232,8 @@ The branch would strengthen the whole paper if the following hold:
 - Numerical and lifecycle tests continue to cover rounded ties, extreme search
   scales, acceptance changes, rank loss, migrations, empty groups, and snapshot
   replacement. Validate actual queued/cached solver feedback, not audit output
-  alone. Compact task scheduling must satisfy the same checks before being
-  included in conclusions.
+  alone. Keep the validation tied to the exact compact-scheduling checkpoint
+  used for each reported result.
 
 No single percentage is a publication threshold. A modest gain can be a useful
 secondary contribution when repeatable and inexpensive; a large kernel gain
@@ -154,12 +241,13 @@ without end-to-end value is not enough to support an acceleration claim.
 
 ## Conditional negative criteria and fallback framing
 
-- If full/scaled results do not distinguish the small gains from variation,
+- If repetitions or additional scenes do not distinguish small gains from variation,
   report feasibility and correctness, not established end-to-end acceleration.
-- If search-only remains faster than combined, keep certified search as an
-  optional component and present partial QR as a bounded negative result or
-  omit it from the main performance claim. Search savings cannot be credited to
-  the dirty tree simply because both are enabled.
+- Search-only outperforms combined on full stairs and dense features, with an
+  effective tie on the larger window. The additional scenes do not establish a
+  reliably replicated exception. Keep certified search as an optional component
+  and present partial QR as a bounded negative result. Search savings cannot be
+  credited to the dirty tree simply because both are enabled.
 - If simpler warm search or whole-pair reuse obtains the same benefit with less
   state, the extra machinery lacks a demonstrated practical advantage. Its
   correctness contract can still be useful, but should not carry a new general
@@ -169,14 +257,40 @@ without end-to-end value is not enough to support an acceleration claim.
   for a future-count heuristic, versus only 0.36% for two-transition persistence
   and 1.25% for dirty-only partition, before rearrangement overhead. These counts
   neither predict time nor support a causal-layout contribution on this trace.
-- A result confined to A100 and one prefix should be described that way.
-  Full-scene, cross-scene, memory, and hardware scope cannot be inferred from
-  sanitizer passes or a high certificate hit rate.
+- Current evidence covers A100, full stairs, scaled stairs prefixes, and
+  600-scan quad_hard/maths_hard prefixes. Full/scaled sequences for the other
+  scenes, broader memory behavior, and other hardware remain outside the
+  established scope. They cannot be inferred from sanitizer passes or a high
+  certificate hit rate.
 
 The broader paper can retain the existing all-pose compression and measured
 acceleration as its main technical story, while explaining which additional
 work reuse succeeds or fails. It should not inflate the new branch to repair
 an uncertain novelty argument for the whole paper.
+
+## Practical contribution recommendation
+
+Present selective search as an optional, numerically specified optimization with
+modest scene-dependent value. Present dynamic QR maintenance as a correct
+extension whose measured maintenance costs prevent a reliable additional speedup
+in this campaign. The negative result is informative: low correspondence churn,
+high certificate yield, and fewer QR operations do not by themselves produce a
+faster estimator.
+
+The strongest branch-specific contribution remains the explicit composition of
+computed-order matching certificates with lifetime-safe updates of the existing
+nonlinear roots, supported by extensive same-input audits and honest ablations.
+This can support the whole-system paper's technical argument and reproducibility.
+It does not establish a new general assignment-bound or incremental-statistics
+principle beyond Hamerly, cached ICP, and QR prior art. The all-pose feature
+representation and much larger baseline acceleration remain separately
+attributed to the system that predates this branch.
+
+There is insufficient basis to assert that this extension alone supplies
+missing ACC novelty, or guarantees suitability or acceptance at any venue.
+Position it as a limited systems/methods component with a measured boundary of
+usefulness, rather than making publication depend on an unreplicated partial-QR
+gain or a broad novelty claim.
 
 ## Suggested claim language
 
@@ -189,10 +303,22 @@ Supportable as a description of the method, with the stated assumptions:
 > and preserves the supported nonlinear factor in real arithmetic. We evaluate
 > numerical agreement and the full cost of maintaining this state.
 
-Add an acceleration sentence only after final measurements, naming the workload,
-baseline, hardware, component, and observed uncertainty. For the whole paper,
-state the pre-existing all-pose representation as a separate contribution if
-publication history permits, rather than attributing it to rematching.
+The completed measurements support the bounded empirical statement:
+
+> On A100 stairs evaluations, selective search reduces mean total processing
+> time after a 20-scan warmup by 3.71% for the full sequence and by 2.45–5.83% for the tested larger
+> workload prefixes relative to the existing accelerated GPU pipeline. Partial
+> summaries do not provide additional benefit beyond search-only in these
+> comparisons. On two additional scenes, search-only shows no consistent
+> improvement, and an initial combined-mode advantage does not consistently
+> replicate. Extensive same-input audits find no matching mismatches; partial
+> summaries preserve numerical agreement but provide no reliable additional
+> end-to-end speedup in this campaign.
+
+Final wording should retain repeat variability and these additional scene results.
+For the whole paper, state the pre-existing all-pose representation as a separate
+contribution if publication history permits, rather than attributing it to
+rematching.
 
 Claims to avoid include “first exact ICP reuse,” “novel triangle-inequality
 certificate,” “first certified assignments plus delta statistics,” “new TSQR,”
