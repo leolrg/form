@@ -44,9 +44,15 @@ MODES = {mode: (*settings, 'sorted') for mode, settings in MODES.items()}
 MODES['queue128'] = (*MODES['tree-bounded128'][:-1], 'queue')
 MODES['queue-combined'] = (*MODES['tree-squared-split128'][:-1], 'queue')
 MODES['queue-audit'] = ('audit', 'audit-tree64', 'split', 'occurrences', 'squared', 128, 1, 'queue')
+MODES = {mode: (*settings, 'capped') for mode, settings in MODES.items()}
+MODES['compact'] = (*MODES['tree-bounded128'][:-1], 'compact')
+MODES['compact-queue'] = (*MODES['queue128'][:-1], 'compact')
+MODES['compact-sorted-combined'] = (*MODES['tree-squared-split128'][:-1], 'compact')
+MODES['compact-combined'] = (*MODES['queue-combined'][:-1], 'compact')
+MODES['compact-audit'] = (*MODES['queue-audit'][:-1], 'compact')
 ENV_KEYS = ('FORM_CUDA_MATCH_REUSE', 'FORM_CUDA_SUMMARY_REUSE', 'FORM_CUDA_MATCH_KERNEL',
             'FORM_CUDA_MATCH_TOP2', 'FORM_CUDA_MATCH_CERTIFICATE', 'FORM_CUDA_TREE_WARPS',
-            'FORM_CUDA_TREE_BOUNDS', 'FORM_CUDA_SUMMARY_ROWS')
+            'FORM_CUDA_TREE_BOUNDS', 'FORM_CUDA_SUMMARY_ROWS', 'FORM_CUDA_TREE_LAYOUT')
 
 
 def main():
@@ -62,9 +68,12 @@ def main():
     parser.add_argument('--diagnostic', action='store_true')
     parser.add_argument('--stats-only', action='store_true', help='Diagnostic counters/oracles without raw correspondence capture')
     parser.add_argument('--threads', type=int, default=32)
+    parser.add_argument('--gpu-sample-interval', type=float, default=0, help='Optional diagnostic-only GPU memory sampling in seconds')
     args = parser.parse_args()
     if args.stats_only and not args.diagnostic:
         parser.error('--stats-only requires --diagnostic')
+    if args.gpu_sample_interval < 0 or (args.gpu_sample_interval and not args.diagnostic):
+        parser.error('GPU memory sampling requires diagnostic mode and a nonnegative interval')
     if args.limit <= 20 or args.repeats < 1 or args.threads < 1:
         parser.error('limit > 20, repeats >= 1, threads >= 1 required')
     if 'baseline' in args.modes and args.baseline is None:
@@ -85,6 +94,7 @@ def main():
         input_path = input_dir/(args.sequence+'.formpc')
         identity = {'binary': digest(binary), 'input': digest(input_path), 'config': CONFIGS[args.config],
                     'threads': args.threads, 'limit': args.limit, 'diagnostic': args.diagnostic, 'stats_only': args.stats_only,
+                    'gpu_sample_interval': args.gpu_sample_interval,
                     'runtime_environment': prov['environment'], 'cpu_affinity': prov['cpu_affinity']}
         if args.baseline:
             identity['baseline'] = digest(args.baseline)
@@ -113,7 +123,7 @@ def main():
                     argv += ['--profile']
                 spec = {'id': name, 'argv': argv, 'expected_scans': args.limit,
                         'ground_truth': str(input_dir/(args.sequence+'.gt.tum')),
-                        'gpu_sample_interval_seconds': 0,
+                        'gpu_sample_interval_seconds': args.gpu_sample_interval,
                         'fingerprint': json_hash(identity | {'mode': mode, 'env': environment})}
                 execute(spec, output, prov | {'experiment_environment': environment, 'identity': identity})
                 record = json.loads((output/(name+'.run.json')).read_text())
@@ -136,6 +146,8 @@ def main():
                         raise RuntimeError(f'missing bounded-tree path: {name}')
                     if MODES[mode][7] == 'queue' and not any(int(row.get('summary_queued', 0)) for row in stats):
                         raise RuntimeError(f'missing queued-summary path: {name}')
+                    if MODES[mode][8] == 'compact' and not any(int(row.get('summary_compact', 0)) for row in stats):
+                        raise RuntimeError(f'missing compact-summary path: {name}')
                     if MODES[mode][1] in ('audit64', 'audit-tree64') and not sum(int(row['summary_checks']) for row in stats):
                         raise RuntimeError(f'missing full summary reconstruction checks: {name}')
         save(output/'experiment.json', {'identity': identity, 'modes': args.modes, 'repeats': args.repeats})

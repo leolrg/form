@@ -555,3 +555,103 @@ TEST(CudaQr, IncrementalTreeBoundsValidateAndRecoverAcrossShrinkingExtents) {
     expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+5},plane);
   }
 }
+
+TEST(CudaQr, CompactTreeCachesPlansAndBoundsIndependently) {
+  for(bool plane:{false,true}) for(int threads:{32,128}) {
+    form::BatchedCudaQr qr(true,64,64,threads);
+    constexpr size_t capacity=83;
+    TreeFixture memory(capacity,3);
+    std::vector<Eigen::MatrixXd> leaves;
+    for(size_t leaf=0;leaf<capacity*3;++leaf) {
+      leaves.push_back(Eigen::MatrixXd::Random(64,7)); memory.leaf(leaf,leaves.back());
+    }
+    memory.host_highwater={83*64,5*64,0}; memory.uploadTree();
+    auto compact=[&](const std::vector<size_t>& bounds) {
+      return qr.computeDevicePackedIncrementalTreeCompact(memory.device,memory.dirty,capacity,bounds,memory.highwater,plane,memory.producer);
+    };
+    auto roots=compact({83,5,0});
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+83},plane);
+    expectIncrementalGram(roots[1],{leaves.begin()+83,leaves.begin()+88},plane);
+    EXPECT_TRUE(roots[2].isZero());
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,1u);
+    EXPECT_GT(qr.incrementalTreeStats().upload_bytes,3*sizeof(int));
+    memory.host_dirty.assign(capacity*3,0); memory.host_dirty[4]=1;
+    leaves[4]*=2.; memory.leaf(4,leaves[4]); memory.uploadTree();
+    const auto changed=compact({83,5,0});
+    expectIncrementalGram(changed[0],{leaves.begin(),leaves.begin()+83},plane);
+    EXPECT_TRUE(changed[1].isApprox(roots[1],0.));
+    EXPECT_EQ(qr.incrementalTreeStats().dirty_leaves,1u);
+    EXPECT_GT(qr.incrementalTreeStats().merge_tiles,0u);
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,0u);
+    EXPECT_EQ(qr.incrementalTreeStats().upload_bytes,0u);
+    memory.host_dirty.assign(capacity*3,0);
+    for(size_t leaf=0;leaf<capacity*3;++leaf)
+      memory.leaf(leaf,Eigen::MatrixXd::Constant(64,7,std::numeric_limits<double>::quiet_NaN()));
+    memory.uploadTree(); compact({83,5,0});
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,0u);
+    EXPECT_EQ(qr.incrementalTreeStats().upload_bytes,0u);
+    EXPECT_EQ(qr.incrementalTreeStats().dirty_leaves,0u);
+    memory.host_highwater={64,0,0}; memory.uploadTree();
+    roots=compact({1,0,0}); // Work plan still covers the preceding larger bounds.
+    expectIncrementalGram(roots[0],{leaves[0]},plane); EXPECT_TRUE(roots[1].isZero());
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,0u);
+    EXPECT_EQ(qr.incrementalTreeStats().upload_bytes,3*sizeof(int));
+    roots=compact({1,0,0}); // Old bounds now shrink, but validation metadata stays.
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,1u);
+    EXPECT_EQ(qr.incrementalTreeStats().upload_bytes,2*sizeof(int)); // One {group,node}.
+    compact({1,0,0}); EXPECT_EQ(qr.incrementalTreeStats().upload_bytes,0u);
+    for(int count:{4,5,16,17,65,64,9,10,1,0,65,81,82,0}) {
+      memory.host_highwater={count*64,0,0}; memory.uploadTree();
+      roots=compact({size_t(count),0,0});
+      expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+count},plane);
+      EXPECT_EQ(qr.incrementalTreeStats().dirty_leaves,0u);
+    }
+    // Both APIs own the same cached roots, including clean, shrunk-away leaves.
+    memory.host_highwater={5*64,2*64,0}; memory.uploadTree();
+    roots=qr.computeDevicePackedIncrementalTree(memory.device,memory.dirty,capacity,3,memory.highwater,plane,memory.producer);
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+5},plane);
+    expectIncrementalGram(roots[1],{leaves.begin()+83,leaves.begin()+85},plane);
+    EXPECT_EQ(qr.incrementalTreeStats().upload_bytes,0u);
+    roots=compact({5,2,0});
+    expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+5},plane);
+    expectIncrementalGram(roots[1],{leaves.begin()+83,leaves.begin()+85},plane);
+    EXPECT_THROW(compact({5,1,0}),std::invalid_argument); // Global maximum is insufficient validation.
+    EXPECT_EQ(qr.incrementalTreeStats().active_leaves,0u);
+    for(size_t leaf=0;leaf<capacity*3;++leaf) memory.leaf(leaf,leaves[leaf]);
+    memory.host_dirty.assign(capacity*3,1); memory.uploadTree();
+    roots=compact({5,2,0}); expectIncrementalGram(roots[0],{leaves.begin(),leaves.begin()+5},plane);
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,1u);
+    EXPECT_THROW(compact({84,2,0}),std::invalid_argument);
+    qr.resetIncremental(); memory.host_dirty.assign(capacity*3,0); memory.uploadTree();
+    roots=compact({5,2,0}); for(const auto& root:roots) EXPECT_TRUE(root.isZero());
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,1u);
+  }
+}
+
+TEST(CudaQr, CompactTreeProducerOrderingRankDeficiencyAndConfigurationChanges) {
+  form::BatchedCudaQr qr;
+  TreeFixture memory(17,2);
+  Eigen::MatrixXd a=Eigen::MatrixXd::Zero(64,7); a.row(3)<<1.,2.,3.,4.,5.,6.,7.; a.row(20)=a.row(3);
+  for(size_t leaf=0;leaf<34;++leaf) memory.leaf(leaf,a);
+  std::atomic<bool> produced{false};
+  ASSERT_EQ(cudaLaunchHostFunc(memory.producer,[](void* p) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30)); static_cast<std::atomic<bool>*>(p)->store(true);
+  },&produced),cudaSuccess);
+  memory.host_highwater={17*64,64}; memory.uploadTree();
+  for(bool plane:{false,true,false}) {
+    const auto roots=qr.computeDevicePackedIncrementalTreeCompact(memory.device,memory.dirty,17,{17,1},memory.highwater,plane,memory.producer);
+    EXPECT_TRUE(produced.load()); EXPECT_EQ(cudaStreamQuery(memory.producer),cudaSuccess);
+    expectIncrementalGram(roots[0],std::vector<Eigen::MatrixXd>(17,a),plane);
+    expectIncrementalGram(roots[1],{a},plane);
+    EXPECT_EQ(qr.incrementalTreeStats().plan_refreshes,1u);
+  }
+  memory.host_highwater={-1,64}; memory.uploadTree();
+  EXPECT_THROW(qr.computeDevicePackedIncrementalTreeCompact(memory.device,memory.dirty,17,{17,1},memory.highwater,true,memory.producer),std::invalid_argument);
+  memory.host_highwater={64,64}; memory.uploadTree();
+  auto roots=qr.computeDevicePackedIncrementalTreeCompact(memory.device,memory.dirty,17,{1,1},memory.highwater,false,memory.producer);
+  for(const auto& root:roots) expectIncrementalGram(root,{a},false);
+  EXPECT_TRUE(qr.computeDevicePackedIncrementalTreeCompact(nullptr,nullptr,0,{},nullptr,false).empty());
+  memory.host_highwater={0,0}; memory.uploadTree();
+  roots=qr.computeDevicePackedIncrementalTreeCompact(nullptr,nullptr,0,{0,0},memory.highwater,false,memory.producer);
+  for(const auto& root:roots) EXPECT_TRUE(root.isZero());
+}

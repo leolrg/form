@@ -148,8 +148,9 @@ O(G k^2) compact factor output for G target scans
 
 The fused/distinct and split/occurrence variants have different constants in the
 first two terms. Initial runner-up acquisition, initialization, kernel launches,
-transfers, and synchronizations must be counted. Current slot assignment still
-examines queries and uses grouped sorting; total work is not proportional only
+transfers, and synchronizations must be counted. Slot assignment still examines queries; the sorted variant uses grouped sorting,
+while the queued variant reserves incoming rows per group using warp-aggregated
+atomics and fills holes in a separate kernel. Total work is not proportional only
 to the number of changed correspondences.
 
 The prototype reserves a worst-case slot range per group, giving `O(GN)` backing
@@ -164,3 +165,19 @@ procedure and its evaluated operating region. Triangle inequalities, cached
 nearest-neighbor search, QR trees, and selective statistics updates are established
 ideas. Any publication claim must identify what the complete FORM-specific
 procedure adds and demonstrate useful savings against the existing fast pipeline.
+
+## Compact active-tree scheduling prototype
+
+The compact scheduler retains a host/device task list of `(group,node)` pairs
+for each QR tree level. Each task visits one active leaf or ancestor using the
+same arithmetic as the capped-grid tree. It still checks dirty flags on the
+device; it does not claim work proportional only to dirty nodes. The task list
+is rebuilt only when the per-group rounded highwater extents change. Bounds are
+validated against device extents, and launch work includes the previous extent
+when a group shrinks, so stale descendants can be removed safely.
+
+This trades rectangular overlaunch and warp loops for a compact grid plus
+cached metadata. Planning, metadata uploads, initialization and the full
+end-to-end runtime must be counted. Per-call diagnostic counters record task
+plan refreshes and metadata upload bytes. Queue ordering can change dirty-leaf
+locality independently of scheduling; sorted and queued ablations are separate.

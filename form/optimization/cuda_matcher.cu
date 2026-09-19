@@ -589,13 +589,14 @@ struct CudaMatcher::Impl {
   double width=1.;
   bool ready=false,searched=false;
   BatchedCudaQr qr;
-  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false,summary_tree=false,summary_bounds=false,summary_row_queue=false;
+  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false,summary_tree=false,summary_bounds=false,summary_row_queue=false,summary_compact=false;
   size_t summary_checks=0;
   double summary_relative_error=0.;
   Buffer<int> query_slots,slot_queries,previous_targets,incoming,highwater,dirty_leaves;
   Buffer<unsigned char> dirty_flags;
   Buffer<double> stable_packed;
   std::vector<int> host_highwater;
+  std::vector<size_t> host_leaf_bounds;
   int slot_stride=0;
   void invalidateSummaries() { summary_valid=false; qr.resetIncremental(); }
   std::vector<Eigen::MatrixXd> packIncremental(const std::vector<Group>& descriptors,bool plane);
@@ -626,6 +627,11 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
     if(enabled=="1") setSummaryTreeBounds(true);
     else if(enabled!="0") throw std::invalid_argument("Invalid FORM_CUDA_TREE_BOUNDS (0|1)");
   }
+  if(const char* value=std::getenv("FORM_CUDA_TREE_LAYOUT")) {
+    const std::string layout(value);
+    if(layout=="compact") setSummaryTreeCompact(true);
+    else if(layout!="capped") throw std::invalid_argument("Invalid FORM_CUDA_TREE_LAYOUT (capped|compact)");
+  }
   if(const char* value=std::getenv("FORM_CUDA_SUMMARY_ROWS")) {
     const std::string rows(value);
     if(rows=="queue") setSummaryRowQueue(true);
@@ -655,11 +661,12 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
 }
 CudaMatcher::~CudaMatcher()=default;
 void CudaMatcher::setIncrementalSummaries(bool enabled) {
-  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false; impl_->summary_tree=false; impl_->summary_bounds=false; impl_->summary_row_queue=false;
+  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false; impl_->summary_tree=false; impl_->summary_bounds=false; impl_->summary_row_queue=false; impl_->summary_compact=false;
 }
 void CudaMatcher::setSummaryTree(bool enabled) {
   impl_->invalidateSummaries(); impl_->summary_tree=enabled;
   if(enabled) impl_->incremental_summaries=true;
+  else impl_->summary_compact=false;
 }
 void CudaMatcher::setSummaryRowQueue(bool enabled) {
   impl_->invalidateSummaries(); impl_->summary_row_queue=enabled;
@@ -667,11 +674,15 @@ void CudaMatcher::setSummaryRowQueue(bool enabled) {
 void CudaMatcher::setSummaryTreeBounds(bool enabled) {
   impl_->invalidateSummaries(); impl_->summary_bounds=enabled;
 }
+void CudaMatcher::setSummaryTreeCompact(bool enabled) {
+  impl_->invalidateSummaries(); impl_->summary_compact=enabled;
+  if(enabled) { impl_->incremental_summaries=true; impl_->summary_tree=true; impl_->summary_bounds=true; }
+}
 void CudaMatcher::setSummaryTreeWarpCap(size_t cap) { impl_->qr.setIncrementalTreeWarpCap(cap); }
 CudaMatcher::SummaryStats CudaMatcher::summaryStats() {
   if(!impl_->incremental_summaries || !impl_->summary_valid) return {};
   const auto stats=impl_->summary_tree?impl_->qr.incrementalTreeStats():impl_->qr.incrementalStats();
-  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error,impl_->summary_tree,impl_->summary_tree && impl_->summary_bounds,impl_->summary_row_queue};
+  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error,impl_->summary_tree,impl_->summary_tree && (impl_->summary_bounds || impl_->summary_compact),impl_->summary_row_queue,impl_->summary_compact,stats.plan_refreshes,stats.upload_bytes};
 }
 void CudaMatcher::setSearchKernel(SearchKernel kernel) {
   auto& state=*impl_;
@@ -1002,16 +1013,21 @@ std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packIncremental(const std::vecto
       check(cudaGetLastError());
     }
     size_t maximum=std::numeric_limits<size_t>::max();
-    if(s.summary_bounds) {
+    if(s.summary_bounds || s.summary_compact) {
       maximum=0;
+      s.host_leaf_bounds.resize(descriptors.size());
       for(size_t group=0;group<descriptors.size();++group) {
         // First-hole allocation gives h' = max(h,current accepted count).
         // Reset/plane/group/failure invalidation clears this mirror above.
         s.host_highwater[group]=std::max(s.host_highwater[group],descriptors[group].rows);
-        maximum=std::max(maximum,(size_t(s.host_highwater[group])+63)/64);
+        s.host_leaf_bounds[group]=(size_t(s.host_highwater[group])+63)/64;
+        maximum=std::max(maximum,s.host_leaf_bounds[group]);
       }
     }
-    auto roots=s.qr.computeDevicePackedIncrementalTree(s.stable_packed.data,s.dirty_flags.data,
+    auto roots=s.summary_compact
+      ? s.qr.computeDevicePackedIncrementalTreeCompact(s.stable_packed.data,s.dirty_flags.data,
+          s.slot_stride/64,s.host_leaf_bounds,s.highwater.data,plane,s.stream)
+      : s.qr.computeDevicePackedIncrementalTree(s.stable_packed.data,s.dirty_flags.data,
       s.slot_stride/64,s.group_count,s.highwater.data,plane,s.stream,maximum);
     s.summary_valid=true;
     return roots;

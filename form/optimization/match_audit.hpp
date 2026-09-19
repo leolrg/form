@@ -22,7 +22,7 @@ public:
     if(stats_path && *stats_path) {
       stats_.exceptions(std::ios::failbit|std::ios::badbit);
       stats_.open(stats_path);
-      stats_ << "scan,kind,total,certified,searched,cell_fallback,gap_fallback,unchanged,mismatches,oracle_searched,active_leaves,dirty_leaves,summary_checks,relative_gram_error,split_queries,summary_tree,summary_bounded,summary_queued\n";
+      stats_ << "scan,kind,total,certified,searched,cell_fallback,gap_fallback,unchanged,mismatches,oracle_searched,active_leaves,dirty_leaves,summary_checks,relative_gram_error,split_queries,summary_tree,summary_bounded,summary_queued,summary_compact,plan_refreshes,plan_upload_bytes\n";
     }
     const char* path=std::getenv("FORM_MATCH_AUDIT_PATH");
     if(!path || !*path) return;
@@ -40,7 +40,7 @@ public:
     stats_ << scan << ',' << kind << ',' << s.total << ',' << s.certified << ',' << s.searched
            << ',' << s.cell_fallback << ',' << s.gap_fallback << ',' << s.unchanged << ',' << s.mismatches
            << ',' << s.oracle_searched << ',' << q.active_leaves << ',' << q.dirty_leaves << ',' << q.full_rebuild_checks
-           << ',' << q.relative_gram_error << ',' << s.split_queries << ',' << int(q.tree) << ',' << int(q.bounded) << ',' << int(q.queued) << '\n';
+           << ',' << q.relative_gram_error << ',' << s.split_queries << ',' << int(q.tree) << ',' << int(q.bounded) << ',' << int(q.queued) << ',' << int(q.compact) << ',' << q.plan_refreshes << ',' << q.plan_upload_bytes << '\n';
     stats_.flush();
   }
   void append(size_t scan,int kind,const std::vector<size_t>& groups,

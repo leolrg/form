@@ -24,12 +24,15 @@ public:
   struct SummaryStats {
     size_t active_leaves=0, dirty_leaves=0, full_rebuild_checks=0;
     double relative_gram_error=0.;
-    bool tree=false, bounded=false, queued=false;
+    bool tree=false, bounded=false, queued=false, compact=false;
+    size_t plan_refreshes=0, plan_upload_bytes=0;
   };
   void setIncrementalSummaries(bool enabled);
   // Select cached ancestor maintenance; enabling this also enables summaries.
   void setSummaryTree(bool enabled);
   void setSummaryTreeBounds(bool enabled);
+  // Compact scheduling enables tree summaries and exact host bounds.
+  void setSummaryTreeCompact(bool enabled);
   // Queue arrivals per group; insertion order may vary across warps. Requires
   // incremental summaries. Changing this invalidates cached row slots/roots.
   void setSummaryRowQueue(bool enabled);

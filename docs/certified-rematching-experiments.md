@@ -5,7 +5,7 @@ Research branch: `codex/certified-rematching`, isolated worktree
 unchanged at `1255543`. These are preliminary feasibility observations, not final
 speed or novelty claims.
 
-## Latest verified checkpoint: V3 partial QR
+## V3 partial QR checkpoint
 
 The stable 64-row slot implementation keeps unchanged rows in their target scan's
 slots, fills first-available holes on migration/insertion, and rebuilds only dirty
@@ -504,3 +504,19 @@ from8.022 to8.527 ms. Combined queued matching is7.871/8.349 ms, but total is
 The stable finding remains that search work falls while partial-summary overhead
 largely consumes its own QR savings. Compact task scheduling and broader workload
 comparisons remain outstanding.
+
+## Matched CPU controls at the current configuration
+
+Frozen V7, first 250 stairs scans, warmup 20, 32 threads, two reversed-order
+repetitions (`scale-v7-current/`):
+
+| Backend | Mean total ms/scan | Mean matching ms/scan |
+| --- | ---: | ---: |
+| Existing GPU pipeline, research options off |26.901|8.576|
+| Improved CPU summaries/extraction |77.774|52.572|
+| Original FORM reference |126.656|65.119|
+
+All workload counts agree. Maximum translation differences against GPU off
+are 2.89e-13 m for improved CPU and 9.10e-12 m for reference. These are controls
+for the broader existing acceleration, **not gains attributable to certified
+rematching**. Dense/window and full-sequence comparisons follow separately.

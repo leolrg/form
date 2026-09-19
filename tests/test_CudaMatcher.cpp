@@ -12,8 +12,8 @@ using form::CudaMatcher;
 TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRejection) {
   const std::array<double,12> identity={1,0,0,0,0,1,0,0,0,0,1,0};
   auto shifted=identity; shifted[3]=.2;
-  for(bool plane:{false,true}) for(int extra_group:{0,1}) for(int backend:{0,1,2}) {
-    const bool tree=backend!=0,bounded=backend==2;
+  for(bool plane:{false,true}) for(int extra_group:{0,1}) for(int backend:{0,1,2,3}) {
+    const bool tree=backend!=0,bounded=backend>=2,compact=backend==3;
     CudaMatcher full,partial;
     full.setIncrementalSummaries(false);
     full.setReuseMode(CudaMatcher::ReuseMode::Disabled);
@@ -21,6 +21,7 @@ TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRej
     partial.setIncrementalSummaries(true);
     partial.setSummaryTree(tree);
     partial.setSummaryTreeBounds(bounded);
+    partial.setSummaryTreeCompact(compact);
     std::vector<CudaMatcher::MapPoint> points;
     std::vector<CudaMatcher::Query> queries;
     for(int i=0;i<192;++i) {
@@ -59,6 +60,8 @@ TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRej
     EXPECT_EQ(partial.summaryStats().active_leaves,3u);
     EXPECT_EQ(partial.summaryStats().tree,tree);
     EXPECT_EQ(partial.summaryStats().bounded,bounded);
+    EXPECT_EQ(partial.summaryStats().compact,compact);
+    if(compact) EXPECT_EQ(partial.summaryStats().plan_refreshes,1u);
     EXPECT_EQ(partial.summaryStats().dirty_leaves,3u);
     compare(shifted,1.);
     EXPECT_EQ(partial.summaryStats().dirty_leaves,size_t(extra_group?2:1));
@@ -85,13 +88,14 @@ TEST(CudaMatcher, IncrementalSlotsCrossBlockScanChunksAndRefillScatteredHoles) {
     points.push_back({{x,.1,.1,0},{x-.01,.1,.1},{.3,.4,.5}}); groups.push_back(0);
     if(i%17==0) { points.push_back({{x+.3,.1,.1,0},{x+.29,.1,.1},{.5,.4,.3}}); groups.push_back(1); }
   }
-  for(bool plane:{false,true}) for(int backend:{0,1,2}) {
-    const bool tree=backend!=0,bounded=backend==2;
+  for(bool plane:{false,true}) for(int backend:{0,1,2,3}) {
+    const bool tree=backend!=0,bounded=backend>=2;
     CudaMatcher full,partial;
     full.setIncrementalSummaries(false);
     partial.setIncrementalSummaries(true);
     partial.setSummaryTree(tree);
     partial.setSummaryTreeBounds(bounded);
+    partial.setSummaryTreeCompact(backend==3);
     for(auto* matcher:{&full,&partial}) {
       matcher->reset({{{0,0,0},0,int(points.size())}},points,queries,2000.);
       matcher->setGroups(groups,3);
@@ -822,11 +826,11 @@ TEST(CudaMatcher, SquaredCertificateEnvironmentSelectionAndValidation) {
 
 
 TEST(CudaMatcher, SummaryRowQueueHandlesMixedPartialWarpsAndSlotLifetimes) {
-  for(bool plane:{false,true}) for(int backend:{0,1,2}) {
+  for(bool plane:{false,true}) for(int backend:{0,1,2,3}) {
     CudaMatcher full,queued;
     full.setIncrementalSummaries(false);
     queued.setIncrementalSummaries(true); queued.setSummaryTree(backend!=0);
-    queued.setSummaryTreeBounds(backend==2); queued.setSummaryRowQueue(true);
+    queued.setSummaryTreeBounds(backend>=2); queued.setSummaryTreeCompact(backend==3); queued.setSummaryRowQueue(true);
     for(int count:{0,31,33,64,257,777,33}) {
       std::vector<CudaMatcher::MapPoint> points;
       std::vector<CudaMatcher::Query> queries;

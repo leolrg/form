@@ -42,6 +42,8 @@ public:
   struct IncrementalStats {
     size_t active_leaves=0;
     unsigned long long dirty_leaves=0, merge_tiles=0, changed_groups=0;
+    // Latest compact call only; upload_bytes counts task/bound metadata H2D.
+    size_t plan_refreshes=0, upload_bytes=0;
   };
   /// Fixed 64x7 column-major leaves; flattened index is group*capacity+leaf.
   /// All-zero rows represent holes. Clean leaves retain their cached roots.
@@ -67,6 +69,15 @@ public:
       size_t group_count, const int* device_highwater, bool plane,
       void* producer_stream = nullptr,
       size_t max_active_leaves = std::numeric_limits<size_t>::max());
+  /// Compact scheduling shares the tree roots with the capped API. Bounds are
+  /// per-group leaf counts; current device extents are validated against them.
+  /// Cached node tasks and bounds upload only when their respective values change.
+  /// Shrinking bounds process the preceding extent too; false bounds invalidate
+  /// the shared tree cache. Warp caps apply only to the capped API.
+  std::vector<Eigen::MatrixXd> computeDevicePackedIncrementalTreeCompact(
+      const double* packed, const unsigned char* dirty, size_t leaf_capacity_per_group,
+      const std::vector<size_t>& per_group_bounds, const int* device_highwater,
+      bool plane, void* producer_stream = nullptr);
   /// Accepts 32/128/256 warps per group; default 32. Valid changes preserve caches.
   void setIncrementalTreeWarpCap(size_t cap);
   void resetIncremental();
