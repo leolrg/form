@@ -12,13 +12,15 @@ using form::CudaMatcher;
 TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRejection) {
   const std::array<double,12> identity={1,0,0,0,0,1,0,0,0,0,1,0};
   auto shifted=identity; shifted[3]=.2;
-  for(bool plane:{false,true}) for(int extra_group:{0,1}) for(bool tree:{false,true}) {
+  for(bool plane:{false,true}) for(int extra_group:{0,1}) for(int backend:{0,1,2}) {
+    const bool tree=backend!=0,bounded=backend==2;
     CudaMatcher full,partial;
     full.setIncrementalSummaries(false);
     full.setReuseMode(CudaMatcher::ReuseMode::Disabled);
     partial.setReuseMode(CudaMatcher::ReuseMode::Certified);
     partial.setIncrementalSummaries(true);
     partial.setSummaryTree(tree);
+    partial.setSummaryTreeBounds(bounded);
     std::vector<CudaMatcher::MapPoint> points;
     std::vector<CudaMatcher::Query> queries;
     for(int i=0;i<192;++i) {
@@ -56,6 +58,7 @@ TEST(CudaMatcher, IncrementalBlocksRetainUnchangedLeavesAndHandleMigrationAndRej
     compare(identity,1.);
     EXPECT_EQ(partial.summaryStats().active_leaves,3u);
     EXPECT_EQ(partial.summaryStats().tree,tree);
+    EXPECT_EQ(partial.summaryStats().bounded,bounded);
     EXPECT_EQ(partial.summaryStats().dirty_leaves,3u);
     compare(shifted,1.);
     EXPECT_EQ(partial.summaryStats().dirty_leaves,size_t(extra_group?2:1));
@@ -82,11 +85,13 @@ TEST(CudaMatcher, IncrementalSlotsCrossBlockScanChunksAndRefillScatteredHoles) {
     points.push_back({{x,.1,.1,0},{x-.01,.1,.1},{.3,.4,.5}}); groups.push_back(0);
     if(i%17==0) { points.push_back({{x+.3,.1,.1,0},{x+.29,.1,.1},{.5,.4,.3}}); groups.push_back(1); }
   }
-  for(bool plane:{false,true}) for(bool tree:{false,true}) {
+  for(bool plane:{false,true}) for(int backend:{0,1,2}) {
+    const bool tree=backend!=0,bounded=backend==2;
     CudaMatcher full,partial;
     full.setIncrementalSummaries(false);
     partial.setIncrementalSummaries(true);
     partial.setSummaryTree(tree);
+    partial.setSummaryTreeBounds(bounded);
     for(auto* matcher:{&full,&partial}) {
       matcher->reset({{{0,0,0},0,int(points.size())}},points,queries,2000.);
       matcher->setGroups(groups,3);
@@ -730,4 +735,87 @@ TEST(CudaMatcher, SearchVariantEnvironmentSelectionAndValidation) {
   }
   { ScopedMatcherEnvironment invalid("FORM_CUDA_MATCH_KERNEL","invalid"); EXPECT_THROW(CudaMatcher{},std::invalid_argument); }
   { ScopedMatcherEnvironment invalid("FORM_CUDA_MATCH_TOP2","invalid"); EXPECT_THROW(CudaMatcher{},std::invalid_argument); }
+}
+
+TEST(CudaMatcher, SquaredCertificateConservativelyFallsBackWhenPolynomialUnderflows) {
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified})
+  for(auto kernel:{CudaMatcher::SearchKernel::Fused,CudaMatcher::SearchKernel::Split})
+  for(bool occurrences:{false,true}) for(bool squared:{false,true}) {
+    CudaMatcher matcher,oracle;
+    matcher.setReuseMode(mode); matcher.setSearchKernel(kernel); matcher.setOccurrenceBound(occurrences);
+    matcher.setSquaredCertificate(squared); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    const std::vector<CudaMatcher::MapPoint> points={{{0,0,0,0},{},{}},{{1e-100,0,0,0},{},{}}};
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},points,{{{0,0,0,0}}},1.);
+    matcher.search(identity_pose);
+    auto pose=identity_pose; pose[3]=1e-102;
+    const auto expected=oracle.search(pose)[0],actual=matcher.search(pose)[0];
+    EXPECT_EQ(actual.index,expected.index); EXPECT_EQ(actual.distance,expected.distance);
+    EXPECT_EQ(matcher.reuseStats().certified,squared?0:1);
+    EXPECT_EQ(matcher.reuseStats().mismatches,0);
+    matcher.search(pose); EXPECT_EQ(matcher.reuseStats().certified,1);
+    matcher.setSquaredCertificate(squared); matcher.search(pose);
+    EXPECT_EQ(matcher.reuseStats().certified,0);
+  }
+}
+
+TEST(CudaMatcher, SquaredCertificateMatchesOriginalOverAdversarialScalesPaddingAndMotion) {
+  std::mt19937 rng(42871);
+  std::uniform_real_distribution<double> random(.1,.9);
+  for(auto mode:{CudaMatcher::ReuseMode::Audit,CudaMatcher::ReuseMode::Certified})
+  for(auto kernel:{CudaMatcher::SearchKernel::Fused,CudaMatcher::SearchKernel::Split})
+  for(bool occurrences:{false,true}) {
+    CudaMatcher matcher,oracle;
+    matcher.setReuseMode(mode); matcher.setSearchKernel(kernel); matcher.setOccurrenceBound(occurrences);
+    matcher.setSquaredCertificate(true); oracle.setReuseMode(CudaMatcher::ReuseMode::Disabled);
+    for(double scale:{1.,1e-100,1e-160,1e-310,1e150,1e155}) {
+      std::vector<CudaMatcher::MapPoint> points;
+      std::vector<CudaMatcher::Query> queries;
+      for(int i=0;i<67;++i) {
+        points.push_back({{scale*random(rng),scale*random(rng),scale*random(rng),scale*random(rng)},{},{}});
+        if(i<33) queries.push_back({{points.back().world[0],points.back().world[1],points.back().world[2],points.back().world[3]}});
+      }
+      points[66]=points[0];
+      const std::vector<CudaMatcher::Voxel> voxels={{{0,0,0},0,67},{{1,0,0},0,33}};
+      for(auto* m:{&matcher,&oracle}) m->reset(voxels,points,queries,scale);
+      for(int step=0;step<23;++step) {
+        auto pose=identity_pose; const double angle=step*.0001;
+        pose[0]=std::cos(angle); pose[1]=-std::sin(angle); pose[4]=std::sin(angle); pose[5]=std::cos(angle);
+        pose[3]=scale*(step<15?step*.001:(step-14)*.13);
+        const auto expected=oracle.search(pose),actual=matcher.search(pose);
+        for(size_t i=0;i<actual.size();++i) {
+          ASSERT_EQ(actual[i].index,expected[i].index) << scale << ":" << step;
+          ASSERT_EQ(actual[i].distance,expected[i].distance) << scale << ":" << step;
+        }
+        EXPECT_EQ(matcher.reuseStats().mismatches,0);
+      }
+    }
+    // Rounded Voronoi tie: the tiny y term is lost when added to x squared.
+    const double below=std::nextafter(.5,0.);
+    const std::vector<CudaMatcher::MapPoint> tied={{{.25,.5,.5,.25},{},{}},{{.75,std::nextafter(.5,1.),.5,.25},{},{}}};
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},tied,{{{below,.5,.5,.25}}},1.);
+    matcher.search(identity_pose); auto pose=identity_pose; pose[3]=.5-below;
+    const auto expected=oracle.search(pose)[0],actual=matcher.search(pose)[0];
+    EXPECT_EQ(actual.index,expected.index); EXPECT_EQ(actual.distance,expected.distance);
+    EXPECT_EQ(matcher.reuseStats().certified,0); EXPECT_EQ(matcher.reuseStats().mismatches,0);
+    // Ordinary-scale strict gaps actually certify; this is not an always-fallback implementation.
+    for(auto* m:{&matcher,&oracle}) m->reset({{{0,0,0},0,2}},
+      {{{.2,.3,.4,.25},{},{}},{{.8,.3,.4,.5},{},{}}},{{{.21,.3,.4,.25}}},1.);
+    matcher.search(identity_pose); pose=identity_pose; pose[3]=.001;
+    const auto stable_expected=oracle.search(pose)[0],stable_actual=matcher.search(pose)[0];
+    EXPECT_EQ(stable_actual.index,stable_expected.index); EXPECT_EQ(stable_actual.distance,stable_expected.distance);
+    EXPECT_EQ(matcher.reuseStats().certified,1); EXPECT_EQ(matcher.reuseStats().mismatches,0);
+  }
+}
+
+TEST(CudaMatcher, SquaredCertificateEnvironmentSelectionAndValidation) {
+  ScopedMatcherEnvironment reuse("FORM_CUDA_MATCH_REUSE","certified");
+  for(const char* variant:{"norm","squared"}) {
+    ScopedMatcherEnvironment certificate("FORM_CUDA_MATCH_CERTIFICATE",variant);
+    CudaMatcher matcher;
+    matcher.reset({{{0,0,0},0,2}},{{{0,0,0,0},{},{}},{{1e-100,0,0,0},{},{}}},{{{0,0,0,0}}},1.);
+    matcher.search(identity_pose); auto pose=identity_pose; pose[3]=1e-102; matcher.search(pose);
+    EXPECT_EQ(matcher.reuseStats().certified,std::string(variant)=="squared"?0:1);
+  }
+  ScopedMatcherEnvironment invalid("FORM_CUDA_MATCH_CERTIFICATE","invalid");
+  EXPECT_THROW(CudaMatcher{},std::invalid_argument);
 }

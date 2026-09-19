@@ -10,6 +10,40 @@ from pathlib import Path
 from run_suite import CONFIGS, ROOT, digest, execute, json_hash, provenance, save
 
 
+# reuse, summary, kernel, runner-up, certificate, tree warp cap, tree bounds
+MODES = {
+    'off': ('off', 'off', 'fused', 'distinct', 'norm', 32, 0),
+    'baseline': ('off', 'off', 'fused', 'distinct', 'norm', 32, 0),
+    'cpu': ('off', 'off', 'fused', 'distinct', 'norm', 32, 0),
+    'reference': ('off', 'off', 'fused', 'distinct', 'norm', 32, 0),
+    'certified': ('certified', 'off', 'fused', 'distinct', 'norm', 32, 0),
+    'fast': ('certified', 'off', 'fused', 'occurrences', 'norm', 32, 0),
+    'split': ('certified', 'off', 'split', 'distinct', 'norm', 32, 0),
+    'split-fast': ('certified', 'off', 'split', 'occurrences', 'norm', 32, 0),
+    'blocks': ('off', 'blocks64', 'fused', 'distinct', 'norm', 32, 0),
+    'combined': ('certified', 'blocks64', 'fused', 'distinct', 'norm', 32, 0),
+    'combined-fast': ('certified', 'blocks64', 'split', 'occurrences', 'norm', 32, 0),
+    'audit': ('audit', 'off', 'fused', 'distinct', 'norm', 32, 0),
+    'audit-fast': ('audit', 'off', 'split', 'occurrences', 'norm', 32, 0),
+    'summary-audit': ('audit', 'audit64', 'fused', 'distinct', 'norm', 32, 0),
+    'tree': ('off', 'tree64', 'fused', 'distinct', 'norm', 32, 0),
+    'tree-combined': ('certified', 'tree64', 'split', 'occurrences', 'norm', 32, 0),
+    'tree-audit': ('audit', 'audit-tree64', 'split', 'occurrences', 'norm', 32, 0),
+    'tree128': ('off', 'tree64', 'fused', 'distinct', 'norm', 128, 0),
+    'tree256': ('off', 'tree64', 'fused', 'distinct', 'norm', 256, 0),
+    'tree-bounded': ('off', 'tree64', 'fused', 'distinct', 'norm', 32, 1),
+    'tree-bounded128': ('off', 'tree64', 'fused', 'distinct', 'norm', 128, 1),
+    'tree-bounded256': ('off', 'tree64', 'fused', 'distinct', 'norm', 256, 1),
+    'squared': ('certified', 'off', 'fused', 'occurrences', 'squared', 32, 0),
+    'squared-split': ('certified', 'off', 'split', 'occurrences', 'squared', 32, 0),
+    'tree-squared128': ('certified', 'tree64', 'fused', 'occurrences', 'squared', 128, 1),
+    'squared-audit': ('audit', 'audit-tree64', 'fused', 'occurrences', 'squared', 128, 1),
+}
+ENV_KEYS = ('FORM_CUDA_MATCH_REUSE', 'FORM_CUDA_SUMMARY_REUSE', 'FORM_CUDA_MATCH_KERNEL',
+            'FORM_CUDA_MATCH_TOP2', 'FORM_CUDA_MATCH_CERTIFICATE', 'FORM_CUDA_TREE_WARPS',
+            'FORM_CUDA_TREE_BOUNDS')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -19,7 +53,7 @@ def main():
     parser.add_argument('--config', choices=CONFIGS, default='current')
     parser.add_argument('--limit', type=int, default=250)
     parser.add_argument('--repeats', type=int, default=2)
-    parser.add_argument('--modes', nargs='+', choices=('baseline', 'off', 'audit', 'certified', 'cpu', 'reference', 'blocks', 'combined', 'summary-audit', 'fast', 'split', 'split-fast', 'combined-fast', 'audit-fast', 'tree', 'tree-combined', 'tree-audit'), default=['off', 'certified'])
+    parser.add_argument('--modes', nargs='+', choices=MODES, default=['off', 'certified'])
     parser.add_argument('--diagnostic', action='store_true')
     parser.add_argument('--stats-only', action='store_true', help='Diagnostic counters/oracles without raw correspondence capture')
     parser.add_argument('--threads', type=int, default=32)
@@ -30,14 +64,14 @@ def main():
         parser.error('limit > 20, repeats >= 1, threads >= 1 required')
     if 'baseline' in args.modes and args.baseline is None:
         parser.error('baseline mode requires --baseline')
-    if any(m in args.modes for m in ('audit', 'summary-audit', 'audit-fast', 'tree-audit')) and not args.diagnostic:
+    if any(MODES[m][0] == 'audit' for m in args.modes) and not args.diagnostic:
         parser.error('audit mode is diagnostic, never clean timing')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     # Hold lock throughout all children; prevent accidental overlapping suites.
     with (ROOT/'benchmarks/results/.rematching.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for key in ('FORM_CUDA_MATCH_REUSE', 'FORM_CUDA_SUMMARY_REUSE', 'FORM_CUDA_MATCH_KERNEL', 'FORM_CUDA_MATCH_TOP2', 'FORM_MATCH_STATS_PATH', 'FORM_MATCH_AUDIT_PATH'):
+        for key in (*ENV_KEYS, 'FORM_MATCH_STATS_PATH', 'FORM_MATCH_AUDIT_PATH'):
             os.environ.pop(key, None)
         binary = args.binary.resolve()
         prov = provenance(binary, output)
@@ -53,11 +87,7 @@ def main():
             modes = args.modes if repeat % 2 == 0 else list(reversed(args.modes))
             for mode in modes:
                 name = f'{args.sequence}-{args.config}-{mode}-r{repeat+1}'
-                os.environ['FORM_CUDA_MATCH_REUSE'] = 'audit' if mode in ('audit', 'summary-audit', 'audit-fast', 'tree-audit') else ('certified' if mode in ('certified', 'combined', 'fast', 'split', 'split-fast', 'combined-fast', 'tree-combined') else 'off')
-                summary_modes = {'summary-audit': 'audit64', 'blocks': 'blocks64', 'combined': 'blocks64', 'combined-fast': 'blocks64', 'tree': 'tree64', 'tree-combined': 'tree64', 'tree-audit': 'audit-tree64'}
-                os.environ['FORM_CUDA_SUMMARY_REUSE'] = summary_modes.get(mode, 'off')
-                os.environ['FORM_CUDA_MATCH_KERNEL'] = 'split' if mode in ('split', 'split-fast', 'combined-fast', 'audit-fast', 'tree-combined', 'tree-audit') else 'fused'
-                os.environ['FORM_CUDA_MATCH_TOP2'] = 'occurrences' if mode in ('fast', 'split-fast', 'combined-fast', 'audit-fast', 'tree-combined', 'tree-audit') else 'distinct'
+                os.environ.update({key: str(value) for key, value in zip(ENV_KEYS, MODES[mode])})
                 if args.diagnostic and mode not in ('baseline', 'cpu', 'reference'):
                     os.environ['FORM_MATCH_STATS_PATH'] = str(output/(name+'.match-stats.csv'))
                     if args.stats_only:
@@ -93,11 +123,13 @@ def main():
                         stats = list(csv.DictReader(stream))
                     if not stats or any(int(row['mismatches']) for row in stats):
                         raise RuntimeError(f'empty or failing match audit: {name}')
-                    if mode in ('audit', 'summary-audit', 'audit-fast', 'tree-audit') and any(int(row['oracle_searched']) != int(row['total']) for row in stats):
+                    if MODES[mode][0] == 'audit' and any(int(row['oracle_searched']) != int(row['total']) for row in stats):
                         raise RuntimeError(f'incomplete original-kernel oracle: {name}')
-                    if mode == 'tree-audit' and not any(int(row.get('summary_tree', 0)) for row in stats):
+                    if MODES[mode][1] == 'audit-tree64' and not any(int(row.get('summary_tree', 0)) for row in stats):
                         raise RuntimeError(f'missing cached-tree path: {name}')
-                    if mode in ('summary-audit', 'tree-audit') and not sum(int(row['summary_checks']) for row in stats):
+                    if MODES[mode][6] and MODES[mode][1] == 'audit-tree64' and not any(int(row.get('summary_bounded', 0)) for row in stats):
+                        raise RuntimeError(f'missing bounded-tree path: {name}')
+                    if MODES[mode][1] in ('audit64', 'audit-tree64') and not sum(int(row['summary_checks']) for row in stats):
                         raise RuntimeError(f'missing full summary reconstruction checks: {name}')
         save(output/'experiment.json', {'identity': identity, 'modes': args.modes, 'repeats': args.repeats})
 

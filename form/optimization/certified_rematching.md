@@ -164,3 +164,56 @@ masked fallback warps. The occurrence bound saves comparisons, rank storage, and
 one rank shuffle per reduction step, at the possible cost of weaker certificates.
 Both variants require measured end-to-end comparisons rather than a speedup claim
 from certificate yield alone.
+
+## Optional squared certificate
+
+`setSquaredCertificate(true)`, or `FORM_CUDA_MATCH_CERTIFICATE=squared`, selects
+an alternative strict predicate without square roots or division. `norm` is the
+default and retains the preceding implementation. The setter invalidates anchors,
+even when setting the same value; invalid environment values are rejected.
+Template specialization selects the predicate in both fused and split kernels.
+This is an arithmetic ablation, with no assumed performance benefit.
+
+Let c be the cached winner's newly computed distance, R0 the anchor's stored
+competitor threshold, and D an upward-rounded bound on squared displacement as
+above. Use directed arithmetic to form
+
+    R = down(max(0, down(R0-A)) * (1-E))
+    W = up(up(c+A) * (1+E+epsilon))
+    T = down(down(R-D)-W).
+
+Both multiplier constants are exactly representable binary64 numbers. They satisfy
+
+    1-E <= 1/(1+E)
+    1+E+epsilon >= 1/(1-E),
+
+because the second reciprocal's remainder after 1+E is E^2/(1-E), smaller than
+binary64 epsilon. Therefore R is no greater than any competitor's exact anchor
+squared distance, including a clamped overflowed anchor. W is at least
+(c+A)/(1-E). Clamping before the lower multiplication preserves the inequality
+when R0-A is negative.
+
+Reject nonfinite c, c >= DBL_MAX, nonfinite D, or nonfinite W. Certify only if
+
+    T > 0  and  down(T*T) > up(4 * up(D*W)).
+
+This implies R-D-W > 2*sqrt(D*W), and hence
+sqrt(R) > sqrt(D)+sqrt(W). The reverse triangle inequality makes every current
+competitor's exact squared distance strictly greater than W. The lower error
+enclosure then makes its computed distance strictly greater than c; overflowed
+current competitors also exceed c. Thus rounded-distance ties cannot be skipped.
+Using a lower R and upper D,W is conservative: the exact criterion
+sqrt(R)>sqrt(D)+sqrt(W) is monotone in precisely those directions. The positive
+T check is necessary before squaring.
+
+Directed products preserve these implications under gradual underflow. In
+particular an underflowed left square can reject an otherwise useful certificate;
+an upward-rounded right product cannot silently vanish below its true value.
+A downward-rounded positive overflow yields DBL_MAX, still a valid lower bound;
+an upward-rounded right overflow yields infinity and rejects. All operands after
+the finite checks are nonnegative and finite, so neither product introduces NaN.
+There is no rescaling to recover certificate yield at extreme magnitudes. The
+norm and squared predicates may therefore make different conservative decisions,
+while both must return the exact original search result. Padding is included in
+R0 and c and has zero displacement; same-cell, identical-query, empty-domain,
+anchor-lifetime, and Audit rules are unchanged.

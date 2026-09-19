@@ -57,7 +57,9 @@ Convert that into a lower bound on its **computed** current squared distance.
 Certify only when the original-arithmetic winner distance is strictly smaller.
 This excludes computed-distance ties. The full binary64 enclosure, including
 underflow and overflow, is given in
-`form/optimization/certified_rematching.md`.
+`form/optimization/certified_rematching.md`. An optional squared predicate uses
+directed products and strict polynomial inequalities to avoid square roots and
+divisions; extreme scales can make it fall back more often.
 
 There are fused and split GPU schedules. The fused kernel assigns one warp per
 query and checks the bound in lane zero. The split schedule uses one thread per

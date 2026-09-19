@@ -140,6 +140,7 @@ __device__ double exactDistance(const double* points,size_t stride,int j,
   return (dx*dx+dz*dz)+(dy*dy+dw*dw);
 }
 // See certified_rematching.md for the floating-point enclosure proof.
+template<bool Squared>
 __device__ bool gapCertified(const SearchAnchor& anchor,const double* world,double winner) {
   constexpr double error=0x1p-46; // 64 * binary64 epsilon
   constexpr double tiny=0x1p-1069; // 32 * binary64 denorm_min
@@ -151,10 +152,24 @@ __device__ bool gapCertified(const SearchAnchor& anchor,const double* world,doub
     displacement2=__dadd_ru(displacement2,__dmul_ru(delta,delta));
   }
   if(!isfinite(displacement2)) return false;
-  const double old2=fmax(0.,__ddiv_rd(__dsub_rd(anchor.second,tiny),1.+error));
-  const double lower_norm=fmax(0.,__dsub_rd(__dsqrt_rd(old2),__dsqrt_ru(displacement2)));
-  const double lower=__dsub_rd(__dmul_rd(1.-error,__dmul_rd(lower_norm,lower_norm)),tiny);
-  return winner<lower;
+  if constexpr(Squared) {
+    // Exact binary64 reciprocal enclosures: 1-E <= 1/(1+E),
+    // and 1+E+epsilon >= 1/(1-E). Clamp before multiplying the lower bound.
+    const double reference=__dmul_rd(fmax(0.,__dsub_rd(anchor.second,tiny)),1.-error);
+    const double threshold=__dmul_ru(__dadd_ru(winner,tiny),1.+error+0x1p-52);
+    if(!isfinite(threshold)) return false;
+    const double gap=__dsub_rd(__dsub_rd(reference,displacement2),threshold);
+    if(!(gap>0.)) return false;
+    // A positive gap and gap^2 > 4*D*W prove sqrt(R)>sqrt(D)+sqrt(W).
+    // Underflow and overflow may weaken this test, but directed rounding
+    // preserves the strict computed-distance ordering whenever it succeeds.
+    return __dmul_rd(gap,gap)>__dmul_ru(4.,__dmul_ru(displacement2,threshold));
+  } else {
+    const double old2=fmax(0.,__ddiv_rd(__dsub_rd(anchor.second,tiny),1.+error));
+    const double lower_norm=fmax(0.,__dsub_rd(__dsqrt_rd(old2),__dsqrt_ru(displacement2)));
+    const double lower=__dsub_rd(__dmul_rd(1.-error,__dmul_rd(lower_norm,lower_norm)),tiny);
+    return winner<lower;
+  }
 }
 struct RankedPair {
   double best,second;
@@ -181,6 +196,7 @@ struct RankedPair {
 // One thread owns one certificate, so a warp evaluates 32 queries. It never
 // mutates anchors: Audit still needs the previous index, and all retained bounds
 // must remain tied to the last uncertified full search.
+template<bool Squared>
 __global__ void certifyQueries(const double* __restrict__ points,size_t point_stride,
                                const CudaMatcher::Query* queries,int count,double width,Pose pose,
                                const SearchAnchor* anchors,CudaMatcher::Result* results,
@@ -210,7 +226,7 @@ __global__ void certifyQueries(const double* __restrict__ points,size_t point_st
       const bool identical=world[0]==anchor.world[0] && world[1]==anchor.world[1] && world[2]==anchor.world[2];
       reused.index=anchor.index;
       if(reused.index>=0) reused.distance=exactDistance(points,point_stride,reused.index,world,q.point[3]);
-      certified=identical || anchor.empty || (anchor.index>=0 && gapCertified(anchor,world,reused.distance));
+      certified=identical || anchor.empty || (anchor.index>=0 && gapCertified<Squared>(anchor,world,reused.distance));
       if(!certified) status|=GapFallback;
     }
     if(certified) status|=Certified;
@@ -219,7 +235,7 @@ __global__ void certifyQueries(const double* __restrict__ points,size_t point_st
   flags[i]=status;
 }
 
-template<bool Occurrences,bool Split>
+template<bool Occurrences,bool Split,bool Squared>
 __global__ void nearestReuse(const Bucket* buckets,int mask,const double* __restrict__ points,size_t point_stride,
                         const CudaMatcher::Query* queries,int count,double width,Pose pose,
                         CudaMatcher::Result* results,SearchAnchor* anchors,unsigned char* flags,
@@ -265,7 +281,7 @@ __global__ void nearestReuse(const Bucket* buckets,int mask,const double* __rest
         const bool identical=world[0]==anchor.world[0] && world[1]==anchor.world[1] && world[2]==anchor.world[2];
         reused.index=anchor.index;
         if(reused.index>=0) reused.distance=exactDistance(points,point_stride,reused.index,world,q.point[3]);
-        certified=identical || anchor.empty || (anchor.index>=0 && gapCertified(anchor,world,reused.distance));
+        certified=identical || anchor.empty || (anchor.index>=0 && gapCertified<Squared>(anchor,world,reused.distance));
         if(!certified) status|=GapFallback;
       }
       if(certified) status|=Certified;
@@ -494,7 +510,7 @@ struct CudaMatcher::Impl {
   CudaMatcher::ReuseMode reuse_mode=CudaMatcher::ReuseMode::Disabled;
   bool anchors_valid=false,stats_ready=false;
   CudaMatcher::SearchKernel search_kernel=CudaMatcher::SearchKernel::Fused;
-  bool occurrence_bound=false,split_prepass=false;
+  bool occurrence_bound=false,split_prepass=false,squared_certificate=false;
   Buffer<int> indices;
   Buffer<Group> groups;
   Buffer<double> packed;
@@ -509,7 +525,7 @@ struct CudaMatcher::Impl {
   double width=1.;
   bool ready=false,searched=false;
   BatchedCudaQr qr;
-  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false,summary_tree=false;
+  bool incremental_summaries=false,summary_valid=false,summary_plane=false,summary_audit=false,summary_tree=false,summary_bounds=false;
   size_t summary_checks=0;
   double summary_relative_error=0.;
   Buffer<int> query_slots,slot_queries,previous_targets,incoming,highwater,dirty_leaves;
@@ -534,6 +550,18 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
       impl_->summary_audit=mode=="audit64" || mode=="audit-tree64";
     } else if(mode!="off") throw std::invalid_argument("Invalid FORM_CUDA_SUMMARY_REUSE (off|blocks64|audit64|tree64|audit-tree64)");
   }
+  if(const char* value=std::getenv("FORM_CUDA_TREE_WARPS")) {
+    const std::string cap(value);
+    if(cap=="32") setSummaryTreeWarpCap(32);
+    else if(cap=="128") setSummaryTreeWarpCap(128);
+    else if(cap=="256") setSummaryTreeWarpCap(256);
+    else throw std::invalid_argument("Invalid FORM_CUDA_TREE_WARPS (32|128|256)");
+  }
+  if(const char* value=std::getenv("FORM_CUDA_TREE_BOUNDS")) {
+    const std::string enabled(value);
+    if(enabled=="1") setSummaryTreeBounds(true);
+    else if(enabled!="0") throw std::invalid_argument("Invalid FORM_CUDA_TREE_BOUNDS (0|1)");
+  }
   if(const char* value=std::getenv("FORM_CUDA_MATCH_REUSE")) {
     const std::string mode(value);
     if(mode=="audit") setReuseMode(ReuseMode::Audit);
@@ -545,6 +573,11 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
     if(kernel=="split") setSearchKernel(SearchKernel::Split);
     else if(kernel!="fused") throw std::invalid_argument("Invalid FORM_CUDA_MATCH_KERNEL (fused|split)");
   }
+  if(const char* value=std::getenv("FORM_CUDA_MATCH_CERTIFICATE")) {
+    const std::string certificate(value);
+    if(certificate=="squared") setSquaredCertificate(true);
+    else if(certificate!="norm") throw std::invalid_argument("Invalid FORM_CUDA_MATCH_CERTIFICATE (norm|squared)");
+  }
   if(const char* value=std::getenv("FORM_CUDA_MATCH_TOP2")) {
     const std::string bound(value);
     if(bound=="occurrences") setOccurrenceBound(true);
@@ -553,16 +586,20 @@ CudaMatcher::CudaMatcher():impl_(std::make_unique<Impl>()) {
 }
 CudaMatcher::~CudaMatcher()=default;
 void CudaMatcher::setIncrementalSummaries(bool enabled) {
-  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false; impl_->summary_tree=false;
+  impl_->invalidateSummaries(); impl_->incremental_summaries=enabled; impl_->summary_audit=false; impl_->summary_tree=false; impl_->summary_bounds=false;
 }
 void CudaMatcher::setSummaryTree(bool enabled) {
   impl_->invalidateSummaries(); impl_->summary_tree=enabled;
   if(enabled) impl_->incremental_summaries=true;
 }
+void CudaMatcher::setSummaryTreeBounds(bool enabled) {
+  impl_->invalidateSummaries(); impl_->summary_bounds=enabled;
+}
+void CudaMatcher::setSummaryTreeWarpCap(size_t cap) { impl_->qr.setIncrementalTreeWarpCap(cap); }
 CudaMatcher::SummaryStats CudaMatcher::summaryStats() {
   if(!impl_->incremental_summaries || !impl_->summary_valid) return {};
   const auto stats=impl_->summary_tree?impl_->qr.incrementalTreeStats():impl_->qr.incrementalStats();
-  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error,impl_->summary_tree};
+  return {stats.active_leaves,size_t(stats.dirty_leaves),impl_->summary_checks,impl_->summary_relative_error,impl_->summary_tree,impl_->summary_tree && impl_->summary_bounds};
 }
 void CudaMatcher::setSearchKernel(SearchKernel kernel) {
   auto& state=*impl_;
@@ -570,6 +607,9 @@ void CudaMatcher::setSearchKernel(SearchKernel kernel) {
   if(kernel!=SearchKernel::Fused && kernel!=SearchKernel::Split)
     throw std::invalid_argument("Invalid CUDA search kernel");
   state.search_kernel=kernel;
+}
+void CudaMatcher::setSquaredCertificate(bool enabled) {
+  impl_->anchors_valid=false; impl_->stats_ready=false; impl_->squared_certificate=enabled;
 }
 void CudaMatcher::setOccurrenceBound(bool enabled) {
   impl_->anchors_valid=false; impl_->stats_ready=false; impl_->occurrence_bound=enabled;
@@ -686,22 +726,30 @@ void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
       // The first full search cannot certify anything; omit the split prepass.
       s.split_prepass=s.search_kernel==SearchKernel::Split && anchors_valid;
       if(s.split_prepass) {
-        certifyQueries<<<1+(s.count-1)/128,128,0,s.stream>>>(s.search_positions.data,s.point_stride,
-          s.queries.data,s.count,s.width,pose,s.anchors.data,s.results.data,s.reuse_flags.data);
+        auto certify=[&](auto squared) {
+          certifyQueries<decltype(squared)::value><<<1+(s.count-1)/128,128,0,s.stream>>>(s.search_positions.data,s.point_stride,
+            s.queries.data,s.count,s.width,pose,s.anchors.data,s.results.data,s.reuse_flags.data);
+        };
+        if(s.squared_certificate) certify(std::true_type{});
+        else certify(std::false_type{});
         check(cudaGetLastError());
       }
-      auto launch=[&](auto occurrences,auto split) {
-        nearestReuse<decltype(occurrences)::value,decltype(split)::value>
+      auto launch=[&](auto occurrences,auto split,auto squared) {
+        nearestReuse<decltype(occurrences)::value,decltype(split)::value,decltype(squared)::value>
           <<<1+(s.count-1)/(search_threads/32),search_threads,0,s.stream>>>(s.buckets.data,s.mask,
           s.search_positions.data,s.point_stride,s.queries.data,s.count,s.width,pose,s.results.data,
           s.anchors.data,s.reuse_flags.data,anchors_valid,s.reuse_mode==ReuseMode::Audit);
       };
+      auto launch_bound=[&](auto occurrences,auto split) {
+        if(s.squared_certificate) launch(occurrences,split,std::true_type{});
+        else launch(occurrences,split,std::false_type{});
+      };
       if(s.occurrence_bound) {
-        if(s.split_prepass) launch(std::true_type{},std::true_type{});
-        else launch(std::true_type{},std::false_type{});
+        if(s.split_prepass) launch_bound(std::true_type{},std::true_type{});
+        else launch_bound(std::true_type{},std::false_type{});
       } else {
-        if(s.split_prepass) launch(std::false_type{},std::true_type{});
-        else launch(std::false_type{},std::false_type{});
+        if(s.split_prepass) launch_bound(std::false_type{},std::true_type{});
+        else launch_bound(std::false_type{},std::false_type{});
       }
       check(cudaGetLastError());
       if(s.reuse_mode==ReuseMode::Audit) {
@@ -864,8 +912,18 @@ std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packIncremental(const std::vecto
         s.slot_queries.data,s.highwater.data,s.dirty_leaves.data,s.dirty_flags.data,s.slot_stride,plane,s.stable_packed.data);
       check(cudaGetLastError());
     }
+    size_t maximum=std::numeric_limits<size_t>::max();
+    if(s.summary_bounds) {
+      maximum=0;
+      for(size_t group=0;group<descriptors.size();++group) {
+        // First-hole allocation gives h' = max(h,current accepted count).
+        // Reset/plane/group/failure invalidation clears this mirror above.
+        s.host_highwater[group]=std::max(s.host_highwater[group],descriptors[group].rows);
+        maximum=std::max(maximum,(size_t(s.host_highwater[group])+63)/64);
+      }
+    }
     auto roots=s.qr.computeDevicePackedIncrementalTree(s.stable_packed.data,s.dirty_flags.data,
-      s.slot_stride/64,s.group_count,s.highwater.data,plane,s.stream);
+      s.slot_stride/64,s.group_count,s.highwater.data,plane,s.stream,maximum);
     s.summary_valid=true;
     return roots;
   }

@@ -1,5 +1,6 @@
 #pragma once
 #include <Eigen/Core>
+#include <limits>
 #include <memory>
 #include <vector>
 namespace form {
@@ -59,10 +60,15 @@ public:
   /// and failed calls start a zero cache; mark every populated leaf dirty afterward.
   /// This cache is independent of ordinary QR and computeDevicePackedIncremental.
   /// Input remains caller-owned and every read completes before return.
+  /// Optional max_active_leaves bounds every device extent; a false bound throws
+  /// and invalidates the cache. The default sentinel uses the full capacity.
   std::vector<Eigen::MatrixXd> computeDevicePackedIncrementalTree(
       const double* packed, const unsigned char* dirty, size_t leaf_capacity_per_group,
       size_t group_count, const int* device_highwater, bool plane,
-      void* producer_stream = nullptr);
+      void* producer_stream = nullptr,
+      size_t max_active_leaves = std::numeric_limits<size_t>::max());
+  /// Accepts 32/128/256 warps per group; default 32. Valid changes preserve caches.
+  void setIncrementalTreeWarpCap(size_t cap);
   void resetIncremental();
   /// Latest call's work; device counters are downloaded only on request.
   IncrementalStats incrementalStats();

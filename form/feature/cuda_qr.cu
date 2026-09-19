@@ -321,6 +321,7 @@ struct BatchedCudaQr::Impl {
   Buffer<TreeExtent> tree_extents;
   std::vector<TreeLevel> tree_levels;
   size_t tree_capacity=0,tree_groups=0,tree_nodes_per_group=0;
+  size_t tree_warp_cap=32,tree_previous_bound=0;
   bool tree_plane=false,tree_ready=false,tree_stats_ready=false;
   std::vector<Eigen::MatrixXd> run(const std::vector<InputLayout>& input, size_t total,
                                    const double* device_input = nullptr, bool device = false);
@@ -342,9 +343,15 @@ BatchedCudaQr::BatchedCudaQr(bool pinned_host_buffers,int first_rows,int reducti
 void BatchedCudaQr::setInputObserver(InputObserver observer) { input_observer = observer; }
 bool BatchedCudaQr::hasInputObserver() { return input_observer!=nullptr; }
 BatchedCudaQr::~BatchedCudaQr() = default;
+void BatchedCudaQr::setIncrementalTreeWarpCap(size_t cap) {
+  if(cap!=32 && cap!=128 && cap!=256)
+    throw std::invalid_argument("CUDA incremental tree warp cap must be 32, 128, or 256");
+  impl_->tree_warp_cap=cap;
+}
 void BatchedCudaQr::resetIncremental() {
   impl_->incremental_ready=false; impl_->incremental_stats_ready=false;
   impl_->tree_ready=false; impl_->tree_stats_ready=false;
+  impl_->tree_previous_bound=0;
 }
 BatchedCudaQr::IncrementalStats BatchedCudaQr::incrementalStats() {
   auto& state=*impl_;
@@ -388,16 +395,28 @@ BatchedCudaQr::IncrementalStats BatchedCudaQr::incrementalTreeStats() {
 
 std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncrementalTree(
     const double* packed,const unsigned char* dirty,size_t capacity,size_t groups,
-    const int* highwater,bool plane,void* producer_stream) {
+    const int* highwater,bool plane,void* producer_stream,size_t max_active_leaves) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::qr_total);
   auto& state=*impl_;
   const bool configured=state.tree_capacity==capacity && state.tree_groups==groups &&
     state.tree_plane==plane && !state.tree_levels.empty();
   const bool retained=configured && state.tree_ready;
-  state.tree_ready=false; state.tree_stats_ready=false;
+  const size_t previous_bound=retained?state.tree_previous_bound:0;
+  state.tree_ready=false; state.tree_stats_ready=false; state.tree_previous_bound=0;
   constexpr size_t limit=std::numeric_limits<int>::max();
-  if(capacity>limit/64 || groups>limit/32 || (groups && capacity>std::numeric_limits<size_t>::max()/groups))
+  if(capacity>limit/64 || groups>limit || (groups && capacity>std::numeric_limits<size_t>::max()/groups))
     throw std::invalid_argument("CUDA incremental tree layout exceeds supported dimensions");
+  const size_t bound=max_active_leaves==std::numeric_limits<size_t>::max()?capacity:max_active_leaves;
+  if(bound>capacity) throw std::invalid_argument("CUDA incremental tree active bound exceeds capacity");
+  // A shrinking call must visit the previous extent to propagate deactivations.
+  const size_t work_bound=std::max(bound,previous_bound);
+  const int threads=state.block_threads,warps=threads/32;
+  auto blocks=[&](size_t count) {
+    return int((std::min(state.tree_warp_cap,std::max<size_t>(1,count))+warps-1)/warps);
+  };
+  const int leaf_blocks=blocks(work_bound);
+  if(groups>limit/size_t(leaf_blocks))
+    throw std::invalid_argument("CUDA incremental tree launch exceeds supported dimensions");
   if(groups && !highwater) throw std::invalid_argument("CUDA incremental tree extent pointer is null");
   if(groups && capacity && (!packed || !dirty))
     throw std::invalid_argument("CUDA incremental tree row or dirty pointer is null");
@@ -444,17 +463,16 @@ std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncrementalTree(
   }
   if(groups) {
     prepareTreeExtents<<<1+(groups-1)/256,256,0,state.stream>>>(highwater,state.tree_history.data,
-      state.tree_extents.data,int(groups),int(capacity*64));
+      state.tree_extents.data,int(groups),int(bound*64));
     check(cudaGetLastError());
-    const int threads=state.block_threads,warps=threads/32;
-    auto blocks=[&](size_t count) { return int((std::min<size_t>(32,std::max<size_t>(1,count))+warps-1)/warps); };
-    const int leaf_blocks=blocks(capacity);
     updateTreeLeaves<<<groups*leaf_blocks,threads,0,state.stream>>>(packed,dirty,state.tree_roots.data,
       state.tree_flags.data,state.tree_extents.data,capacity,state.tree_nodes_per_group,leaf_blocks,width);
     check(cudaGetLastError());
     for(size_t level=1;level<state.tree_levels.size();++level) {
       const auto layout=state.tree_levels[level];
-      const int level_blocks=blocks(layout.count);
+      if(layout.span/fanin>=work_bound) break;
+      const size_t work_count=(work_bound+layout.span-1)/layout.span;
+      const int level_blocks=blocks(work_count);
       updateTreeAncestors<<<groups*level_blocks,threads,0,state.stream>>>(state.tree_roots.data,state.tree_flags.data,
         state.tree_extents.data,state.tree_nodes_per_group,state.tree_levels[level-1].offset,layout.offset,
         layout.span,level_blocks,width);
@@ -468,7 +486,7 @@ std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncrementalTree(
   check(cudaStreamSynchronize(state.stream));
   for(size_t group=0;group<groups;++group)
     if(state.host_roots.data[group*(square+1)+square]!=0.)
-      throw std::invalid_argument("CUDA incremental tree highwater exceeds leaf capacity");
+      throw std::invalid_argument("CUDA incremental tree highwater exceeds active bound or leaf capacity");
   if(input_observer) {
     // Explicit diagnostics may inspect producer rows, including clean leaves.
     std::vector<TreeExtent> extents(groups);
@@ -509,6 +527,7 @@ std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncrementalTree(
     result.emplace_back(Eigen::Map<const Eigen::MatrixXd>(state.host_roots.data+group*(square+1),width,width));
   state.tree_capacity=capacity; state.tree_groups=groups; state.tree_plane=plane;
   state.tree_ready=true; state.tree_stats_ready=true;
+  state.tree_previous_bound=bound;
   return result;
 }
 std::vector<Eigen::MatrixXd> BatchedCudaQr::computeDevicePackedIncremental(

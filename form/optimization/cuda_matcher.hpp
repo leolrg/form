@@ -15,19 +15,22 @@ public:
     unsigned long long unchanged=0, mismatches=0, oracle_searched=0, split_queries=0;
   };
   void setReuseMode(ReuseMode mode);
-  // Research ablations; both setters invalidate existing certificates.
+  // Research ablations; setters invalidate existing certificates.
   void setSearchKernel(SearchKernel kernel);
   void setOccurrenceBound(bool enabled);
+  void setSquaredCertificate(bool enabled);
   // Statistics for the latest search; downloads only when requested.
   ReuseStats reuseStats();
   struct SummaryStats {
     size_t active_leaves=0, dirty_leaves=0, full_rebuild_checks=0;
     double relative_gram_error=0.;
-    bool tree=false;
+    bool tree=false, bounded=false;
   };
   void setIncrementalSummaries(bool enabled);
   // Select cached ancestor maintenance; enabling this also enables summaries.
   void setSummaryTree(bool enabled);
+  void setSummaryTreeBounds(bool enabled);
+  void setSummaryTreeWarpCap(size_t cap);
   SummaryStats summaryStats();
   struct Voxel { int coords[3]; int begin, count; };
   struct MapPoint { double world[4], local[3], normal[3]; };
