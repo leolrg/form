@@ -108,10 +108,10 @@ template<class T, bool Accumulate> struct Neighborhood {
   }
 };
 
-template<class T, bool Accumulate>
+template<class T, class Output>
 __device__ void gatherNeighbors(const Point<T>* scan, int center, int columns,
     int neighbors, double radius2, CudaExtraction::Reduction reduction,
-    Neighborhood<T,Accumulate>& output) {
+    Output& output) {
   const int column=center%columns;
   for(int sign=1;sign>=-1;sign-=2) for(int n=1;n<=neighbors;++n) {
     const int c=column+sign*n;
@@ -122,10 +122,10 @@ __device__ void gatherNeighbors(const Point<T>* scan, int center, int columns,
   }
 }
 
-template<class T, bool Accumulate>
+template<class T, class Output>
 __device__ void gatherNormal(const Point<T>* scan, int query, const int* nearest,
     int columns, int neighbors, double radius2, CudaExtraction::Reduction reduction,
-    Neighborhood<T,Accumulate>& output) {
+    Output& output) {
   gatherNeighbors(scan,query,columns,neighbors,radius2,reduction,output);
   for(int side=0;side<2;++side) if(nearest[side]>=0) {
     output.add(scan[nearest[side]]);
@@ -133,10 +133,76 @@ __device__ void gatherNormal(const Point<T>* scan, int query, const int* nearest
   }
 }
 
+// Eigen 3.4 uses coefficient dot products for A.transpose()*A when
+// A.rows()+3+3 is below this threshold. Their SIMD reduction differs from GEMM.
+constexpr int coefficient_threshold=EIGEN_GEMM_TO_COEFFBASED_THRESHOLD-6;
+template<class T> struct SmallNeighborhood {
+  Point<T> query;
+  T divisor;
+  int count=0;
+  T displacement[coefficient_threshold-1][3];
+  __device__ void add(const Point<T>& p) {
+    displacement[count][0]=(p.x-query.x)/divisor;
+    displacement[count][1]=(p.y-query.y)/divisor;
+    displacement[count][2]=(p.z-query.z)/divisor;
+    ++count;
+  }
+};
+
+// Keep the rare short-neighborhood workspace off the common GEMM-order path.
+template<class T>
+__device__ __noinline__ Eigen::Matrix<T,3,3> smallCovariance(
+    const Point<T>* scan, int query, const int* adjacent, int columns,
+    int neighbors, double radius2, CudaExtraction::Reduction reduction,
+    int count, int packet_size) {
+  SmallNeighborhood<T> gathered{scan[query],T(count)};
+  gatherNormal(scan,query,adjacent,columns,neighbors,radius2,reduction,gathered);
+  Eigen::Matrix<T,3,3> covariance=Eigen::Matrix<T,3,3>::Zero();
+  for(int col=0;col<3;++col) for(int row=col;row<3;++row) {
+    T products[coefficient_threshold-1];
+    for(int i=0;i<count;++i)
+      products[i]=gathered.displacement[i][row]*gathered.displacement[i][col];
+    T sum;
+    const int end=count/packet_size*packet_size;
+    if(packet_size>1 && end) {
+      T lanes[16];
+      for(int lane=0;lane<packet_size;++lane) {
+        T first=products[lane];
+        if(end>packet_size) {
+          T second=products[packet_size+lane];
+          const int paired_end=count/(2*packet_size)*(2*packet_size);
+          for(int i=2*packet_size;i<paired_end;i+=2*packet_size) {
+            first+=products[i+lane]; second+=products[i+packet_size+lane];
+          }
+          first+=second;
+          if(end>paired_end) first+=products[paired_end+lane];
+        }
+        lanes[lane]=first;
+      }
+      // Eigen's x86 predux normally folds halves recursively. AVX512
+      // double8 instead folds to four lanes, then adds adjacent pairs.
+      if(sizeof(T)==sizeof(double) && packet_size==8) {
+        for(int lane=0;lane<4;++lane) lanes[lane]+=lanes[lane+4];
+        sum=(lanes[0]+lanes[1])+(lanes[2]+lanes[3]);
+      } else {
+        for(int half=packet_size/2;half;half/=2)
+          for(int lane=0;lane<half;++lane) lanes[lane]+=lanes[lane+half];
+        sum=lanes[0];
+      }
+      for(int i=end;i<count;++i) sum+=products[i];
+    } else {
+      sum=products[0];
+      for(int i=1;i<count;++i) sum+=products[i];
+    }
+    covariance(row,col)=sum;
+  }
+  return covariance;
+}
+
 template<class T>
 __global__ void normalsKernel(const Point<T>* scan, const int* queries,
     const int* nearest, int count, int columns, int neighbors, double radius2,
-    size_t min_points, CudaExtraction::Reduction reduction, Point<double>* out) {
+    size_t min_points, CudaExtraction::Reduction reduction, int covariance_packet_size, Point<double>* out) {
   const int job=blockIdx.x*blockDim.x+threadIdx.x;
   if(job>=count) return;
   out[job]={0,0,0,0};
@@ -146,10 +212,18 @@ __global__ void normalsKernel(const Point<T>* scan, const int* queries,
   Neighborhood<T,false> counter{scan[query],T(1)};
   gatherNormal(scan,query,adjacent,columns,neighbors,radius2,reduction,counter);
   if(size_t(counter.count)<min_points) return;
-  Neighborhood<T,true> gathered{scan[query],T(counter.count)};
-  gatherNormal(scan,query,adjacent,columns,neighbors,radius2,reduction,gathered);
+  Eigen::Matrix<T,3,3> covariance;
+  if(counter.count>0 && counter.count<coefficient_threshold) {
+    covariance=smallCovariance(scan,query,adjacent,columns,neighbors,radius2,
+                               reduction,counter.count,covariance_packet_size);
+  } else {
+    Neighborhood<T,true> gathered{scan[query],T(counter.count)};
+    gatherNormal(scan,query,adjacent,columns,neighbors,radius2,reduction,gathered);
+    covariance=gathered.covariance;
+  }
   Eigen::Matrix<T,3,1> normal;
-  if(!cuda_detail::normalEigenvector(gathered.covariance,normal)) {
+  if(!cuda_detail::normalEigenvector(covariance,normal,
+        sizeof(T)==sizeof(double) && covariance_packet_size>1)) {
     out[job].w=-1; return;
   }
   out[job]={double(normal.x()),double(normal.y()),double(normal.z()),1};
@@ -168,14 +242,21 @@ struct CudaExtraction::Impl {
   Buffer<int> sorted,scratch,selected_planes,selected_points,row_counts,totals,point_queries;
   int columns=0, rows=0, count=0, neighbor_points=0;
   bool single=false, ready=false;
+  int covariance_packet_size=1;
+  void setCovariancePacketSize(int size) {
+    if(size<1 || size>16 || (size & (size-1)))
+      throw std::invalid_argument("Invalid CUDA covariance packet size");
+    covariance_packet_size=size;
+  }
   CudaExtraction::Reduction reduction=CudaExtraction::Reduction::Cross;
   Impl() { check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)); }
   ~Impl() { if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); } }
   template<class T> std::vector<double> prepare(
       const std::vector<std::array<T,4>>& input,
-      const std::vector<unsigned char>& mask, int cols, int neighbors, CudaExtraction::Reduction policy) {
+      const std::vector<unsigned char>& mask, int cols, int neighbors, CudaExtraction::Reduction policy, int packet_size) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::extraction_prepare);
     ready=false;
+    setCovariancePacketSize(packet_size);
     if (cols <= 0 || neighbors < 0 || neighbors > cols/2 ||
         input.empty() || input.size() > size_t(INT_MAX)/2 ||
         input.size()%cols || mask.size()!=input.size())
@@ -218,8 +299,9 @@ struct CudaExtraction::Impl {
     check(cudaGetLastError());
   }
   template<class T> Features extract(const std::vector<std::array<T,4>>& input,
-      const Selection& p,Reduction policy) {
+      const Selection& p,Reduction policy, int packet_size) {
     ready=false;
+    setCovariancePacketSize(packet_size);
     if(p.columns<=0 || p.neighbors<0 || p.neighbors>p.columns/2 ||
        p.sectors<=0 || p.sectors>p.columns || p.spacing<0 || p.spacing>p.neighbors ||
        input.empty() || input.size()>size_t(INT_MAX)/2 || input.size()%p.columns ||
@@ -253,7 +335,7 @@ struct CudaExtraction::Impl {
     searchDevice(sizes[0]);
     if(sizes[0]) {
       normals.reserve(sizes[0]);
-      normalsKernel<<<(sizes[0]+127)/128,128,0,stream>>>(points,queries.data,nearest.data,sizes[0],columns,neighbor_points,p.radius*p.radius,p.min_points,reduction,normals.data);
+      normalsKernel<<<(sizes[0]+127)/128,128,0,stream>>>(points,queries.data,nearest.data,sizes[0],columns,neighbor_points,p.radius*p.radius,p.min_points,reduction,covariance_packet_size,normals.data);
       check(cudaGetLastError());
       check(cudaMemcpyAsync(result.normals.data(),normals.data,result.normals.size()*sizeof(Point<double>),cudaMemcpyDeviceToHost,stream));
       check(cudaMemcpyAsync(result.planes.data(),queries.data,result.planes.size()*sizeof(int),cudaMemcpyDeviceToHost,stream));
@@ -267,8 +349,8 @@ struct CudaExtraction::Impl {
 };
 CudaExtraction::CudaExtraction(): impl_(std::make_unique<Impl>()) {}
 CudaExtraction::~CudaExtraction() = default;
-CudaExtraction::Features CudaExtraction::extract(const std::vector<std::array<float,4>>& scan,const Selection& p,Reduction r){return impl_->extract(scan,p,r);}
-CudaExtraction::Features CudaExtraction::extract(const std::vector<std::array<double,4>>& scan,const Selection& p,Reduction r){return impl_->extract(scan,p,r);}
+CudaExtraction::Features CudaExtraction::extract(const std::vector<std::array<float,4>>& scan,const Selection& p,Reduction r,int packet_size){return impl_->extract(scan,p,r,packet_size);}
+CudaExtraction::Features CudaExtraction::extract(const std::vector<std::array<double,4>>& scan,const Selection& p,Reduction r,int packet_size){return impl_->extract(scan,p,r,packet_size);}
 std::vector<std::array<double,4>> CudaExtraction::normals(
     const std::vector<size_t>& indices, double radius, size_t min_points) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::extraction_search);
@@ -281,9 +363,9 @@ std::vector<std::array<double,4>> CudaExtraction::normals(
   s.normals.reserve(indices.size());
   const int blocks=int((indices.size()+127)/128);
   if(s.single)
-    normalsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<float>*>(s.scan.data),s.queries.data,s.nearest.data,int(indices.size()),s.columns,s.neighbor_points,radius*radius,min_points,s.reduction,s.normals.data);
+    normalsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<float>*>(s.scan.data),s.queries.data,s.nearest.data,int(indices.size()),s.columns,s.neighbor_points,radius*radius,min_points,s.reduction,s.covariance_packet_size,s.normals.data);
   else
-    normalsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<double>*>(s.scan.data),s.queries.data,s.nearest.data,int(indices.size()),s.columns,s.neighbor_points,radius*radius,min_points,s.reduction,s.normals.data);
+    normalsKernel<<<blocks,128,0,s.stream>>>(reinterpret_cast<const Point<double>*>(s.scan.data),s.queries.data,s.nearest.data,int(indices.size()),s.columns,s.neighbor_points,radius*radius,min_points,s.reduction,s.covariance_packet_size,s.normals.data);
   check(cudaGetLastError());
   static_assert(sizeof(Point<double>)==sizeof(std::array<double,4>));
   check(cudaMemcpyAsync(output.data(),s.normals.data,output.size()*sizeof(Point<double>),cudaMemcpyDeviceToHost,s.stream));
@@ -292,12 +374,12 @@ std::vector<std::array<double,4>> CudaExtraction::normals(
   return output;
 }
 std::vector<double> CudaExtraction::prepare(const std::vector<std::array<float,4>>& scan,
-    const std::vector<unsigned char>& valid,int columns,int neighbors, Reduction reduction) {
-  return impl_->prepare(scan,valid,columns,neighbors,reduction);
+    const std::vector<unsigned char>& valid,int columns,int neighbors, Reduction reduction, int packet_size) {
+  return impl_->prepare(scan,valid,columns,neighbors,reduction,packet_size);
 }
 std::vector<double> CudaExtraction::prepare(const std::vector<std::array<double,4>>& scan,
-    const std::vector<unsigned char>& valid,int columns,int neighbors, Reduction reduction) {
-  return impl_->prepare(scan,valid,columns,neighbors,reduction);
+    const std::vector<unsigned char>& valid,int columns,int neighbors, Reduction reduction, int packet_size) {
+  return impl_->prepare(scan,valid,columns,neighbors,reduction,packet_size);
 }
 std::vector<std::array<int,2>> CudaExtraction::nearestRows(const std::vector<size_t>& indices) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::extraction_search);

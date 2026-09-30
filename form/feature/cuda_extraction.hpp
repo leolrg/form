@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Eigen/Core>
 #include <array>
 #include <cstddef>
 #include <memory>
@@ -25,12 +26,15 @@ public:
   ~CudaExtraction();
   CudaExtraction(const CudaExtraction&) = delete;
   CudaExtraction& operator=(const CudaExtraction&) = delete;
+  // The default packet width is evaluated by the CPU caller, not nvcc.
   std::vector<double> prepare(const std::vector<std::array<float,4>>& scan,
       const std::vector<unsigned char>& valid, int columns, int neighbors,
-      Reduction reduction = Reduction::Cross);
+      Reduction reduction = Reduction::Cross,
+      int covariance_packet_size = Eigen::internal::packet_traits<float>::size);
   std::vector<double> prepare(const std::vector<std::array<double,4>>& scan,
       const std::vector<unsigned char>& valid, int columns, int neighbors,
-      Reduction reduction = Reduction::Cross);
+      Reduction reduction = Reduction::Cross,
+      int covariance_packet_size = Eigen::internal::packet_traits<double>::size);
   /// For each selected index, exact nearest valid index on preceding/following
   /// rows, or -1. Ties use the first scanline index, as in the CPU search.
   std::vector<std::array<int,2>> nearestRows(const std::vector<size_t>& indices);
@@ -41,9 +45,11 @@ public:
   /// Resident masks, ordered selection and normals. Only completed indices
   /// and normals return; intermediate masks/curvatures/queries stay on device.
   Features extract(const std::vector<std::array<float,4>>& scan,
-                   const Selection& params,Reduction reduction);
+                   const Selection& params,Reduction reduction,
+                   int covariance_packet_size = Eigen::internal::packet_traits<float>::size);
   Features extract(const std::vector<std::array<double,4>>& scan,
-                   const Selection& params,Reduction reduction);
+                   const Selection& params,Reduction reduction,
+                   int covariance_packet_size = Eigen::internal::packet_traits<double>::size);
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

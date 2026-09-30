@@ -16,7 +16,8 @@
 namespace form::cuda_detail {
 template<class T>
 __device__ bool normalEigenvector(const Eigen::Matrix<T,3,3>& covariance,
-                                 Eigen::Matrix<T,3,1>& normal) {
+                                 Eigen::Matrix<T,3,1>& normal,
+                                 bool pair_normal_xy=false) {
   Eigen::Matrix<T,3,3> mat=covariance.template triangularView<Eigen::Lower>();
   T scale=mat.cwiseAbs().maxCoeff();
   if(scale==T(0)) scale=T(1);
@@ -41,7 +42,12 @@ __device__ bool normalEigenvector(const Eigen::Matrix<T,3,3>& covariance,
   const auto info=Eigen::internal::computeFromTridiagonal_impl(
       diag,subdiag,Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T,3,3>>::m_maxIterations,true,mat);
   normal=mat.col(0);
-  normal.normalize();
+  // A vectorized host double3 normal uses its double2 packet then z;
+  // scalar Eigen (including CUDA) instead groups x+(y+z).
+  if(pair_normal_xy) {
+    const T x=normal.x(), y=normal.y(), z=normal.z();
+    normal/=sqrt((x*x+y*y)+z*z);
+  } else normal.normalize();
   return info==Eigen::Success && isfinite(normal.x()) && isfinite(normal.y()) && isfinite(normal.z());
 }
 }
