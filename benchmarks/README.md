@@ -403,6 +403,37 @@ Sensor normalization and input-file loading are outside estimator timings.
 
 ### GPU-assisted feature extraction
 
+`--backend cuda-normals` is an opt-in extension of `cuda-extraction` that also
+gathers normal neighborhoods, constructs covariance matrices and solves their
+eigensystems on the GPU. It preserves CPU selection and exact adjacent-row
+search, while returning completed normals in one download. CPU/GPU floating-point
+reductions can differ, so validate normal directions and trajectory quality
+rather than requiring bitwise normal equality. A device-compatible adapter
+retains Eigen's original specialized 3x3 tridiagonalization and iterative QR;
+the generic Eigen reduction was tested and failed the full-sequence quality gate. C++ callers
+set both `extraction.use_cuda=true` and `extraction.use_cuda_normals=true`; Python's
+estimator parameters expose `use_cuda_extraction` and `use_cuda_normals`.
+
+Compare with the unchanged hybrid control using sequential reversed repeats:
+
+```bash
+/home/ubuntu/.local/share/uv/tools/evalio/bin/python benchmarks/run_suite.py \
+  --binary build-accel/form-replay --output benchmarks/results/my-cuda-normals \
+  --sequences stairs --configs current --threads 32 --repeats 2 \
+  --backends reference cuda-extraction cuda-normals --cuda-solve-min-dimension 240
+```
+
+Use a new output directory. For scaling, add `--limit 250 --configs features window`;
+keep those prefix results separate from complete-sequence quality gates. Add
+`--profile` only in separate diagnostic runs to inspect `extract_normals_ms`.
+See [GPU normal results](../docs/cuda-normals-results.md) for the corrected
+paired measurements, the rejected generic-eigensolver experiment, and remaining
+CPU/GPU placement limitations.
+The subsequent [CPU-boundary investigation](../docs/cpu-boundary-investigation.md)
+adds a standalone mask/selection CUDA probe, full-scan sort-tie audit, and a
+map/materialization dependency analysis. It does not introduce a new estimator
+backend or claim integrated speedups.
+
 `--backend cuda-extraction` extends `cuda-matching` with CUDA curvature and
 batched exact nearest-point searches on adjacent scanlines. The ordered feature
 selector and Eigen covariance/eigenvector calculations remain on the CPU. Rows
@@ -420,6 +451,7 @@ The controls separate CPU parallelism from GPU offload:
 | `cuda-matching` | Original CPU | Existing CUDA matching/hybrid optimizer |
 | `cuda-selection` | CPU with row-parallel selection | Existing CUDA matching/hybrid optimizer |
 | `cuda-extraction` | CUDA curvature/search plus row-parallel CPU selection and CPU normal completion | Existing CUDA matching/hybrid optimizer |
+| `cuda-normals` | CUDA curvature/search/neighborhoods/covariance/eigenvectors plus row-parallel CPU selection | Existing CUDA matching/hybrid optimizer |
 
 ```bash
 python benchmarks/run_suite.py \
@@ -513,3 +545,35 @@ matching enabled while changing only the resident optimizer policy.
 full runs in old/disabled/enabled/enabled/disabled/old order. Run calibration before
 creating the optimizer artifact snapshot. The enabled setting includes existing
 profile counters as well as new diagnostics; it does not enable NVTX tracing.
+
+### Integrated extraction/map boundary experiments
+
+The following opt-in replay backends extend `cuda-normals`:
+
+- `cuda-stable-selection`: CPU selection with explicit curvature/index ties.
+  This is a changed-semantics control; it failed the full stairs quality gate.
+- `cuda-frontend`: resident GPU masks, curvature, original-order selection,
+  adjacent search and normals. Only completed indices/normals return to host.
+- `cuda-materialization`: GPU final target gathering with the original CPU map.
+- `cuda-map`: GPU world transforms, voxel grouping and lookup construction,
+  plus GPU final gathering.
+- `cuda-pipeline`: resident frontend plus GPU map and gathering.
+
+Original-order resident selection reproduces serial libstdc++ 13 introsort,
+including its observable equal-curvature permutation. Other host sort policies
+are rejected unless the user explicitly opts into changed index-tie semantics
+with `stable_selection`. Sectors may contain at most 1024 samples. The compatibility
+helper includes its upstream notices and license texts in `form/feature/licenses/`.
+
+`cuda-frontend` and `cuda-pipeline` in the earlier frozen
+`integrated-boundaries-build` binary used index ties. Its artifacts are retained
+as a rejected experiment, not evidence of a quality-preserving speedup. Always
+use the recorded binary hash to distinguish these experiments.
+
+`benchmarks/analyze_integrated_boundaries.py` verifies a completed campaign,
+compares full trajectory quality and workload counts, and reports repeat means.
+Use unprofiled runs for latency and separate `--profile` runs to explain costs.
+For the resident frontend, `extract_planar_select_ms` includes masks,
+curvature, sorting and compaction; `extract_curvature_ms` is host input
+packing. For GPU maps, map construction moves from the world-map counter into
+snapshot setup. Compare complete extraction/map scopes across implementations.

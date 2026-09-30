@@ -45,6 +45,8 @@ std::tuple<std::vector<PlanarFeat>, std::vector<PointFeat>>
 Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   constexpr auto SEQ = std::make_index_sequence<2>{};
   last_timing = {};
+  if ((m_params.matcher.use_cuda_materialization || m_params.matcher.use_cuda_map) && !m_params.matcher.use_cuda)
+    throw std::invalid_argument("CUDA map and materialization require CUDA matching");
 #ifndef FORM_ENABLE_CUDA
   if (m_params.matcher.use_cuda) throw std::runtime_error("CUDA matching requested without FORM_ENABLE_CUDA");
 #endif
@@ -78,6 +80,7 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
   // ---------------------------- Generate World Map ---------------------------- //
   auto map_profile_start = profile::enabled ? profile::Clock::now() : profile::Clock::time_point{};
   const auto world_map = tuple::transform(m_keypoint_map, [&](auto &map) {
+    if (m_params.matcher.use_cuda_map) return decltype(map.to_voxel_map(m_constraints.get_values(),1.))(m_params.matcher.max_dist_matching);
     return map.to_voxel_map(m_constraints.get_values(),
                             // make voxel size match the max matching distance
                             m_params.matcher.max_dist_matching);
@@ -86,8 +89,13 @@ Estimator::register_scan(const std::vector<PointXYZf> &scan) {
 #ifdef FORM_ENABLE_CUDA
   if (m_params.matcher.use_cuda) {
     profile::checkpoint(profile::map_world_wall, map_profile_start);
-    if (!m_cuda_matching) m_cuda_matching = std::make_shared<CudaMatching>();
-    m_cuda_matching->reset(std::get<0>(world_map), std::get<1>(world_map),
+    if (!m_cuda_matching) m_cuda_matching = std::make_shared<CudaMatching>(
+        m_params.matcher.use_cuda_materialization || m_params.matcher.use_cuda_map);
+    if (m_params.matcher.use_cuda_map) {
+      m_cuda_matching->resetLocal(std::get<0>(m_keypoint_map),std::get<1>(m_keypoint_map),
+          std::get<0>(keypoints),std::get<1>(keypoints),
+          [&](size_t i) {return m_constraints.get_pose(i);},m_params.matcher.max_dist_matching);
+    } else m_cuda_matching->reset(std::get<0>(world_map), std::get<1>(world_map),
         std::get<0>(keypoints), std::get<1>(keypoints),
         [&](size_t i) { return m_constraints.get_pose(i); }, m_params.matcher.max_dist_matching);
     profile::checkpoint(profile::map_snapshot_wall, map_profile_start);

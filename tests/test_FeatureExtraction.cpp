@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+#include <random>
+#include "form/feature/cuda_legacy_sort.cuh"
 #include <stdexcept>
 #include <tuple>
 
@@ -38,6 +41,88 @@ template <typename Feature> void sortFeatures(std::vector<Feature> &features) {
   });
 }
 } // namespace
+
+TEST(FeatureExtraction, LegacySortMatchesLibstdcxxPermutation) {
+#if !defined(__GLIBCXX__) || !defined(_GLIBCXX_RELEASE) || _GLIBCXX_RELEASE != 13 || defined(_GLIBCXX_PARALLEL)
+  GTEST_SKIP()<<"Legacy compatibility policy is verified against serial libstdc++ 13";
+#endif
+  std::mt19937 random(321);
+  for(int n=1;n<=1024;++n)for(int pattern=0;pattern<6;++pattern) {
+    std::vector<double> keys(n);
+    for(int i=0;i<n;++i) {
+      switch(pattern) {
+        case 0:keys[i]=0.;break;
+        case 1:keys[i]=i;break;
+        case 2:keys[i]=-i;break;
+        case 3:keys[i]=std::min(i,n-1-i);break;
+        case 4:keys[i]=random()%11;break;
+        default:keys[i]=random();
+      }
+    }
+    std::vector<int> a(n);std::iota(a.begin(),a.end(),0);auto b=a;
+    std::sort(a.begin(),a.end(),[&](int x,int y){return keys[x]<keys[y];});
+    form::detail::legacySelectionSort(b.data(),keys.data(),n);
+    ASSERT_EQ(a,b)<<"n="<<n<<" pattern="<<pattern;
+    std::iota(a.begin(),a.end(),0);b=a;
+    auto less=[&](int x,int y){return keys[x]<keys[y];};
+    std::make_heap(a.begin(),a.end(),less);std::sort_heap(a.begin(),a.end(),less);
+    form::detail::legacyHeap(b.data(),keys.data(),n);
+    ASSERT_EQ(a,b)<<"heap n="<<n<<" pattern="<<pattern;
+  }
+}
+
+#ifdef FORM_ENABLE_CUDA
+TEST(FeatureExtraction, ResidentSelectionMatchesCpuSelection) {
+  for(bool stable : {false,true}) for(int sectors : {1,6}) for(int columns : {41,257,1024}) for(size_t spacing : {size_t{2},size_t{5}}) {
+    auto p=planarParams();p.num_rows=3;p.num_columns=columns;p.num_sectors=sectors;
+    p.planar_feats_per_sector=50;p.point_feats_per_sector=3;p.feature_spacing=spacing;
+    p.stable_selection=stable;p.parallel_selection=true;p.use_cuda=true;p.use_cuda_normals=true;
+    auto scan=planarScan(p);
+    scan[columns+16].x=0.;scan[columns+16].y=0.;scan[columns+16].z=0.;
+    auto reference=form::FeatureExtractor(p,4).extract(scan,0);
+    p.use_cuda_selection=true;
+    auto candidate=form::FeatureExtractor(p,4).extract(scan,0);
+    const auto& a=std::get<0>(reference);const auto& b=std::get<0>(candidate);
+    ASSERT_EQ(a.size(),b.size());
+    for(size_t i=0;i<a.size();++i){EXPECT_EQ(a[i],b[i]);}
+    ASSERT_EQ(std::get<1>(reference).size(),std::get<1>(candidate).size());
+    for(size_t i=0;i<std::get<1>(reference).size();++i)EXPECT_EQ(std::get<1>(reference)[i],std::get<1>(candidate)[i]);
+  }
+}
+TEST(FeatureExtraction, ResidentSelectionRequiresExplicitSemantics) {
+  auto p=planarParams();p.use_cuda_selection=true;
+  EXPECT_THROW(form::FeatureExtractor(p).extract(planarScan(p),0),std::invalid_argument);
+}
+TEST(FeatureExtraction, ResidentSelectionFloatMasksZeroCapsAndRaggedSectors) {
+  auto p=planarParams();p.num_rows=3;p.num_columns=137;p.num_sectors=6;
+  p.min_norm_squared=.01;p.max_norm_squared=2500.;p.planar_feats_per_sector=0;p.point_feats_per_sector=0;
+  p.stable_selection=true;p.parallel_selection=true;p.use_cuda=true;p.use_cuda_normals=true;
+  std::vector<form::PointXYZf> scan;
+  for(int row=0;row<p.num_rows;++row)for(int c=0;c<p.num_columns;++c)scan.emplace_back(5.f,.015f*c,.04f*row);
+  scan[16]._=60.f;scan[0].x=100.f;scan[31]=form::PointXYZf(0,0,0);
+  for(bool stable : {false,true}) for(size_t cap : {size_t{0},size_t{3},size_t{200}}){
+    p.stable_selection=stable;
+    p.planar_feats_per_sector=cap;p.point_feats_per_sector=cap;p.use_cuda_selection=false;
+    auto a=form::FeatureExtractor(p,4).extract(scan,7);p.use_cuda_selection=true;
+    auto b=form::FeatureExtractor(p,4).extract(scan,7);
+    EXPECT_EQ(std::get<0>(a),std::get<0>(b));EXPECT_EQ(std::get<1>(a),std::get<1>(b));
+  }
+  p.num_sectors=0;
+  EXPECT_THROW(form::FeatureExtractor(p).extract(scan,7),std::invalid_argument);
+}
+TEST(FeatureExtraction, ResidentSelectionRejectsNonfiniteCurvatureAndRecovers) {
+ for(bool stable : {false,true}) {
+  auto p=planarParams();p.use_cuda=true;p.use_cuda_normals=true;p.stable_selection=stable;p.use_cuda_selection=true;
+  auto scan=planarScan(p);auto extractor=form::FeatureExtractor(p);
+  scan[17].x=std::numeric_limits<double>::quiet_NaN();
+  EXPECT_THROW(extractor.extract(scan,0),std::invalid_argument);
+  p.use_cuda_selection=false;
+  if(stable)EXPECT_THROW(form::FeatureExtractor(p).extract(scan,0),std::invalid_argument);
+  scan=planarScan(p);
+  EXPECT_NO_THROW(extractor.extract(scan,1));
+ }
+}
+#endif
 
 TEST(FeatureExtraction, DefaultSpacingMatchesExplicitNeighborhood) {
   for (size_t neighbors : {size_t{3}, size_t{5}}) {
@@ -239,3 +324,41 @@ TEST(FeatureExtraction, ParallelSelectionPreservesSectorSuppression) {
     EXPECT_EQ(cp,gp); EXPECT_EQ(cq,gq);
   }
 }
+
+TEST(FeatureExtraction, GpuNormalsRequireCudaExtraction) {
+  auto params=planarParams(); params.use_cuda_normals=true;
+  EXPECT_THROW(form::FeatureExtractor(params,1).extract(planarScan(params),0),std::invalid_argument);
+}
+
+#ifdef FORM_ENABLE_CUDA
+TEST(FeatureExtraction, GpuNormalsPreserveSelectedFeaturesAndDirections) {
+  auto params=planarParams(); params.num_rows=7; params.num_columns=131;
+  params.num_sectors=6; params.parallel_selection=true; params.use_cuda=true;
+  form::FeatureExtractor control(params,1);
+  params.use_cuda_normals=true;
+  form::FeatureExtractor candidate(params,1);
+  for(int repetition=0;repetition<3;++repetition) {
+    auto scan=planarScan(params);
+    scan[60].vec3().setZero(); scan[131+65].vec3().setZero();
+    for(size_t i=0;i<scan.size();++i)
+      if(scan[i].x!=0) scan[i].x+=.001*std::sin(i*.37+repetition);
+    auto compare=[&](const auto& input, double tolerance) {
+      auto [cp,cq]=control.extract(input,repetition);
+      auto [gp,gq]=candidate.extract(input,repetition);
+      sortFeatures(cp); sortFeatures(gp);
+      ASSERT_FALSE(cp.empty()); ASSERT_EQ(cp.size(),gp.size()); EXPECT_EQ(cq,gq);
+      for(size_t i=0;i<cp.size();++i) {
+        EXPECT_EQ(cp[i].vec3(),gp[i].vec3()); EXPECT_EQ(cp[i].scan,gp[i].scan);
+        Eigen::Vector3d c(cp[i].nx,cp[i].ny,cp[i].nz),g(gp[i].nx,gp[i].ny,gp[i].nz);
+        EXPECT_LT(std::min((c-g).norm(),(c+g).norm()),tolerance);
+      }
+    };
+    compare(scan,1e-10);
+    std::vector<form::PointXYZf> floats;
+    for(const auto& p:scan) floats.emplace_back(p.x,p.y,p.z);
+    compare(floats,2e-4);
+  }
+  candidate.params.planar_threshold=0.;
+  EXPECT_TRUE(std::get<0>(candidate.extract(planarScan(params),0)).empty());
+}
+#endif

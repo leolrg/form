@@ -79,6 +79,11 @@ public:
     (int,  point_feats_per_sector,   3, params_.extraction.point_feats_per_sector),
     (bool,   parallel_selection, false, params_.extraction.parallel_selection),
     (bool,   use_cuda_extraction, false, params_.extraction.use_cuda),
+    (bool,   use_cuda_normals, false, params_.extraction.use_cuda_normals),
+    (bool,   stable_selection, false, params_.extraction.stable_selection),
+    (bool,   use_cuda_selection, false, params_.extraction.use_cuda_selection),
+    (bool,   use_cuda_materialization, false, params_.matcher.use_cuda_materialization),
+    (bool,   use_cuda_map, false, params_.matcher.use_cuda_map),
     (int,        feature_spacing,   0, params_.extraction.feature_spacing),
     (double,               radius, 1.0, params_.extraction.radius),
     (int,              min_points,   5, params_.extraction.min_points),
@@ -175,6 +180,9 @@ NB_MODULE(_core, m) {
       .def(nb::init<>())
       .def_rw("parallel_selection", &form::FeatureExtractor::Params::parallel_selection)
       .def_rw("use_cuda", &form::FeatureExtractor::Params::use_cuda)
+      .def_rw("use_cuda_normals", &form::FeatureExtractor::Params::use_cuda_normals)
+      .def_rw("stable_selection", &form::FeatureExtractor::Params::stable_selection)
+      .def_rw("use_cuda_selection", &form::FeatureExtractor::Params::use_cuda_selection)
       .def_rw("neighbor_points", &form::FeatureExtractor::Params::neighbor_points)
       .def_rw("num_sectors", &form::FeatureExtractor::Params::num_sectors)
       .def_rw("planar_feats_per_sector",

@@ -33,6 +33,16 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
   if (params.feature_spacing > params.neighbor_points) {
     throw std::invalid_argument("feature_spacing must not exceed neighbor_points");
   }
+  if (params.use_cuda_normals && !params.use_cuda)
+    throw std::invalid_argument("CUDA normals require CUDA extraction");
+  if(params.use_cuda_selection && !params.use_cuda_normals)
+    throw std::invalid_argument("Resident CUDA selection requires GPU normals");
+#if !defined(__GLIBCXX__) || !defined(_GLIBCXX_RELEASE) || _GLIBCXX_RELEASE != 13 || defined(_GLIBCXX_PARALLEL)
+  if(params.use_cuda_selection && !params.stable_selection)
+    throw std::invalid_argument("Legacy CUDA selection requires the verified serial libstdc++ 13 sort policy");
+#endif
+  if(params.use_cuda_selection && (!params.num_sectors || params.num_rows<=0 || params.num_columns<=0))
+    throw std::invalid_argument("Invalid resident CUDA extraction shape");
 #ifndef FORM_ENABLE_CUDA
   if (params.use_cuda) throw std::runtime_error("CUDA extraction requested without FORM_ENABLE_CUDA");
 #else
@@ -43,6 +53,35 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
   const size_t points_per_sector = params.num_columns / params.num_sectors;
 
   auto profile_start = profile::enabled ? profile::Clock::now() : profile::Clock::time_point{};
+
+#ifdef FORM_ENABLE_CUDA
+  if(params.use_cuda_selection) {
+    if(scan.size()!=size_t(params.num_rows)*params.num_columns || scan.empty())
+      throw std::invalid_argument("Invalid resident CUDA scan shape");
+    if(!cuda_)cuda_=std::make_shared<CudaExtraction>();
+    std::vector<std::array<T,4>> packed(scan.size());
+    for(size_t i=0;i<scan.size();++i)for(int axis=0;axis<4;++axis)packed[i][axis]=scan[i].vec4()[axis];
+    using Squared=std::decay_t<decltype((scan.front().vec4()-scan.front().vec4()).cwiseAbs2())>;
+    using Redux=Eigen::internal::redux_traits<Eigen::internal::scalar_sum_op<T>,Eigen::internal::redux_evaluator<Squared>>;
+    constexpr auto reduction=int(Redux::Traversal)!=int(Eigen::DefaultTraversal)?CudaExtraction::Reduction::Cross:
+      (int(Redux::Unrolling)==int(Eigen::CompleteUnrolling)?CudaExtraction::Reduction::Adjacent:CudaExtraction::Reduction::Sequential);
+    const CudaExtraction::Selection selection{params.num_columns,int(params.neighbor_points),int(params.num_sectors),
+      int(params.feature_spacing?params.feature_spacing:params.neighbor_points),params.planar_feats_per_sector,params.point_feats_per_sector,
+      params.min_points,params.min_norm_squared,params.max_norm_squared,params.planar_threshold,params.radius,params.stable_selection};
+    profile::checkpoint(profile::extract_curvature,profile_start); // Host input packing only for this backend.
+    const auto output=cuda_->extract(packed,selection,reduction);
+    profile_start=profile::enabled?profile::Clock::now():profile::Clock::time_point{};
+    std::vector<PlanarFeat> planes;std::vector<PointFeat> points;
+    planes.reserve(output.planes.size());points.reserve(output.points.size());
+    for(size_t i=0;i<output.planes.size();++i)if(output.normals[i][3]!=0){
+      const auto& p=scan[output.planes[i]];const auto& n=output.normals[i];
+      planes.emplace_back(double(p.x),double(p.y),double(p.z),n[0],n[1],n[2],scan_idx);
+    }
+    for(int i:output.points){const auto& p=scan[i];points.emplace_back(double(p.x),double(p.y),double(p.z),scan_idx);}
+    profile::checkpoint(profile::extract_pack,profile_start);
+    return {std::move(planes),std::move(points)};
+  }
+#endif
 
   // First we validate that all the points are good
   auto valid_mask = compute_valid_points(scan);
@@ -83,7 +122,13 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
       const size_t first=scan_line_idx*params.num_columns+sector_idx*points_per_sector;
       const size_t end=sector_idx+1==params.num_sectors
           ? (scan_line_idx+1)*params.num_columns : first+points_per_sector;
-      std::sort(curvature.begin()+first,curvature.begin()+end);
+      if(params.stable_selection) {
+        if(std::any_of(curvature.begin()+first,curvature.begin()+end,[](const auto& c){return !std::isfinite(c.curvature);}))
+          throw std::invalid_argument("Nonfinite stable-selection curvature");
+        std::sort(curvature.begin()+first,curvature.begin()+end,[](const auto& a,const auto& b){
+          return a.curvature<b.curvature || (a.curvature==b.curvature && a.index<b.index);
+        });
+      } else std::sort(curvature.begin()+first,curvature.begin()+end);
       extract_planar(first,end,curvature,selected,mask);
     }
   };
@@ -137,33 +182,49 @@ FeatureExtractor::extract(const std::vector<Point> &scan, size_t scan_idx) const
   profile::checkpoint(profile::extract_point_select, profile_start);
 
   std::vector<std::array<int,2>> nearest_rows;
+  std::vector<std::array<double,4>> gpu_normals;
 #ifdef FORM_ENABLE_CUDA
-  if (params.use_cuda) nearest_rows = cuda_->nearestRows(planar_indices);
+  if (params.use_cuda_normals)
+    gpu_normals = cuda_->normals(planar_indices, params.radius, params.min_points);
+  else if (params.use_cuda) nearest_rows = cuda_->nearestRows(planar_indices);
 #endif
 
   // Finally extract all normals
-  tbb::concurrent_vector<PlanarFeat> result_planar_tbb;
-  result_planar_tbb.reserve(planar_indices.size());
-  const auto range =
-      tbb::blocked_range{planar_indices.cbegin(), planar_indices.cend()};
-  tbb::parallel_for(range, [&](const auto &range) {
-    for (auto it = range.begin(); it != range.end(); ++it) {
-      const size_t idx = *it;
-      const Point &point = scan[idx];
-      std::optional<Eigen::Matrix<T, 3, 1>> normal =
-          compute_normal(idx, scan, valid_mask, params.use_cuda ? &nearest_rows[it-planar_indices.cbegin()] : nullptr);
-      if (normal.has_value()) {
-        result_planar_tbb.emplace_back(
-            static_cast<double>(point.x), static_cast<double>(point.y),
-            static_cast<double>(point.z), static_cast<double>(normal.value().x()),
-            static_cast<double>(normal.value().y()),
-            static_cast<double>(normal.value().z()), static_cast<size_t>(scan_idx));
-      }
+  std::vector<PlanarFeat> result_planar;
+  if (params.use_cuda_normals) {
+    // Normals are complete: a linear gather avoids TBB scheduling and contention
+    // on concurrent_vector for what is now only a small output-copy operation.
+    result_planar.reserve(planar_indices.size());
+    for (size_t i=0;i<planar_indices.size();++i) {
+      const auto& n=gpu_normals[i];
+      if(n[3]==0) continue;
+      const auto& p=scan[planar_indices[i]];
+      result_planar.emplace_back(double(p.x),double(p.y),double(p.z),n[0],n[1],n[2],scan_idx);
     }
-  });
-  profile::checkpoint(profile::extract_normals, profile_start);
-  std::vector<PlanarFeat> result_planar(result_planar_tbb.begin(),
-                                        result_planar_tbb.end());
+    profile::checkpoint(profile::extract_normals, profile_start);
+  } else {
+    tbb::concurrent_vector<PlanarFeat> result_planar_tbb;
+    result_planar_tbb.reserve(planar_indices.size());
+    const auto range =
+        tbb::blocked_range{planar_indices.cbegin(), planar_indices.cend()};
+    tbb::parallel_for(range, [&](const auto &range) {
+      for (auto it = range.begin(); it != range.end(); ++it) {
+        const size_t idx = *it;
+        const Point &point = scan[idx];
+        std::optional<Eigen::Matrix<T, 3, 1>> normal =
+            compute_normal(idx, scan, valid_mask, params.use_cuda ? &nearest_rows[it-planar_indices.cbegin()] : nullptr);
+        if (normal.has_value()) {
+          result_planar_tbb.emplace_back(
+              static_cast<double>(point.x), static_cast<double>(point.y),
+              static_cast<double>(point.z), static_cast<double>(normal.value().x()),
+              static_cast<double>(normal.value().y()),
+              static_cast<double>(normal.value().z()), static_cast<size_t>(scan_idx));
+        }
+      }
+    });
+    profile::checkpoint(profile::extract_normals, profile_start);
+    result_planar.assign(result_planar_tbb.begin(), result_planar_tbb.end());
+  }
 
   // Add the point features
   std::vector<PointFeat> result_point;

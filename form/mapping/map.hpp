@@ -116,6 +116,10 @@ private:
   tsl::robin_map<ScanIndex, std::vector<Point>> m_scan_keypoints;
 
 public:
+  // Iteration order is the insertion order used by to_voxel_map within voxels.
+  [[nodiscard]] auto begin() const noexcept { return m_scan_keypoints.begin(); }
+  [[nodiscard]] auto end() const noexcept { return m_scan_keypoints.end(); }
+
   /// @brief Default constructor
   KeypointMap() noexcept : m_params() {}
 

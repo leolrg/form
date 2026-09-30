@@ -12,6 +12,10 @@ public:
   struct MapPoint { double world[4], local[3], normal[3]; };
   struct Query { double point[4]; };
   struct Result { double distance; int index; };
+  struct Materialized {
+    double distance, local[3], normal[3];
+    int source, grouped_query;
+  };
   struct GroupedSummary {
     std::vector<Eigen::MatrixXd> roots;
     std::vector<size_t> counts;
@@ -26,6 +30,15 @@ public:
              const std::vector<Query>& queries, double voxel_width,
              const std::vector<std::array<double,12>>& inverse_poses = {},
              const std::vector<int>& point_pose_indices = {});
+  // Input world[] contains local coordinates. Stable source ordinals remain
+  // the public result indices even though the device map is reordered by voxel.
+  void resetLocal(const std::vector<MapPoint>& points, const std::vector<Query>& queries,
+                  double voxel_width, const std::vector<std::array<double,12>>& poses,
+                  const std::vector<std::array<double,12>>& inverse_poses,
+                  const std::vector<int>& point_pose_indices);
+  // Gather local targets and original source IDs in query order. After grouped
+  // search the first sum(counts) grouped_query fields give accepted query order.
+  std::vector<Materialized> downloadMaterialized();
   const std::vector<Result>& search(const std::array<double,12>& world_T_query);
   // One entry per map point; -1 excludes a point, other IDs index group_count.
   // Configuration lasts until reset or the next setGroups call.

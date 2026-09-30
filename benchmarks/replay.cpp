@@ -171,13 +171,22 @@ int main(int argc, char** argv) {
         params.constraints.use_cuda_dense_solver = true;
       }
       else if (arg == "--backend") {
-        if (value != "reference" && value != "summary" && value != "cuda" && value != "summary-batch" && value != "cuda-batch" && value != "summary-resident" && value != "cuda-resident" && value != "cuda-resident-hybrid" && value != "cuda-matching" && value != "cuda-extraction" && value != "cuda-selection" && value != "cpu-extraction") throw std::runtime_error("Unknown backend " + value);
-        const bool gpu_matching = value == "cuda-matching" || value == "cuda-selection" || value == "cuda-extraction";
+        if (value != "reference" && value != "summary" && value != "cuda" && value != "summary-batch" && value != "cuda-batch" && value != "summary-resident" && value != "cuda-resident" && value != "cuda-resident-hybrid" && value != "cuda-matching" && value != "cuda-extraction" && value != "cuda-normals" && value != "cuda-stable-selection" && value != "cuda-frontend" && value != "cuda-materialization" && value != "cuda-map" && value != "cuda-pipeline" && value != "cuda-selection" && value != "cpu-extraction") throw std::runtime_error("Unknown backend " + value);
+        const bool resident_frontend = value == "cuda-frontend" || value == "cuda-pipeline";
+        const bool gpu_map = value == "cuda-map" || value == "cuda-pipeline";
+        const bool gpu_materialization = value == "cuda-materialization" || gpu_map;
+        const bool gpu_normals = value == "cuda-normals" || value == "cuda-stable-selection" || resident_frontend || gpu_materialization;
+        const bool gpu_matching = value == "cuda-matching" || value == "cuda-selection" || value == "cuda-extraction" || gpu_normals;
         params.constraints.use_summary = value != "reference";
         params.constraints.use_cuda_summaries = value == "cuda" || value == "cuda-batch" || value == "cuda-resident" || value == "cuda-resident-hybrid" || gpu_matching;
         params.constraints.use_resident_optimizer = value == "summary-resident" || value == "cpu-extraction" || value == "cuda-resident" || value == "cuda-resident-hybrid" || gpu_matching;
-        params.extraction.use_cuda = value == "cuda-extraction";
-        params.extraction.parallel_selection = value == "cpu-extraction" || value == "cuda-selection" || value == "cuda-extraction";
+        params.extraction.use_cuda = value == "cuda-extraction" || gpu_normals;
+        params.extraction.use_cuda_normals = gpu_normals;
+        params.extraction.stable_selection = value == "cuda-stable-selection";
+        params.extraction.use_cuda_selection = resident_frontend;
+        params.matcher.use_cuda_materialization = gpu_materialization;
+        params.matcher.use_cuda_map = gpu_map;
+        params.extraction.parallel_selection = value == "cpu-extraction" || value == "cuda-selection" || value == "cuda-extraction" || gpu_normals;
         params.matcher.use_cuda = gpu_matching;
         if(value == "cuda-resident-hybrid" || gpu_matching) params.constraints.use_cuda_dense_solver = true;
         if(value == "summary-batch" || value == "cuda-batch" || params.constraints.use_resident_optimizer) params.constraints.use_batch_summaries = true;

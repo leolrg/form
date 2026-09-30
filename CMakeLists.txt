@@ -92,6 +92,8 @@ if(FORM_ENABLE_CUDA)
     target_link_libraries(FORM PUBLIC CUDA::cudart CUDA::cusolver ${CMAKE_DL_LIBS})
     target_compile_definitions(FORM PUBLIC FORM_ENABLE_CUDA=1)
     set_source_files_properties(form/optimization/cuda_matcher.cu form/feature/cuda_extraction.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
+    # Eigen's device code uses constexpr standard-library numeric traits.
+    set_property(SOURCE form/feature/cuda_extraction.cu APPEND PROPERTY COMPILE_OPTIONS --expt-relaxed-constexpr)
     set_target_properties(FORM PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 endif()
 

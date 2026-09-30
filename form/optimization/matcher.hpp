@@ -41,6 +41,8 @@ struct MatcherParams {
 
   /// Optional device matching and direct exact summary preparation.
   bool use_cuda = false;
+  bool use_cuda_materialization = false;
+  bool use_cuda_map = false;
 };
 
 /// @brief Class for matching keypoints to a map

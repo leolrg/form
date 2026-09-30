@@ -323,3 +323,78 @@ TEST(CudaMatcher, DeviceInversePoseValidationAndOverflow) {
   EXPECT_NO_THROW(matcher.reset(voxels,points,queries,1.,{identity_pose},{0}));
   EXPECT_EQ(matcher.search(identity_pose)[0].index,0);
 }
+
+TEST(CudaMatcher, LocalMapBuildPreservesOriginalIdsVoxelTiesAndGroupedRaw) {
+  CudaMatcher matcher;
+  std::vector<CudaMatcher::MapPoint> local={
+    {{.75,0,0,.2},{.75,0,0},{0,0,1}},
+    {{-.1,0,0,.2},{-.1,0,0},{0,1,0}},
+    {{1.25,0,0,.2},{1.25,0,0},{1,0,0}},
+    {{.75,0,0,.2},{.75,0,0},{1,1,0}}};
+  matcher.resetLocal(local,{{{1,0,0,.2}},{{.8,0,0,.2}},{{-.01,0,0,.2}},{{20,0,0,.2}}},
+                     1.,{identity_pose},{identity_pose},{0,0,0,0});
+  matcher.setGroups({1,0,1,0},2);
+  EXPECT_EQ(matcher.searchGrouped(identity_pose,1.,false).counts,(std::vector<size_t>{1,2}));
+  const auto raw=matcher.downloadMaterialized();
+  ASSERT_EQ(raw.size(),4);
+  EXPECT_EQ(raw[0].source,2); EXPECT_EQ(raw[1].source,0); EXPECT_EQ(raw[2].source,1);
+  EXPECT_EQ(raw[3].source,-1);
+  EXPECT_EQ(raw[0].grouped_query,2); EXPECT_EQ(raw[1].grouped_query,0); EXPECT_EQ(raw[2].grouped_query,1);
+  EXPECT_DOUBLE_EQ(raw[0].local[0],1.25); EXPECT_DOUBLE_EQ(raw[1].normal[2],1.);
+  matcher.resetLocal({}, {},1.,{}, {},{});
+  matcher.setGroups({},1);
+  EXPECT_EQ(matcher.searchGrouped(identity_pose,1.,false).counts,(std::vector<size_t>{0}));
+  EXPECT_TRUE(matcher.downloadMaterialized().empty());
+}
+
+TEST(CudaMatcher, LocalMapRejectsMalformedInputsAndCoordinateOverflow) {
+  CudaMatcher matcher;
+  const std::vector<CudaMatcher::MapPoint> points={{{.1,.2,.3,0},{.1,.2,.3},{0,0,1}}};
+  EXPECT_THROW(matcher.resetLocal(points,{},1.,{identity_pose},{identity_pose},{}),std::invalid_argument);
+  EXPECT_THROW(matcher.resetLocal(points,{},1.,{identity_pose},{},{0}),std::invalid_argument);
+  EXPECT_THROW(matcher.resetLocal(points,{},1.,{identity_pose},{identity_pose},{-1}),std::invalid_argument);
+  auto bad=identity_pose; bad[3]=1e100;
+  EXPECT_THROW(matcher.resetLocal(points,{},1.,{bad},{identity_pose},{0}),std::invalid_argument);
+  EXPECT_THROW(matcher.search(identity_pose),std::logic_error);
+  EXPECT_NO_THROW(matcher.resetLocal(points,{},1.,{identity_pose},{identity_pose},{0}));
+}
+
+TEST(CudaMatcher, LocalMapBoundaryRoundingAndRaggedReplacementMatchCpu) {
+  CudaMatcher matcher;
+  std::mt19937 random(921);
+  std::uniform_real_distribution<double> value(-2.,2.);
+  for(int count:{1,255,256,257,509}) {
+    const gtsam::Pose3 pose(gtsam::Rot3::RzRyRx(.13,-.21,.31),gtsam::Point3(100.,-200.,300.));
+    std::array<double,12> matrix,inverse;
+    for(int r=0;r<3;++r) for(int c=0;c<4;++c) {matrix[4*r+c]=pose.matrix()(r,c);inverse[4*r+c]=pose.inverse().matrix()(r,c);}
+    std::vector<CudaMatcher::MapPoint> local;
+    std::vector<CudaMatcher::Query> queries;
+    form::VoxelMap<form::PointFeat> cpu(.5);
+    for(int i=0;i<count;++i) {
+      auto world=form::PointFeat(value(random),value(random),value(random),i);
+      if(i<3) world.x=std::nextafter(.5,i==0?0.:1.);
+      auto p=world.transform(pose.inverse());
+      local.push_back({{p.x,p.y,p.z,0},{p.x,p.y,p.z},{0,0,1}});
+      cpu.push_back(p.transform(pose));
+      queries.push_back({{world.x,world.y,world.z,0}});
+    }
+    matcher.resetLocal(local,queries,.5,{matrix},{inverse},std::vector<int>(count,0));
+    const auto result=matcher.search(identity_pose);
+    for(int i=0;i<count;++i) {
+      const auto& q=queries[i];
+      auto expected=cpu.find_closest(form::PointFeat(q.point[0],q.point[1],q.point[2],0));
+      ASSERT_TRUE(expected.found()); EXPECT_EQ(result[i].index,int(expected.point.scan));
+      EXPECT_NEAR(result[i].distance,expected.dist_sqrd,1e-20);
+    }
+  }
+}
+
+TEST(CudaMatcher, ReconfiguringGroupsInvalidatesMaterializedGroupOrder) {
+  CudaMatcher matcher;
+  matcher.reset({{{0,0,0},0,1}},{{{0,0,0,0},{0,0,0},{0,0,1}}},{{{.1,0,0,0}}},1.);
+  matcher.setGroups({0},1);
+  matcher.searchGrouped(identity_pose,1.,false);
+  ASSERT_EQ(matcher.downloadMaterialized()[0].grouped_query,0);
+  matcher.setGroups({-1},1);
+  EXPECT_EQ(matcher.downloadMaterialized()[0].grouped_query,-1);
+}

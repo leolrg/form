@@ -63,6 +63,85 @@ __global__ void extractWorld(CudaMatcher::MapPoint* points,int count,
   }
 }
 
+struct Coords { int axis[3]; };
+__device__ bool equalCoords(Coords a,Coords b) {
+  return a.axis[0]==b.axis[0] && a.axis[1]==b.axis[1] && a.axis[2]==b.axis[2];
+}
+// Preserve the CPU local -> world -> local rounding path (FMA disabled).
+__global__ void transformLocal(CudaMatcher::MapPoint* points,int count,const Pose* poses,
+    const Pose* inverse,const int* slots,double width,Coords* coords,int* sequence,int* invalid) {
+  const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
+  auto p=points[i];
+  const auto forward=poses[slots[i]],backward=inverse[slots[i]];
+  double world[3],normal[3];
+  for(int axis=0;axis<3;++axis) {
+    const double* r=forward.matrix+4*axis;
+    world[axis]=((r[0]*p.world[0]+r[1]*p.world[1])+r[2]*p.world[2])+r[3];
+    normal[axis]=(r[0]*p.normal[0]+r[1]*p.normal[1])+r[2]*p.normal[2];
+    const double bin=floor(world[axis]/width);
+    if(!isfinite(bin) || bin<-2147483648. || bin>2147483647.) {
+      atomicExch(invalid,1); coords[i].axis[axis]=0;
+    } else coords[i].axis[axis]=int(bin);
+  }
+  for(int axis=0;axis<3;++axis) {
+    const double* r=backward.matrix+4*axis;
+    p.world[axis]=world[axis];
+    p.local[axis]=((r[0]*world[0]+r[1]*world[1])+r[2]*world[2])+r[3];
+    p.normal[axis]=(r[0]*normal[0]+r[1]*normal[1])+r[2]*normal[2];
+    if(!isfinite(p.local[axis]) || !isfinite(p.normal[axis])) atomicExch(invalid,1);
+  }
+  points[i]=p; sequence[i]=int(i);
+}
+__global__ void coordinateKeys(const Coords* coords,const int* sequence,int count,int axis,int* keys) {
+  const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i<size_t(count)) keys[i]=coords[sequence[i]].axis[axis];
+}
+__global__ void buildLocalMap(const CudaMatcher::MapPoint* input,CudaMatcher::MapPoint* output,
+    const Coords* coords,const int* sequence,int count,Bucket* buckets,int mask,
+    double* world,size_t stride) {
+  const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
+  const int source=sequence[i];
+  const auto p=input[source]; output[i]=p;
+  for(int axis=0;axis<4;++axis) world[size_t(axis)*stride+i]=p.world[axis];
+  const auto c=coords[source];
+  if(i && equalCoords(c,coords[sequence[i-1]])) return;
+  size_t end=i+1;
+  while(end<size_t(count) && equalCoords(c,coords[sequence[end]])) ++end;
+  int slot=hash(c.axis[0],c.axis[1],c.axis[2])&mask;
+  // Each thread owns a unique voxel. Reserve slots without reading keys which
+  // another thread may still be publishing. Search runs in a subsequent kernel.
+  while(atomicCAS(&buckets[slot].begin,-1,int(i))!=-1) slot=(slot+1)&mask;
+  buckets[slot].x=c.axis[0]; buckets[slot].y=c.axis[1]; buckets[slot].z=c.axis[2];
+  buckets[slot].count=int(end-i);
+}
+__global__ void reorderGroups(const int* original,const int* sources,int* reordered,int count) {
+  const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i<size_t(count)) reordered[i]=original[sources[i]];
+}
+__global__ void originalResults(const CudaMatcher::Result* input,CudaMatcher::Result* output,
+    const int* sources,int count) {
+  const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
+  auto r=input[i]; if(r.index>=0) r.index=sources[r.index]; output[i]=r;
+}
+__global__ void gatherMaterialized(const CudaMatcher::MapPoint* points,const CudaMatcher::Result* results,
+    const int* sources,const int* grouped,int accepted,int count,CudaMatcher::Materialized* output) {
+  const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i>=size_t(count)) return;
+  const auto r=results[i];
+  CudaMatcher::Materialized row{};
+  row.distance=r.distance; row.source=r.index;
+  row.grouped_query=i<size_t(accepted)?grouped[i]:-1;
+  if(r.index>=0) {
+    const auto p=points[r.index];
+    if(sources) row.source=sources[r.index];
+    for(int axis=0;axis<3;++axis) {row.local[axis]=p.local[axis];row.normal[axis]=p.normal[axis];}
+  }
+  output[i]=row;
+}
+
 // One warp owns one query. Dense voxel rows are scanned cooperatively; the
 // lexicographic (distance, neighbor order, point order) reduction retains FORM's
 // first-hit tie rule even when different lanes discover equal-distance points.
@@ -163,7 +242,14 @@ __global__ void pack(const CudaMatcher::MapPoint* points,const CudaMatcher::Quer
 struct CudaMatcher::Impl {
   cudaStream_t stream=nullptr;
   Buffer<Bucket> buckets;
-  Buffer<MapPoint> points;
+  Buffer<MapPoint> points,local_sorted_points;
+  Buffer<Pose> forward_poses;
+  Buffer<Coords> local_coords;
+  Buffer<int> local_sequence,source_indices,local_keys,local_sorted_keys,original_groups;
+  Buffer<unsigned char> local_sort_storage;
+  Buffer<Materialized> materialized;
+  Buffer<Result> source_results;
+  bool local_map=false,grouped_searched=false;
   Buffer<Pose> inverse_poses;
   Buffer<int> pose_indices,snapshot_error;
   Buffer<double> search_positions;
@@ -199,6 +285,7 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::matcher_reset);
   auto& s=*impl_;
   s.ready=false; s.searched=false; s.groups_ready=false; s.host_results_ready=false;
+  s.local_map=false; s.grouped_searched=false;
   if(!std::isfinite(width) || width<=0) throw std::invalid_argument("Invalid CUDA voxel width");
   constexpr size_t limit=std::numeric_limits<int>::max();
   if(points.size()>limit || queries.size()>limit || voxels.size()>limit/4)
@@ -258,10 +345,92 @@ void CudaMatcher::reset(const std::vector<Voxel>& voxels,const std::vector<MapPo
   if(invalid_snapshot) throw std::invalid_argument("Nonfinite CUDA transformed map feature");
   s.ready=true;
 }
+void CudaMatcher::resetLocal(const std::vector<MapPoint>& points,const std::vector<Query>& queries,
+    double width,const std::vector<std::array<double,12>>& matrices,
+    const std::vector<std::array<double,12>>& inverses,const std::vector<int>& slots) {
+  auto& s=*impl_;
+  s.ready=false; s.searched=false; s.groups_ready=false; s.grouped_searched=false;
+  if(matrices.size()!=inverses.size() || slots.size()!=points.size() ||
+      points.size()>size_t(std::numeric_limits<int>::max())/4)
+    throw std::invalid_argument("Invalid CUDA local map pose shape");
+  for(int slot:slots) if(slot<0 || size_t(slot)>=matrices.size())
+    throw std::invalid_argument("Invalid CUDA local map pose index");
+  std::vector<Pose> forward(matrices.size()),backward(inverses.size());
+  for(size_t i=0;i<matrices.size();++i) for(int j=0;j<12;++j) {
+    if(!std::isfinite(matrices[i][j]) || !std::isfinite(inverses[i][j]))
+      throw std::invalid_argument("Nonfinite CUDA local map pose");
+    forward[i].matrix[j]=matrices[i][j]; backward[i].matrix[j]=inverses[i][j];
+  }
+  // Share ordinary record validation and allocation. World coordinates are
+  // replaced below before ready becomes visible to the caller.
+  reset({},points,queries,width);
+  s.ready=false;
+  s.forward_poses.upload(forward,s.stream); s.inverse_poses.upload(backward,s.stream);
+  s.pose_indices.upload(slots,s.stream);
+  const size_t count=points.size();
+  size_t bucket_count=1; while(bucket_count<std::max<size_t>(1,2*count)) bucket_count*=2;
+  s.buckets.reserve(bucket_count);
+  check(cudaMemsetAsync(s.buckets.data,255,bucket_count*sizeof(Bucket),s.stream));
+  s.mask=int(bucket_count-1);
+  s.source_indices.reserve(count); s.local_sequence.reserve(count);
+  s.local_keys.reserve(count); s.local_sorted_keys.reserve(count);
+  s.local_coords.reserve(count); s.local_sorted_points.reserve(count);
+  s.snapshot_error.reserve(1); check(cudaMemsetAsync(s.snapshot_error.data,0,sizeof(int),s.stream));
+  int invalid=0;
+  if(count) {
+    const auto blocks=1+(count-1)/256;
+    transformLocal<<<blocks,256,0,s.stream>>>(s.points.data,int(count),s.forward_poses.data,
+      s.inverse_poses.data,s.pose_indices.data,width,s.local_coords.data,s.local_sequence.data,s.snapshot_error.data);
+    check(cudaGetLastError());
+    size_t bytes=0;
+    check(cub::DeviceRadixSort::SortPairs(nullptr,bytes,s.local_keys.data,s.local_sorted_keys.data,
+      s.local_sequence.data,s.source_indices.data,int(count),0,32,s.stream));
+    s.local_sort_storage.reserve(bytes);
+    // Three stable signed-coordinate passes retain original insertion ordinal
+    // within every voxel, regardless of its position in the final sorted array.
+    for(int axis=2;axis>=0;--axis) {
+      coordinateKeys<<<blocks,256,0,s.stream>>>(s.local_coords.data,s.local_sequence.data,int(count),axis,s.local_keys.data);
+      check(cudaGetLastError());
+      check(cub::DeviceRadixSort::SortPairs(s.local_sort_storage.data,bytes,s.local_keys.data,s.local_sorted_keys.data,
+        s.local_sequence.data,s.source_indices.data,int(count),0,32,s.stream));
+      if(axis) {
+        std::swap(s.local_sequence.data,s.source_indices.data);
+        std::swap(s.local_sequence.capacity,s.source_indices.capacity);
+      }
+    }
+    buildLocalMap<<<blocks,256,0,s.stream>>>(s.points.data,s.local_sorted_points.data,s.local_coords.data,
+      s.source_indices.data,int(count),s.buckets.data,s.mask,s.search_positions.data,s.point_stride);
+    check(cudaGetLastError());
+    std::swap(s.points.data,s.local_sorted_points.data); std::swap(s.points.capacity,s.local_sorted_points.capacity);
+  }
+  check(cudaMemcpyAsync(&invalid,s.snapshot_error.data,sizeof(int),cudaMemcpyDeviceToHost,s.stream));
+  check(cudaStreamSynchronize(s.stream));
+  if(invalid) throw std::invalid_argument("Invalid CUDA transformed local map feature or voxel coordinate");
+  s.local_map=true; s.ready=true;
+}
+std::vector<CudaMatcher::Materialized> CudaMatcher::downloadMaterialized() {
+  diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_download);
+  auto& s=*impl_;
+  if(!s.searched) throw std::logic_error("CUDA materialization requires a completed search");
+  int accepted=0;
+  if(s.grouped_searched) for(int i=0;i<s.group_count;++i) accepted+=s.host_counts[i];
+  std::vector<Materialized> rows(s.count); s.materialized.reserve(s.count);
+  if(s.count) {
+    gatherMaterialized<<<1+(s.count-1)/256,256,0,s.stream>>>(s.points.data,s.results.data,
+      s.local_map?s.source_indices.data:nullptr,s.indices.data,accepted,s.count,s.materialized.data);
+    check(cudaGetLastError());
+    check(cudaMemcpyAsync(rows.data(),s.materialized.data,size_t(s.count)*sizeof(Materialized),cudaMemcpyDeviceToHost,s.stream));
+  }
+  check(cudaStreamSynchronize(s.stream));
+  for(const auto& row:rows) if(row.source==-2) {
+    s.searched=false; throw std::invalid_argument("CUDA transformed query exceeds voxel coordinate range");
+  }
+  return rows;
+}
 void CudaMatcher::Impl::launchSearch(const std::array<double,12>& matrix) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_search_launch);
   auto& s=*this;
-  s.searched=false; s.host_results_ready=false;
+  s.searched=false; s.host_results_ready=false; s.grouped_searched=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before search");
   for(auto v:matrix) if(!std::isfinite(v)) throw std::invalid_argument("Nonfinite CUDA query pose");
   if(s.count) {
@@ -283,7 +452,15 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
   auto& s=*impl_;
   if(!s.searched) throw std::logic_error("CUDA results require a completed search");
   if(!s.host_results_ready) {
-    if(s.count) check(cudaMemcpyAsync(s.host_results.data(),s.results.data,size_t(s.count)*sizeof(Result),cudaMemcpyDeviceToHost,s.stream));
+    if(s.count) {
+      const Result* output=s.results.data;
+      if(s.local_map) {
+        s.source_results.reserve(s.count);
+        originalResults<<<1+(s.count-1)/256,256,0,s.stream>>>(s.results.data,s.source_results.data,s.source_indices.data,s.count);
+        check(cudaGetLastError()); output=s.source_results.data;
+      }
+      check(cudaMemcpyAsync(s.host_results.data(),output,size_t(s.count)*sizeof(Result),cudaMemcpyDeviceToHost,s.stream));
+    }
     check(cudaStreamSynchronize(s.stream));
     for(const auto& r:s.host_results) if(r.index==-2) {
       s.searched=false;
@@ -296,13 +473,17 @@ const std::vector<CudaMatcher::Result>& CudaMatcher::downloadResults() {
 void CudaMatcher::setGroups(const std::vector<int>& target_groups,size_t group_count) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_group_setup);
   auto& s=*impl_;
-  s.groups_ready=false;
+  s.groups_ready=false; s.grouped_searched=false;
   if(!s.ready) throw std::logic_error("CUDA matcher must be reset before grouping");
   if(target_groups.size()!=size_t(s.point_count) || group_count>65535)
     throw std::invalid_argument("Invalid CUDA target group shape");
   for(int group:target_groups) if(group < -1 || (group>=0 && size_t(group)>=group_count))
     throw std::invalid_argument("Invalid CUDA target group index");
-  s.target_groups.upload(target_groups,s.stream);
+  if(s.local_map && s.point_count) {
+    s.original_groups.upload(target_groups,s.stream); s.target_groups.reserve(s.point_count);
+    reorderGroups<<<1+(s.point_count-1)/256,256,0,s.stream>>>(s.original_groups.data,s.source_indices.data,s.target_groups.data,s.point_count);
+    check(cudaGetLastError());
+  } else s.target_groups.upload(target_groups,s.stream);
   s.group_count=int(group_count);
   s.group_counts.reserve(group_count+1); s.host_counts.resize(group_count+1);
   s.sort_keys.reserve(s.count); s.sorted_keys.reserve(s.count);
@@ -357,6 +538,7 @@ CudaMatcher::GroupedSummary CudaMatcher::searchGrouped(const std::array<double,1
   }
   phase.reset();
   result.roots=s.packSummaries(descriptors,shapes,total,max_rows,plane);
+  s.grouped_searched=true;
   return result;
 }
 std::vector<Eigen::MatrixXd> CudaMatcher::Impl::packSummaries(const std::vector<Group>& descriptors,
@@ -389,6 +571,7 @@ std::vector<Eigen::MatrixXd> CudaMatcher::summarize(const std::vector<std::vecto
     indices.insert(indices.end(),g.begin(),g.end()); total+=g.size()*7;
     max_rows=std::max(max_rows,int(g.size()));
   }
+  s.grouped_searched=false;
   s.indices.upload(indices,s.stream);
   return s.packSummaries(descriptors,shapes,total,max_rows,plane);
 }

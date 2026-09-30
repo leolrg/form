@@ -165,3 +165,78 @@ TEST(CudaMatching, FailedHostResetBlocksMatchingWithoutMutatingConstraintsAndRec
   ASSERT_TRUE(p->summaryValidFor(q));
   EXPECT_NEAR(p->summary_cache->squaredError({},{}),.015625,1e-14);
 }
+
+TEST(CudaMatching, DeviceMapAndMaterializationPreserveRawMatchesAndRetainedFactors) {
+  form::KeypointMap<form::PlanarFeat> local_planes;
+  form::KeypointMap<form::PointFeat> local_points;
+  gtsam::Values values;
+  for(size_t scan=0;scan<3;++scan) {
+    values.insert(X(scan),gtsam::Pose3(gtsam::Rot3::RzRyRx(.03*scan,-.02*scan,.04*scan),gtsam::Point3(.1*scan,-.2*scan,.3*scan)));
+    for(int i=0;i<257;++i) {
+      local_planes.get(scan).emplace_back((i%17)*.15,(i/17)*.12,.1,.3,.5,.7,scan);
+      local_points.get(scan).emplace_back((i%17)*.15,(i/17)*.12,.1,scan);
+    }
+  }
+  const auto planes=local_planes.to_voxel_map(values,.8);
+  const auto points=local_points.to_voxel_map(values,.8);
+  auto poses=[&](size_t scan) {return values.at<gtsam::Pose3>(X(scan));};
+  std::vector<form::PlanarFeat> pq; std::vector<form::PointFeat> qq;
+  for(int i=0;i<259;++i) {pq.emplace_back((i%17)*.15+.01,(i/17)*.12,.1,.3,.5,.7,4);qq.emplace_back((i%17)*.15,(i/17)*.12+.01,.1,4);}
+  form::CudaMatching reference;
+  reference.reset(planes,points,pq,qq,poses,.8);
+  form::CudaMatching::ConstraintMap expected;
+  for(size_t scan=0;scan<3;++scan) expected[scan]={std::make_shared<form::PlanePoint>(),std::make_shared<form::PointPoint>()};
+  tbb::concurrent_vector<form::Match<form::PlanarFeat>> ep,ap;
+  tbb::concurrent_vector<form::Match<form::PointFeat>> eq,aq;
+  reference.match({},.8,expected,ep,eq);
+  for(bool device_map:{false,true}) {
+    form::PointPoint::Ptr retained; form::PlanePoint::Ptr retained_plane;
+    {
+      form::CudaMatching candidate(true);
+      if(device_map) candidate.resetLocal(local_planes,local_points,pq,qq,poses,.8);
+      else candidate.reset(planes,points,pq,qq,poses,.8);
+      form::CudaMatching::ConstraintMap actual;
+      for(size_t scan=0;scan<3;++scan) actual[scan]={std::make_shared<form::PlanePoint>(),std::make_shared<form::PointPoint>()};
+      candidate.match({},.8,actual,ap,aq,true);
+      retained=std::make_shared<form::PointPoint>(*std::get<1>(actual.at(0)));
+      retained_plane=std::make_shared<form::PlanePoint>(*std::get<0>(actual.at(0)));
+      candidate.materialize(ap,aq);
+      ASSERT_EQ(ap.size(),ep.size()); ASSERT_EQ(aq.size(),eq.size());
+      for(size_t i=0;i<ap.size();++i) {
+        EXPECT_EQ(ap[i].point.scan,ep[i].point.scan); EXPECT_EQ(aq[i].point.scan,eq[i].point.scan);
+        EXPECT_NEAR(ap[i].dist_sqrd,ep[i].dist_sqrd,1e-14);
+        EXPECT_LE((ap[i].point.vec3()-ep[i].point.vec3()).norm(),1e-14);
+        EXPECT_LE((ap[i].point.n_vec3()-ep[i].point.n_vec3()).norm(),1e-14);
+      }
+      // Force resident storage reuse while copied deferred loaders survive.
+      candidate.resetLocal({}, {}, {}, {},poses,.8);
+    }
+    EXPECT_NEAR(retained->evaluateError(poses(0),{}).squaredNorm(),std::get<1>(expected.at(0))->evaluateError(poses(0),{}).squaredNorm(),1e-12);
+    EXPECT_NEAR(retained_plane->evaluateError(poses(0),{}).squaredNorm(),std::get<0>(expected.at(0))->evaluateError(poses(0),{}).squaredNorm(),1e-12);
+  }
+}
+
+TEST(CudaMatching, DeviceRawLeaseSurvivesResetAndDestructionBeforeFirstAccess) {
+  for(bool reset_before_destroy:{false,true}) {
+    auto points=std::make_shared<form::PointPoint>();
+    auto planes=std::make_shared<form::PlanePoint>();
+    {
+      form::KeypointMap<form::PlanarFeat> plane_map;
+      form::KeypointMap<form::PointFeat> point_map;
+      plane_map.get(0).emplace_back(0,0,0,1,0,0,0);
+      point_map.get(0).emplace_back(0,0,0,0);
+      form::CudaMatching candidate(true);
+      auto pose=[](size_t) {return gtsam::Pose3();};
+      candidate.resetLocal(plane_map,point_map,{{.5,0,0,1,0,0,1}},{{.5,0,0,1}},pose,1.);
+      form::CudaMatching::ConstraintMap constraints;
+      constraints[0]={planes,points};
+      tbb::concurrent_vector<form::Match<form::PlanarFeat>> pm;
+      tbb::concurrent_vector<form::Match<form::PointFeat>> qm;
+      candidate.match({},1.,constraints,pm,qm,true);
+      EXPECT_TRUE(pm.empty()); EXPECT_TRUE(qm.empty());
+      if(reset_before_destroy) candidate.resetLocal({}, {}, {}, {},pose,1.);
+    }
+    EXPECT_DOUBLE_EQ(points->evaluateError({},{}).squaredNorm(),.25);
+    EXPECT_DOUBLE_EQ(planes->evaluateError({},{}).squaredNorm(),.25);
+  }
+}

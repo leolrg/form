@@ -36,7 +36,8 @@ template<class Point> struct MatchBatch {
   size_t group_count;
   double threshold;
   std::mutex mutex;
-  bool loaded=false;
+  bool loaded=false,gpu_materialization=false;
+  std::vector<size_t> group_counts;
   std::vector<Match<Point>> matches;
   std::vector<std::vector<int>> groups;
 
@@ -44,6 +45,31 @@ template<class Point> struct MatchBatch {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_ensure);
     std::lock_guard<std::mutex> lock(mutex);
     if(loaded) return;
+    if(gpu_materialization) {
+      const auto rows=device->downloadMaterialized();
+      std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::match_reconstruct);
+      matches.resize(map->queries.size());
+      tbb::parallel_for(size_t(0),matches.size(),[&](size_t i) {
+        Match<Point> match{};
+        const auto& row=rows[i];
+        match.query=map->queries[i]; match.dist_sqrd=row.distance;
+        if(row.source>=0) {
+          match.point=map->world_points.at(row.source);
+          for(int axis=0;axis<3;++axis) {
+            match.point.vec3()[axis]=row.local[axis];
+            if constexpr(std::is_same_v<Point,PlanarFeat>) match.point.n_vec3()[axis]=row.normal[axis];
+          }
+        }
+        matches[i]=match;
+      });
+      phase.emplace(diagnostics::Stage::match_host_group);
+      groups.assign(group_count,{});
+      size_t first=0;
+      for(size_t group=0;group<group_count;++group) {
+        groups[group].resize(group_counts.at(group));
+        for(size_t row=0;row<groups[group].size();++row) groups[group][row]=rows[first++].grouped_query;
+      }
+    } else {
     const auto& results=device->downloadResults();
     std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::match_reconstruct);
     matches.resize(map->queries.size());
@@ -62,8 +88,9 @@ template<class Point> struct MatchBatch {
         if(group>=0) groups.at(group).push_back(int(i));
       }
     }
+    }
     loaded=true;
-    device.reset();
+    device.reset(); map.reset(); target_groups.reset();
   }
   template<class Rows> void load(const Rows& rows,size_t group) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_rows);
@@ -83,14 +110,15 @@ template<class Point> struct MatchBatch {
   void materialize(tbb::concurrent_vector<Match<Point>>& output) {
   diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_output);
     // Preserve FORM's existing stale raw-match behavior for empty feature input.
-    if(map->queries.empty()) return;
     ensure();
+    if(matches.empty()) return;
     output.clear();
     std::copy(matches.begin(),matches.end(),output.grow_by(matches.size()));
   }
 };
 
 template<class Point> struct Snapshot {
+  bool gpu_materialization=false;
   std::shared_ptr<CudaMatcher> device=std::make_shared<CudaMatcher>();
   std::shared_ptr<HostMap<Point>> map;
   std::shared_ptr<MatchBatch<Point>> current,idle_batch;
@@ -101,7 +129,7 @@ template<class Point> struct Snapshot {
   std::vector<CudaMatcher::Voxel> voxels;
   std::vector<CudaMatcher::MapPoint> points;
   std::vector<CudaMatcher::Query> packed;
-  std::vector<std::array<double,12>> inverse_matrices;
+  std::vector<std::array<double,12>> inverse_matrices,forward_matrices;
   std::unordered_map<size_t,int> pose_slots;
   void freezeSurvivors() {
     if(!current) return;
@@ -157,6 +185,37 @@ template<class Point> struct Snapshot {
     device->reset(voxels,points,packed,width,inverse_matrices,map->pose_indices);
     scan_order.clear(); target_groups.reset();
   }
+  void resetLocal(const KeypointMap<Point>& local_map,const std::vector<Point>& query,
+             const std::function<gtsam::Pose3(size_t)>& estimates,double width) {
+    diagnostics::Scope diagnostic_scope(diagnostics::Stage::match_snapshot);
+    freezeSurvivors();
+    std::optional<diagnostics::Scope> phase; phase.emplace(diagnostics::Stage::match_snapshot_pack);
+    if(!map || map.use_count()!=1) map=std::make_shared<HostMap<Point>>();
+    map->world_points.clear(); map->pose_indices.clear(); map->inverse_poses.clear(); map->queries=query;
+    points.clear(); packed.clear(); inverse_matrices.clear(); forward_matrices.clear();
+    size_t total=0;
+    for(const auto& entry:local_map) total+=entry.second.size();
+    if(total>size_t(std::numeric_limits<int>::max())/4) throw std::invalid_argument("CUDA local map too large");
+    points.reserve(total); map->world_points.reserve(total); map->pose_indices.reserve(total);
+    for(const auto& [scan,features]:local_map) {
+      const auto pose=estimates(scan);
+      const int slot=int(forward_matrices.size());
+      forward_matrices.push_back(packPose(pose)); inverse_matrices.push_back(packPose(pose.inverse()));
+      for(const auto& local:features) {
+        if(local.scan!=scan) throw std::invalid_argument("CUDA local feature scan does not match map key");
+        map->world_points.push_back(local); map->pose_indices.push_back(slot);
+        CudaMatcher::MapPoint p{{local.x,local.y,local.z,local._},{local.x,local.y,local.z},{0,0,0}};
+        if constexpr(std::is_same_v<Point,PlanarFeat>) {p.normal[0]=local.nx;p.normal[1]=local.ny;p.normal[2]=local.nz;}
+        points.push_back(p);
+      }
+    }
+    packed.reserve(query.size());
+    for(const auto& q:query) packed.push_back({{q.x,q.y,q.z,q._}});
+    phase.reset();
+    device->resetLocal(points,packed,width,forward_matrices,inverse_matrices,map->pose_indices);
+    gpu_materialization=true;
+    scan_order.clear(); target_groups.reset();
+  }
   template<int I> CudaMatcher::GroupedSummary match(const std::array<double,12>& pose,double threshold,
       const std::vector<size_t>& scans,const std::vector<std::tuple<PlanePoint::Ptr,PointPoint::Ptr>>& pairs) {
     if(!map) throw std::logic_error("CUDA matching must be reset before match");
@@ -175,6 +234,7 @@ template<class Point> struct Snapshot {
     else current=std::make_shared<MatchBatch<Point>>();
     current->map=map; current->device=device; current->target_groups=target_groups;
     current->group_count=scans.size(); current->threshold=threshold;
+    current->gpu_materialization=gpu_materialization; current->group_counts=summaries.counts;
     for(size_t i=0;i<pairs.size();++i) {
       if(!summaries.counts[i]) continue;
       std::get<I>(pairs[i])->deferRaw(summaries.counts[i],[batch=current,i](const auto& rows) {batch->load(rows,i);});
@@ -189,7 +249,10 @@ struct CudaMatching::Impl {
   Snapshot<PointFeat> points;
   std::vector<std::pair<std::weak_ptr<PlanePoint>,std::weak_ptr<PointPoint>>> pending;
 };
-CudaMatching::CudaMatching():impl_(std::make_unique<Impl>()) {}
+CudaMatching::CudaMatching(bool gpu_materialization):impl_(std::make_unique<Impl>()) {
+  impl_->planes.gpu_materialization=gpu_materialization;
+  impl_->points.gpu_materialization=gpu_materialization;
+}
 CudaMatching::~CudaMatching()=default;
 void CudaMatching::reset(const VoxelMap<PlanarFeat>& planes,const VoxelMap<PointFeat>& points,
     const std::vector<PlanarFeat>& pq,const std::vector<PointFeat>& qq,
@@ -197,6 +260,14 @@ void CudaMatching::reset(const VoxelMap<PlanarFeat>& planes,const VoxelMap<Point
   impl_->ready=false;
   impl_->planes.reset(planes,pq,estimates,width);
   impl_->points.reset(points,qq,estimates,width);
+  impl_->ready=true;
+}
+void CudaMatching::resetLocal(const KeypointMap<PlanarFeat>& planes,const KeypointMap<PointFeat>& points,
+    const std::vector<PlanarFeat>& pq,const std::vector<PointFeat>& qq,
+    const std::function<gtsam::Pose3(size_t)>& estimates,double width) {
+  impl_->ready=false;
+  impl_->planes.resetLocal(planes,pq,estimates,width);
+  impl_->points.resetLocal(points,qq,estimates,width);
   impl_->ready=true;
 }
 void CudaMatching::match(const gtsam::Pose3& pose,double max_distance,ConstraintMap& constraints,

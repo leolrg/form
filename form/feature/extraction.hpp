@@ -98,6 +98,15 @@ public:
     size_t feature_spacing = 0;
     /// CUDA curvature and exact normal-neighborhood search; selection/eigenvectors stay on CPU.
     bool use_cuda = false;
+    /// Also gather neighborhoods and compute covariance/eigenvectors on GPU.
+    /// Requires use_cuda; opt-in because floating-point reductions can differ.
+    bool use_cuda_normals = false;
+    /// Explicit curvature/index total order, for reproducible CPU/GPU selection.
+    bool stable_selection = false;
+    /// GPU masks/selection through normals; requires CUDA normals. Default ties
+    /// require verified serial libstdc++ 13 introsort; stable_selection opts
+    /// into changed index-tie semantics on any supported host standard library.
+    bool use_cuda_selection = false;
     /// Parallelize independent rows, retaining ordered suppression within each row.
     bool parallel_selection = false;
   };

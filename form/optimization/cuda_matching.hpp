@@ -13,9 +13,12 @@ namespace form {
 class CudaMatching {
 public:
   using ConstraintMap=tsl::robin_map<size_t,std::tuple<PlanePoint::Ptr,PointPoint::Ptr>>;
-  CudaMatching();
+  explicit CudaMatching(bool gpu_materialization=false);
   ~CudaMatching();
   void reset(const VoxelMap<PlanarFeat>& planes,const VoxelMap<PointFeat>& points,
+             const std::vector<PlanarFeat>& plane_queries,const std::vector<PointFeat>& point_queries,
+             const std::function<gtsam::Pose3(size_t)>& estimates,double voxel_width);
+  void resetLocal(const KeypointMap<PlanarFeat>& planes,const KeypointMap<PointFeat>& points,
              const std::vector<PlanarFeat>& plane_queries,const std::vector<PointFeat>& point_queries,
              const std::function<gtsam::Pose3(size_t)>& estimates,double voxel_width);
   void match(const gtsam::Pose3& pose,double max_distance,ConstraintMap& constraints,
