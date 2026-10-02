@@ -67,7 +67,8 @@ public:
     /// Experimental selective dense solving; independent of summary preparation.
     /// In resident LM this selects the entire CPU/CUDA matrix pipeline.
     bool use_cuda_dense_solver = false;
-    int cuda_solve_min_dimension = 240;
+    /// 75 active poses, with six scalar dimensions per pose.
+    int cuda_solve_min_dimension = 450;
     // Used for ablations, optimize a single pose at a time
     bool disable_smoothing = false;
 

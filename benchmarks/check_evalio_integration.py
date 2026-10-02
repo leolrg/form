@@ -28,7 +28,7 @@ def load_extension(module_dir):
     assert defaults['use_summary'] is False
     assert defaults['use_cuda_summaries'] is False
     assert defaults['use_cuda_dense_solver'] is False
-    assert defaults['cuda_solve_min_dimension'] == 240
+    assert defaults['cuda_solve_min_dimension'] == 450
     assert defaults['feature_spacing'] == 0
     assert isinstance(pipeline, evalio.pipelines.Pipeline)
     return pipeline

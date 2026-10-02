@@ -52,7 +52,7 @@ public:
                    const gtsam::Values &initialValues,
                    const gtsam::LevenbergMarquardtParams &params,
                    std::shared_ptr<CudaDenseSolver> cuda_solver = {},
-                   int cuda_min_dimension = 240)
+                   int cuda_min_dimension = 450)
       : LevenbergMarquardtOptimizer(graph, initialValues, params),
         cuda_solver_(std::move(cuda_solver)), cuda_min_dimension_(cuda_min_dimension) {}
 

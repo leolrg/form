@@ -254,8 +254,9 @@ CPU solve; CUDA runtime errors remain visible. The replay CSV records
 `cuda_solve_calls` and `cuda_solve_fallbacks` even without `--profile`.
 
 The corresponding C++/Python parameters are `use_cuda_dense_solver` (default
-false) and `cuda_solve_min_dimension` (default 240). N240 is the selected benchmark
-threshold, not a measured exact crossover or a portable desktop-GPU threshold.
+false) and `cuda_solve_min_dimension` (default 450, or 75 six-DoF poses).
+The experiment below used N240 explicitly; it is not a measured exact crossover
+or a portable desktop-GPU threshold.
 See `cuda_solve_experiment.md` for captured-system evidence. The completed suite
 enabled this option only for CUDA window40 and measured lower optimization time
 than CPU summaries in both repeats on all four sequences; the comparison includes

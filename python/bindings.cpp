@@ -95,7 +95,7 @@ public:
     (bool,         use_summary, false, params_.constraints.use_summary),
     (bool,  use_cuda_summaries, false, params_.constraints.use_cuda_summaries),
     (bool, use_cuda_dense_solver, false, params_.constraints.use_cuda_dense_solver),
-    (int, cuda_solve_min_dimension, 240, params_.constraints.cuda_solve_min_dimension),
+    (int, cuda_solve_min_dimension, 450, params_.constraints.cuda_solve_min_dimension),
     // MAPPING
     (int,         max_num_keyscans,  50, params_.scans.max_num_keyscans),
     (int,     max_num_recent_scans,  10, params_.scans.max_num_recent_scans),
